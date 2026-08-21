@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
-"""客户端入口：管理员权限、无控制台、启动后进入托盘。"""
+"""客户端入口：普通权限运行、无控制台、启动后进入托盘。"""
 import sys
+
+from app_common.logger import set_app_scope
+
+# 必须先于任何 get_logger 调用：客户端日志写入 logs\client 子目录，
+# 与服务端（logs\server）隔离，客户端日志管理不会出现服务端的 SFTP 信息。
+set_app_scope("client")
 
 from PySide6.QtWidgets import QApplication
 
-from app_common import winutil
 from app_common.app_config import ClientConfig
+from app_common.app_icon import get_app_icon
 from app_common.constants import APP_DISPLAY_NAME
 from app_common.logger import get_logger
-from app_common.style import apply_style
+from app_common.style import apply_style, theme_is_dark
 
 from .ui.main_window import ClientMainWindow
 
@@ -16,12 +22,8 @@ log = get_logger("client.main")
 
 
 def main() -> int:
-    # 打包后 exe 自带管理员清单（图标带盾牌）；源码运行时尝试提权
-    if not winutil.is_admin() and "--no-admin" not in sys.argv:
-        if winutil.relaunch_as_admin():
-            return 0
-        log.warning("提权被拒绝，以普通权限继续运行")
-
+    # 普通权限运行：客户端写入的是用户目录（.minecraft）与 HKCU 自启注册表，
+    # 均不需要管理员；提权反而会因 UIPI 隔离导致无法从资源管理器拖放文件/文件夹。
     app = QApplication(sys.argv)
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setQuitOnLastWindowClosed(False)
@@ -31,10 +33,10 @@ def main() -> int:
 
     window = ClientMainWindow(config)
     if "--tray" not in sys.argv:
-        window.show()
+        window.showMaximized()
     else:
         log.info("以 --tray 方式启动，直接进入托盘")
-    log.info("客户端启动，管理员权限: %s", winutil.is_admin())
+    log.info("客户端启动")
     return app.exec()
 
 

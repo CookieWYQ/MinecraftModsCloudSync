@@ -12,9 +12,9 @@ APP_VERSION = "1.0.0"
 # 客户端加密密钥派生盐值（构建时可通过环境变量 MC_SYNC_SECRET 覆盖密钥本体）
 CRYPTO_SALT = "mc-mods-cloud-sync-7f3a9c2e5b1d"
 
-# SFTP 默认远程目录
-DEFAULT_REMOTE_TODO_DIR = "todo"          # 待办任务目录
-DEFAULT_REMOTE_FILES_DIR = "client_files"  # 客户端文件仓库目录
+# SFTP 默认远程目录（服务器上的绝对路径）
+DEFAULT_REMOTE_TODO_DIR = "/todo"          # 待办任务目录
+DEFAULT_REMOTE_FILES_DIR = "/client_files"  # 客户端文件仓库目录
 MANIFEST_FILENAME = "manifest.json"
 
 # 同步分类（对应 Minecraft 游戏目录子文件夹）
@@ -46,9 +46,22 @@ def app_dir() -> Path:
 
 
 def appdata_dir() -> Path:
-    base = os.environ.get("APPDATA") or str(Path.home())
-    d = Path(base) / APP_NAME
-    d.mkdir(parents=True, exist_ok=True)
+    """数据目录：安装目录（exe 所在目录）下的隐藏文件夹，绝不写入 C 盘用户目录。
+
+    若安装目录不可写（如受保护的系统目录），回退到 LOCALAPPDATA 兜底。
+    """
+    base = app_dir()
+    d = base / ".mc-sync-data"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".write_test"
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+    except OSError:
+        # 安装目录不可写 → 兜底（仅在极端情况下使用）
+        fallback = Path(os.environ.get("LOCALAPPDATA") or str(Path.home())) / APP_NAME
+        fallback.mkdir(parents=True, exist_ok=True)
+        d = fallback
     # 隐藏整个数据目录（配置与日志都在其中），避免用户误删/误改
     set_hidden(d)
     return d

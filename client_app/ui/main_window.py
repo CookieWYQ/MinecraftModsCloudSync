@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """客户端 - 主窗口：多服务器管理、导入配置文件、更新检查与任务应用、托盘与自启。"""
+import json
+import os
 from datetime import datetime
 
 from PySide6.QtCore import QSize, Qt, QTimer
@@ -33,14 +35,15 @@ from app_common.app_config import ClientConfig
 from app_common.app_icon import get_app_icon
 from app_common.config_manager import ConfigManagerDialog
 from app_common.constants import APP_DISPLAY_NAME
-from app_common.launcher import KnownVersions, resolve_dropped
+from app_common.launcher import KnownVersions, parse_and_store
 from app_common.log_manager import LogManagerDialog
-from app_common.logger import get_logger
+from app_common.logger import get_logger, set_log_context
 from app_common.notifications import notify
-from app_common.profile import PROFILE_FILTER, parse_profile_content
+from app_common.profile import PROFILE_FILTER, PROFILE_SUFFIX, parse_profile_content
 from app_common.settings_dialog import SettingsDialog
 from app_common.tasks import ACTION_LABELS, CATEGORY_LABELS, TodoManifest
 from app_common.version_dialog import VersionPickerDialog
+from app_common.worker import Worker
 
 from ..engine import (
     ApplyThread,
@@ -99,28 +102,55 @@ class ClientMainWindow(QWidget):
         self.setAcceptDrops(True)
         self.setWindowIcon(get_app_icon("client"))
 
-        root = QHBoxLayout(self)
+        root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(14)
+        root.setSpacing(8)
 
-        # ---- 左侧：服务器列表 ----
-        left = QVBoxLayout()
-        left.setSpacing(8)
-        left_title = QLabel("服务器")
-        left_title.setObjectName("card-title")
-        left.addWidget(left_title)
+        # ---- 顶部固定行：收起按钮 + 标题（位于可折叠面板之外，收起/展开时位置完全不变） ----
+        top_row = QHBoxLayout()
+        top_row.setSpacing(4)
+        self.btn_toggle_list = QPushButton("◀")
+        self.btn_toggle_list.setCheckable(True)
+        self.btn_toggle_list.setChecked(True)
+        self.btn_toggle_list.setFixedSize(28, 28)
+        self.btn_toggle_list.setToolTip("收起服务器列表（面板变窄，右侧变宽）")
+        self.btn_toggle_list.clicked.connect(self._toggle_server_list)
+        top_row.addWidget(self.btn_toggle_list)
+        self.lbl_title = QLabel("服务器")
+        self.lbl_title.setObjectName("card-title")
+        top_row.addWidget(self.lbl_title)
+        top_row.addStretch(1)
+        root.addLayout(top_row)
+
+        # ---- 主体：左侧服务器列表（可折叠）+ 右侧详情 ----
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        self.left_panel = QWidget()
+        pl = QVBoxLayout(self.left_panel)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(8)
+
+        self.ed_search_servers = QLineEdit()
+        self.ed_search_servers.setPlaceholderText("搜索服务器（支持 * 通配）")
+        self.ed_search_servers.setClearButtonEnabled(True)
+        self.ed_search_servers.textChanged.connect(lambda _: self._filter_server_list())
+        pl.addWidget(self.ed_search_servers)
 
         self.list_servers = QListWidget()
         self.list_servers.currentItemChanged.connect(self._on_select)
-        left.addWidget(self.list_servers, 1)
+        pl.addWidget(self.list_servers, 1)
 
         self.btn_import = QPushButton("导入配置文件…")
         self.btn_import.clicked.connect(self._import_profile)
         self.btn_remove = QPushButton("移除选中服务器")
         self.btn_remove.clicked.connect(self._remove_profile)
-        left.addWidget(self.btn_import)
-        left.addWidget(self.btn_remove)
-        root.addLayout(left, 1)
+        pl.addWidget(self.btn_import)
+        pl.addWidget(self.btn_remove)
+        self._server_panel_widgets = (self.ed_search_servers, self.list_servers,
+                                      self.btn_import, self.btn_remove)
+        self._left_w, self._left_w_min = 210, 28
+        self.left_panel.setFixedWidth(self._left_w)
+        body.addWidget(self.left_panel)
 
         # ---- 右侧：详情 ----
         right = QVBoxLayout()
@@ -201,6 +231,7 @@ class ClientMainWindow(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         header = self.table.horizontalHeader()
+        header.setSectionsMovable(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.Stretch)
@@ -222,7 +253,8 @@ class ClientMainWindow(QWidget):
         opt_row.addStretch(1)
         right.addWidget(opt_box)
 
-        root.addLayout(right, 3)
+        body.addLayout(right, 3)
+        root.addLayout(body, 1)
 
         self.btn_check.clicked.connect(lambda: self._check(manual=True))
         self.btn_apply.clicked.connect(self._apply)
@@ -253,6 +285,16 @@ class ClientMainWindow(QWidget):
         self.tray.show()
 
     # ---------- 状态 ----------
+    def _toggle_server_list(self, expanded: bool):
+        """折叠 / 展开左侧服务器列表：收起时整个面板向左变窄，右侧内容区自动变宽。"""
+        for w in self._server_panel_widgets:
+            w.setVisible(expanded)
+        self.left_panel.setFixedWidth(self._left_w if expanded else self._left_w_min)
+        self.btn_toggle_list.setText("◀" if expanded else "▶")
+        self.btn_toggle_list.setToolTip(
+            "收起服务器列表（面板变窄，右侧变宽）" if expanded
+            else "展开服务器列表（恢复宽度）")
+
     def _load_state(self):
         self.ed_game_dir.setText(self.config.local_mc_dir or default_minecraft_dir())
         self.refresh_list()
@@ -282,6 +324,21 @@ class ClientMainWindow(QWidget):
         else:
             self._current_sid = None
             self._show_placeholder()
+        self._filter_server_list()
+
+    def _filter_server_list(self):
+        """按搜索关键词过滤服务器列表（支持 * 通配，匹配名称与唯一编号）。"""
+        import fnmatch
+
+        text = self.ed_search_servers.text().strip().lower()
+        for i in range(self.list_servers.count()):
+            item = self.list_servers.item(i)
+            sid = item.data(Qt.UserRole) or ""
+            widget = self.list_servers.itemWidget(item)
+            name = widget.lbl_name.text().lower() if widget is not None else ""
+            hay = f"{name} {sid}"
+            item.setHidden(bool(text)
+                           and not fnmatch.fnmatch(hay, f"*{text}*"))
 
     def _show_placeholder(self):
         self.lbl_name.setText("未选择服务器")
@@ -297,6 +354,8 @@ class ClientMainWindow(QWidget):
             return
         sid = current.data(Qt.UserRole)
         self._current_sid = sid
+        # 每台服务器独立日志文件
+        set_log_context(sid)
         self._refresh_detail()
 
     def _refresh_detail(self):
@@ -337,6 +396,19 @@ class ClientMainWindow(QWidget):
                 widget.set_status(status)
 
     # ---------- 服务器档案管理 ----------
+    def _apply_import(self, content: str, name: str, sid: str, created_at: str) -> None:
+        """写入服务器档案并选中该服务器（界面状态同步）。"""
+        self.config.add_profile(name, sid, content, created_at)
+        self._status.pop(sid, None)
+        self._manifests.pop(sid, None)
+        self._has_new.pop(sid, None)
+        self.refresh_list()
+        self._current_sid = sid
+        for i in range(self.list_servers.count()):
+            if self.list_servers.item(i).data(Qt.UserRole) == sid:
+                self.list_servers.setCurrentRow(i)
+                break
+
     def _import_profile(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入服务器配置文件", "", PROFILE_FILTER)
         if not path:
@@ -349,19 +421,49 @@ class ClientMainWindow(QWidget):
             winutil.error(self, "导入失败", f"无法导入该配置文件：\n{exc}")
             return
         name, sid = data["name"], data["server_id"]
-        self.config.add_profile(name, sid, content, data.get("created_at", ""))
-        self._status.pop(sid, None)
-        self._manifests.pop(sid, None)
-        self._has_new.pop(sid, None)
-        self.refresh_list()
-        self._current_sid = sid
-        for i in range(self.list_servers.count()):
-            if self.list_servers.item(i).data(Qt.UserRole) == sid:
-                self.list_servers.setCurrentRow(i)
-                break
+        existing = self.config.profile_by_id(sid)
+        if existing is not None:
+            if not winutil.confirm(
+                    self, "确认覆盖",
+                    f"服务器「{existing.get('name')}」已存在（唯一编号 {sid}）。\n\n"
+                    f"导入的配置文件：\n{path}\n\n"
+                    f"导入后将覆盖该服务器的现有配置，是否覆盖？",
+                    default_yes=False):
+                return
+        self._apply_import(content, name, sid, data.get("created_at", ""))
         winutil.info(self, "导入成功",
                      f"已接入服务器：{name}\n唯一编号：{sid}\n\n点击「立即检查更新」验证连接。")
         log.info("导入服务器档案: %s", name)
+
+    def _confirm_import_dropped(self, paths: list[str]):
+        """拖入的 .mcscf 服务器配置文件：逐份确认后自动导入；已存在同编号服务器时提示覆盖。"""
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                data = parse_profile_content(content)
+            except Exception as exc:
+                winutil.error(self, "导入失败", f"无法导入该配置文件：\n{exc}")
+                continue
+            name, sid = data["name"], data["server_id"]
+            existing = self.config.profile_by_id(sid)
+            if existing is not None:
+                if not winutil.confirm(
+                        self, "确认覆盖",
+                        f"服务器「{existing.get('name')}」已存在（唯一编号 {sid}）。\n\n"
+                        f"拖入的配置文件：\n{path}\n\n"
+                        f"导入后将覆盖该服务器的现有配置，是否覆盖？",
+                        default_yes=False):
+                    continue
+            elif not winutil.confirm(
+                    self, "确认导入服务器",
+                    f"检测到拖入的服务器配置文件：\n{path}\n\n"
+                    f"服务器名称：{name}\n唯一编号：{sid}\n\n是否导入并接入该服务器？"):
+                continue
+            self._apply_import(content, name, sid, data.get("created_at", ""))
+            winutil.info(self, "导入成功",
+                         f"已接入服务器：{name}\n唯一编号：{sid}\n\n点击「立即检查更新」验证连接。")
+            log.info("通过拖入导入服务器档案: %s", name)
 
     def _remove_profile(self):
         sid = self._current_sid
@@ -484,11 +586,11 @@ class ClientMainWindow(QWidget):
             lines += [f"  · {s.strip()}" for s in settings_text.split("、")]
         if not lines:
             lines = ["（无任务）"]
-        detail = "\n".join(lines)
-        if not winutil.confirm(
+        if not winutil.confirm_list(
                 self, "确认应用更新",
-                f"服务器「{profile.get('name')}」即将应用版本 {manifest.version}（{manifest.formatted_time()}）：\n\n"
-                f"{detail}\n\n是否继续？"):
+                f"服务器「{profile.get('name')}」即将应用版本 {manifest.version}"
+                f"（{manifest.formatted_time()}）。是否继续？",
+                lines, ok_label="应用更新", cancel_label="取消"):
             return
 
         progress = QProgressDialog("正在应用更新…", None, 0, max(len(manifest.tasks), 1), self)
@@ -521,23 +623,26 @@ class ClientMainWindow(QWidget):
         self._apply_settings_ui(manifest.settings or {})
         self._update_list_status()
         self._refresh_detail()
-        detail = (
-            f"服务器：{profile.get('name')}\n"
-            f"已应用版本：{manifest.version}\n"
-            f"时间：{now}\n"
-            f"安装/替换：{len(summary['installed'])} 项\n"
-            f"删除：{len(summary['deleted'])} 项\n"
-            f"跳过：{len(summary['skipped'])} 项\n"
-            f"失败：{len(summary['errors'])} 项"
-        )
+        lines = [
+            f"服务器：{profile.get('name')}",
+            f"已应用版本：{manifest.version}",
+            f"时间：{now}",
+            f"安装/替换：{len(summary['installed'])} 项",
+            f"删除：{len(summary['deleted'])} 项",
+            f"跳过：{len(summary['skipped'])} 项",
+            f"失败：{len(summary['errors'])} 项",
+        ]
         if summary.get("settings"):
-            detail += "\n客户端软件设置：" + "、".join(summary["settings"])
+            lines.append("客户端软件设置：" + "、".join(summary["settings"]))
         if summary["errors"]:
-            detail += "\n\n失败详情：\n" + "\n".join(summary["errors"])
+            lines.append("")
+            lines.append("失败详情：")
+            lines += summary["errors"]
         self.lbl_status.setText(f"已应用版本 {manifest.version} ✔")
         if self.config.notify:
-            notify(f"{APP_DISPLAY_NAME} - 更新完成", detail.split("\n\n")[0], self.tray)
-        winutil.info(self, "更新完成", detail)
+            notify(f"{APP_DISPLAY_NAME} - 更新完成",
+                   f"已应用版本 {manifest.version}", self.tray)
+        winutil.info_list(self, "更新完成", lines)
         log.info("应用更新完成: %s - %s", profile.get("name"), manifest.version)
 
     # ---------- 设置 ----------
@@ -553,57 +658,78 @@ class ClientMainWindow(QWidget):
 
     # ---------- 拖拽 / 已知版本 ----------
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if self._dropped_path(event) is not None:
+        if self._dropped_paths(event):
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event: QDragEnterEvent):
-        if self._dropped_path(event) is not None:
+        if self._dropped_paths(event):
             event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
-        path = self._dropped_path(event)
-        if path:
-            self._handle_dropped(path)
+        paths = self._dropped_paths(event)
+        if paths:
+            self._handle_dropped(paths)
             event.acceptProposedAction()
 
     @staticmethod
-    def _dropped_path(event) -> str | None:
+    def _dropped_paths(event) -> list[str]:
         urls = event.mimeData().urls()
+        out = []
         for url in urls:
             if url.isLocalFile():
-                return url.toLocalFile()
-        return None
+                out.append(url.toLocalFile())
+        return out
 
-    def _handle_dropped(self, path: str):
-        info = resolve_dropped(path)
-        if not info:
-            winutil.warn(self, "无法识别",
-                         "无法识别拖入的内容。\n\n支持：\n"
-                         "· versions 下的版本/整合包文件夹（内含 mods 等）\n"
-                         "· .minecraft 文件夹\n"
-                         "· 启动器快捷方式(.lnk) 或启动器程序")
+    def _handle_dropped(self, paths):
+        """后台线程解析拖入内容（避免拖入 .minecraft / 启动器快捷方式时卡顿界面）。"""
+        if isinstance(paths, str):
+            paths = [paths]
+        # 拖入服务器配置文件（.mcscf）→ 确认后自动导入（无需后台解析）
+        profile_paths = [p for p in paths
+                         if os.path.splitext(p)[1].lower() == PROFILE_SUFFIX]
+        if profile_paths:
+            self._confirm_import_dropped([os.path.abspath(p) for p in profile_paths])
             return
-        known = KnownVersions()
-        if info["kind"] == "version_dir":
-            known.add_version_dir(info["version_dir"])
-            self._set_game_dir(info["version_dir"])
+        self.lbl_status.setText("正在解析拖入内容…")
+        worker = Worker(parse_and_store, [os.path.abspath(p) for p in paths])
+        worker.done.connect(self._on_drop_parsed)
+        self._drop_worker = worker
+        worker.start()
+
+    def _on_drop_parsed(self, ok: bool, msg: str):
+        self.lbl_status.setText("")
+        if not ok:
+            winutil.error(self, "解析失败", str(msg))
+            return
+        try:
+            data = json.loads(msg)
+        except Exception:
+            data = {}
+        version_dirs = data.get("version_dirs") or []
+        mc_roots = data.get("mc_roots") or []
+
+        if version_dirs and len(version_dirs) == 1:
+            # 单个版本/整合包文件夹 → 直接设为客户端根目录
+            self._set_game_dir(version_dirs[0])
             winutil.info(self, "已填充",
-                         f"已将版本目录设为客户端根目录：\n{info['version_dir']}")
+                         f"已将版本目录设为客户端根目录：\n{version_dirs[0]}")
             return
-        if info.get("mc_root"):
-            added = known.add_from_mc_root(info["mc_root"])
-            hint = (f"已识别 Minecraft 根目录：{info['mc_root']}"
-                    + (f"\n新增 {added} 个版本。" if added else ""))
-            dlg = VersionPickerDialog(self, known, title="选择版本目录", hint=hint)
-            if dlg.exec() == VersionPickerDialog.Accepted:
-                entry = dlg.selected_entry()
-                if entry:
-                    self._set_game_dir(entry["version_dir"])
-                    winutil.info(self, "已填充",
-                                 f"已选择版本：{entry.get('version')}\n"
-                                 f"客户端根目录：{entry.get('version_dir')}")
-            else:
-                self.lbl_status.setText("已保存到已知版本库，可通过「选择已知版本…」随时选用。")
+
+        # .minecraft / 启动器 / versions 文件夹 / 多个版本目录 → 识别到的版本全部
+        # 写入已知版本库，只提示导入了什么（不弹选择；需要时用「选择已知版本…」）。
+        lines = []
+        if version_dirs:
+            lines.append(f"已导入 {len(version_dirs)} 个版本文件夹。")
+        if mc_roots:
+            lines.append("已识别 Minecraft 根目录：")
+            lines += [f"  · {r}" for r in mc_roots]
+        if data.get("added"):
+            lines.append(f"共新增 {data['added']} 个版本到已知版本库。")
+        if not lines:
+            lines = ["未识别到可用的版本内容。"]
+        self.lbl_status.setText("已导入到已知版本库")
+        winutil.info(self, "已导入",
+                     "\n".join(lines) + "\n\n可在「选择已知版本…」中选用。")
 
     def _choose_known_version(self):
         dlg = VersionPickerDialog(self, KnownVersions(), title="选择已知版本",

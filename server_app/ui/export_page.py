@@ -29,7 +29,7 @@ from app_common.license import save_ids
 from app_common.logger import get_logger
 from app_common.profile import PROFILE_FILTER, PROFILE_SUFFIX, build_profile_content, new_server_id
 from app_common.sftp import SFTPManager
-from app_common.worker import Worker
+from app_common.worker import Worker, fmt_progress
 
 log = get_logger("server.export_page")
 
@@ -65,14 +65,12 @@ class ExportPage(QWidget):
         self.ed_uid = QLineEdit()
         self.ed_uid.setReadOnly(True)
         self.ed_uid.setPlaceholderText("自动生成（UUID，机器可读，用于授权校验）")
-        btn_gen = QPushButton("重新生成")
-        btn_gen.clicked.connect(self._gen_id)
         row_id.addWidget(self.ed_uid, 1)
-        row_id.addWidget(btn_gen)
         form.addLayout(row_id)
 
         hint = QLabel("说明：名称给人看、编号给程序读。客户端导入配置文件后，以「名称 + 唯一编号」识别本服务器；"
-                      "编号必须同步到服务器授权清单（license.json），客户端连接时才会通过校验。")
+                      "编号必须同步到服务器授权清单（license.json），客户端连接时才会通过校验。"
+                      "\n编号由系统自动生成且不可更改：客户端已按该编号授权，重新生成会使所有客户端失效。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form.addWidget(hint)
@@ -87,6 +85,7 @@ class ExportPage(QWidget):
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
         header = self.table.horizontalHeader()
+        header.setSectionsMovable(True)
         header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -120,13 +119,34 @@ class ExportPage(QWidget):
         self.btn_save.clicked.connect(self._save)
         self.btn_sync.clicked.connect(self._sync_ids)
         self.btn_export.clicked.connect(self._export)
+        self.ed_name.textChanged.connect(lambda _: self._persist_info())
+
+    def reload(self):
+        """切换服务器后刷新界面。"""
+        self._load()
 
     def _load(self):
-        self.ed_name.setText(self.config.export_name())
-        self.ed_uid.setText(self.config.export_server_id())
-        if not self.ed_uid.text():
-            self._gen_id()
+        """载入名称与唯一编号；编号由系统生成后立即持久化，不可手动重新生成。"""
+        name = self.config.export_name()
+        sid = self.config.export_server_id()
+        if not name:
+            cur = next((s for s in self.config.servers
+                        if s.get("id") == self.config.current_id()), None)
+            name = (cur or {}).get("name", "") or "默认服务器"
+        if not sid:
+            sid = new_server_id()
+        self.ed_uid.setText(sid)
+        self.ed_name.setText(name)
+        self._persist_info()
         self._refresh_auth_table()
+
+    def _persist_info(self):
+        """名称与唯一编号即时持久化（不依赖「保存信息」按钮，关闭/切换后依然保留）。"""
+        self.config.export = {
+            **self.config.export,
+            "name": self.ed_name.text().strip(),
+            "server_id": self.ed_uid.text().strip(),
+        }
 
     def _save_state(self):
         self.config.export = {
@@ -149,10 +169,6 @@ class ExportPage(QWidget):
             self.table.setItem(row, 1, QTableWidgetItem(item.get("name", "")))
             self.table.setItem(row, 2, QTableWidgetItem(item.get("created_at", "")))
             self.table.setItem(row, 3, QTableWidgetItem(item.get("note", "")))
-
-    def _gen_id(self):
-        self.ed_uid.setText(new_server_id())
-        self.lbl_status.setText(f"已生成唯一编号：{self.ed_uid.text()}")
 
     def _remove_id(self):
         rows = self.table.selectionModel().selectedRows()
@@ -194,13 +210,19 @@ class ExportPage(QWidget):
         self.btn_sync.setEnabled(False)
         self.lbl_status.setText("正在同步编号…")
         worker = Worker(self._sync_worker, ids)
+        worker.progress.connect(self._on_progress)
         worker.done.connect(self._on_sync_done)
         self._worker = worker
         worker.start()
 
+    def _on_progress(self, current, total, message):
+        self.lbl_status.setText(fmt_progress(current, total, message, "同步编号"))
+
     def _sync_worker(self, ids, progress_cb=None):
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
+            if progress_cb:
+                progress_cb(1, 1, "写入 license.json")
             save_ids(sftp, ids)
         return f"已同步 {len(ids)} 个编号到服务器根目录 license.json。"
 
@@ -255,11 +277,20 @@ class ExportPage(QWidget):
         self.btn_export.setEnabled(False)
         self.lbl_status.setText("正在导出…")
         worker = Worker(self._export_worker, name, server_id, path)
+        worker.progress.connect(self._on_export_progress)
         worker.done.connect(self._on_export_done)
         self._worker = worker
         worker.start()
 
+    def _on_export_progress(self, current, total, message):
+        self.lbl_status.setText(fmt_progress(current, total, message, "导出"))
+
     def _export_worker(self, name, server_id, output_path, progress_cb=None):
+        def step(cur: int, total: int, msg: str):
+            if progress_cb:
+                progress_cb(cur, total, msg)
+
+        step(1, 3, "生成客户端配置文件")
         info = {
             "host": self.config.host(),
             "port": self.config.port(),
@@ -273,12 +304,14 @@ class ExportPage(QWidget):
             f.write(content)
 
         # 登记编号并同步授权清单
+        step(2, 3, "登记授权编号")
         ids = self.config.export_ids()
         if server_id not in [i.get("id") for i in ids]:
             ids.append({"id": server_id, "name": name,
                         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "note": "由导出客户端配置生成"})
             self.config.export = {**self.config.export, "ids": ids}
+        step(3, 3, "同步授权清单到服务器")
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
             save_ids(sftp, [i.get("id", "") for i in ids])

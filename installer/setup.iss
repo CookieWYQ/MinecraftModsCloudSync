@@ -32,7 +32,7 @@ PrivilegesRequired=admin
 SetupIconFile=..\release\installer_assets\icon_server.ico
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Types]
 Name: "full"; Description: "完整安装（客户端 + 服务端）"
@@ -70,3 +70,30 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 [Run]
 Filename: "{app}\{#MyAppExeClient}"; Description: "立即运行客户端"; Flags: nowait postinstall skipifsilent; Components: client
 Filename: "{app}\{#MyAppExeServer}"; Description: "立即运行服务端工具"; Flags: nowait postinstall skipifsilent; Components: server
+
+[Code]
+// 卸载时询问是否删除本机配置与日志（数据位于安装目录下的隐藏文件夹 .mc-sync-data）
+procedure CurUninstallStepChanged(CurStep: TUninstallStep);
+var
+  DataRoot: String;
+begin
+  if CurStep = usUninstall then
+  begin
+    DataRoot := ExpandConstant('{app}\.mc-sync-data');
+    if MsgBox('是否同时删除本机已保存的服务器配置？' + #13#10 +
+              '（选择"是"将删除安装目录下 .mc-sync-data\config 中的全部配置）' + #13#10 +
+              '选择"否"则保留，以便重新安装后继续使用。',
+              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    begin
+      if DirExists(DataRoot + '\config') then
+        DelTree(DataRoot + '\config', True, True, True);
+    end;
+    if MsgBox('是否同时删除本机产生的日志文件？' + #13#10 +
+              '（选择"是"将删除安装目录下 .mc-sync-data\logs 中的全部日志）',
+              mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    begin
+      if DirExists(DataRoot + '\logs') then
+        DelTree(DataRoot + '\logs', True, True, True);
+    end;
+  end;
+end;

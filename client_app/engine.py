@@ -36,9 +36,19 @@ def profile_sftp_info(profile: dict) -> dict:
         "port": int(sftp.get("port", 22)),
         "username": sftp.get("username", ""),
         "password": sftp.get("password", ""),
-        "todo_dir": sftp.get("todo_dir") or DEFAULT_REMOTE_TODO_DIR,
-        "files_dir": sftp.get("files_dir") or DEFAULT_REMOTE_FILES_DIR,
+        "todo_dir": _abs_remote(sftp.get("todo_dir"), DEFAULT_REMOTE_TODO_DIR),
+        "files_dir": _abs_remote(sftp.get("files_dir"), DEFAULT_REMOTE_FILES_DIR),
     }
+
+
+def _abs_remote(value, default: str) -> str:
+    """远程目录统一为绝对路径（以 / 开头）；旧版相对路径配置自动补前缀。"""
+    p = (value or "").strip().replace("\\", "/")
+    if not p:
+        return default
+    if not p.startswith("/"):
+        p = "/" + p.lstrip("/")
+    return p
 
 
 def _connect(info: dict) -> SFTPManager:

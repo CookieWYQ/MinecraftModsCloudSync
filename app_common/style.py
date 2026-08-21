@@ -17,6 +17,40 @@ QTabWidget::pane {
     border-radius: 6px;
     top: -1px;
 }
+QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {
+    background: #1b1f27;
+    border: none;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #2f3644;
+    border-radius: 5px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #3a4358;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+}
+QScrollBar::handle:horizontal {
+    background: #2f3644;
+    border-radius: 5px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #3a4358;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+    height: 0;
+}
 QTabBar::tab {
     background: transparent;
     padding: 9px 22px;
@@ -143,6 +177,7 @@ QHeaderView::section {
     color: #aeb6c2;
     border: none;
     border-bottom: 1px solid #2f3644;
+    border-right: 1px solid #2f3644;
     padding: 6px 8px;
     font-size: 12px;
 }
@@ -251,6 +286,27 @@ QLabel#list-status {
 QListWidget::item:selected QLabel#list-status {
     color: #cfe0ff;
 }
+QTreeWidget {
+    background: #10141a;
+    border: 1px solid #2a2f3a;
+    border-radius: 6px;
+    outline: none;
+    alternate-background-color: #151a22;
+}
+QTreeWidget::item {
+    padding: 3px 4px;
+}
+QTreeWidget::item:hover {
+    background: #232a36;
+}
+QTreeWidget::item:selected {
+    background: #2f6bff;
+    color: #ffffff;
+}
+QTreeWidget QHeaderView::section {
+    border-right: 1px solid #2f3644;
+    border-bottom: 1px solid #2f3644;
+}
 QDateEdit, QDateTimeEdit {
     background: #10141a;
     border: 1px solid #2f3644;
@@ -274,6 +330,40 @@ QTabWidget::pane {
     background: #ffffff;
     border-radius: 6px;
     top: -1px;
+}
+QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {
+    background: #ffffff;
+    border: none;
+}
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+QScrollBar::handle:vertical {
+    background: #c9d0d9;
+    border-radius: 5px;
+    min-height: 30px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #b6bec9;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+}
+QScrollBar::handle:horizontal {
+    background: #c9d0d9;
+    border-radius: 5px;
+    min-width: 30px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #b6bec9;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    width: 0;
+    height: 0;
 }
 QTabBar::tab {
     background: transparent;
@@ -403,6 +493,7 @@ QHeaderView::section {
     color: #5f6b7a;
     border: none;
     border-bottom: 1px solid #d8dde4;
+    border-right: 1px solid #d8dde4;
     padding: 6px 8px;
     font-size: 12px;
 }
@@ -511,6 +602,27 @@ QLabel#list-status {
 }
 QListWidget::item:selected QLabel#list-status {
     color: #2f5fbf;
+}
+QTreeWidget {
+    background: #ffffff;
+    border: 1px solid #d8dde4;
+    border-radius: 6px;
+    outline: none;
+    alternate-background-color: #f7f9fb;
+}
+QTreeWidget::item {
+    padding: 3px 4px;
+}
+QTreeWidget::item:hover {
+    background: #eef2f7;
+}
+QTreeWidget::item:selected {
+    background: #d5e2ff;
+    color: #1f2328;
+}
+QTreeWidget QHeaderView::section {
+    border-right: 1px solid #d8dde4;
+    border-bottom: 1px solid #d8dde4;
 }
 QDateEdit, QDateTimeEdit {
     background: #ffffff;

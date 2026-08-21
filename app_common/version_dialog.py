@@ -1,21 +1,27 @@
 # -*- coding: utf-8 -*-
 """版本选择对话框：列出已知版本（versions 下的客户端根目录），供用户选择。"""
+import fnmatch
 import os
-from pathlib import Path
+import re
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
 )
 
+from . import winutil
 from .launcher import KnownVersions
 from .logger import get_logger
 
@@ -42,18 +48,39 @@ class VersionPickerDialog(QDialog):
             tip.setWordWrap(True)
             layout.addWidget(tip)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["版本名称", "所在根目录", "完整路径"])
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["版本名称", "完整路径"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         header = self.table.horizontalHeader()
+        header.setSectionsMovable(True)
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.itemDoubleClicked.connect(lambda _: self._accept_selected())
         layout.addWidget(self.table, 1)
+
+        # 搜索 + 排序
+        tool = QHBoxLayout()
+        self.ed_search = QLineEdit()
+        self.ed_search.setPlaceholderText("搜索版本（支持 * 通配）")
+        self.ed_search.setClearButtonEnabled(True)
+        self.cb_regex = QCheckBox("正则")
+        self.cb_regex.setToolTip("启用后按正则表达式搜索")
+        tool.addWidget(self.ed_search, 1)
+        tool.addWidget(self.cb_regex)
+        tool.addWidget(QLabel("排序："))
+        self.cb_sort = QComboBox()
+        self.cb_sort.addItem("按版本名", "name")
+        self.cb_sort.addItem("按创建时间", "ctime")
+        tool.addWidget(self.cb_sort)
+        self.btn_sort_dir = QPushButton("↓ 正序")
+        self.btn_sort_dir.setCheckable(True)
+        self.btn_sort_dir.setToolTip("切换正序 / 倒序")
+        tool.addWidget(self.btn_sort_dir)
+        layout.addLayout(tool)
 
         btn_row = QHBoxLayout()
         btn_rescan = QPushButton("重新扫描已识别目录")
@@ -72,20 +99,56 @@ class VersionPickerDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        self.ed_search.textChanged.connect(lambda _: self._refresh())
+        self.cb_regex.toggled.connect(lambda _: self._refresh())
+        self.cb_sort.currentIndexChanged.connect(lambda _: self._refresh())
+        self.btn_sort_dir.toggled.connect(lambda _: self._refresh())
+
         self._refresh()
 
-    def _refresh(self):
+    def _view_entries(self) -> list[dict]:
+        """按搜索与排序规则返回当前可见条目。"""
         entries = self.known.entries()
+        text = self.ed_search.text().strip()
+        if text:
+            use_re = self.cb_regex.isChecked()
+
+            def _match(e: dict) -> bool:
+                name = f"{e.get('version', '')} {e.get('version_dir', '')}"
+                if use_re:
+                    try:
+                        return re.search(text, name, re.IGNORECASE) is not None
+                    except re.error:
+                        return False
+                return fnmatch.fnmatch(name.lower(), f"*{text.lower()}*")
+
+            entries = [e for e in entries if _match(e)]
+        if self.cb_sort.currentData() == "ctime":
+            def _key(e: dict):
+                try:
+                    return os.path.getctime(e.get("version_dir", ""))
+                except OSError:
+                    return 0.0
+            entries = sorted(entries, key=_key)
+        else:
+            entries = sorted(entries, key=lambda e: (e.get("version") or "").lower())
+        if self.btn_sort_dir.isChecked():
+            entries.reverse()
+        return entries
+
+    def _refresh(self):
+        entries = self._view_entries()
         self.table.setRowCount(len(entries))
         for row, e in enumerate(entries):
-            root = Path(e.get("mc_root") or "").name or e.get("mc_root") or "—"
             self.table.setItem(row, 0, QTableWidgetItem(e.get("version", "")))
-            self.table.setItem(row, 1, QTableWidgetItem(root))
-            self.table.setItem(row, 2, QTableWidgetItem(e.get("version_dir", "")))
+            self.table.setItem(row, 1, QTableWidgetItem(e.get("version_dir", "")))
         if not entries:
             self.table.setRowCount(1)
-            self.table.setItem(0, 0, QTableWidgetItem("（暂无已识别版本）"))
-            self.table.setItem(0, 2, QTableWidgetItem("请先拖入 .minecraft 文件夹或启动器快捷方式"))
+            self.table.setItem(0, 0, QTableWidgetItem("（暂无匹配版本）"))
+            self.table.setItem(0, 1, QTableWidgetItem("请先拖入 .minecraft 文件夹或启动器快捷方式"))
+        elif self.table.currentRow() < 0:
+            # 默认选中第一行，保证点「选择」即可生效
+            self.table.selectRow(0)
 
     def _rescan(self):
         scanned = 0
@@ -100,22 +163,30 @@ class VersionPickerDialog(QDialog):
         if scanned:
             log.info("重新扫描新增 %d 个版本", scanned)
 
+    @staticmethod
+    def _selected_rows(table) -> list[int]:
+        """当前选中的行索引（QTableWidget 无 isRowSelected，须经 selectionModel 取）。"""
+        return sorted({idx.row() for idx in table.selectionModel().selectedRows()})
+
     def _remove(self):
-        row = self._current_row()
-        if row < 0:
+        rows = self._selected_rows(self.table)
+        if not rows:
             return
-        entry = self.known.entries()[row]
-        self.known.remove(entry.get("version_dir", ""))
+        entries = self._view_entries()
+        for row in rows:
+            if row < len(entries):
+                self.known.remove(entries[row].get("version_dir", ""))
         self._refresh()
 
-    def _current_row(self) -> int:
-        rows = self.table.selectionModel().selectedRows()
-        return rows[0].row() if rows else -1
-
     def _accept_selected(self):
-        row = self._current_row()
-        entries = self.known.entries()
-        if row < 0 or row >= len(entries):
+        rows = self._selected_rows(self.table)
+        if not rows:
+            winutil.warn(self, "提示", "请先选择一个版本。")
+            return
+        entries = self._view_entries()
+        row = rows[0]
+        if row >= len(entries):
+            winutil.warn(self, "提示", "当前没有可选择的版本。")
             return
         self._selected = entries[row]
         self.accept()

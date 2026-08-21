@@ -18,8 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import winutil
-from .constants import logs_dir
-from .logger import get_logger
+from .logger import active_logs_dir, get_logger
 
 log = get_logger("log_manager")
 
@@ -27,10 +26,14 @@ _TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 
 
 def collect_log_lines(start: datetime, end: datetime, keyword: str = "") -> list[str]:
-    """扫描日志目录（含轮转备份），按时间段与关键词过滤。"""
+    """扫描当前应用的日志目录（含轮转备份），按时间段与关键词过滤。
+
+    客户端 / 服务端日志已按子目录隔离（logs\\client、logs\\server），
+    这里只读取当前应用自己的日志，不会混入对方（含 SFTP 连接细节）的记录。
+    """
     keyword = keyword.strip().lower()
     lines: list[str] = []
-    for path in sorted(logs_dir().glob("*.log*")):
+    for path in sorted(active_logs_dir().glob("*.log*")):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for raw in f:

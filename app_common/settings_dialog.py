@@ -108,6 +108,7 @@ class SettingsDialog(QDialog):
         theme = self.cb_theme.currentData()
         self.config.theme = theme
         # 开机自启（仅客户端支持；服务端走安装器自启项）
+        autostart = "—"
         if self.cb_autostart is not None:
             autostart = self.cb_autostart.isChecked()
             self.config.autostart = autostart

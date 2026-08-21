@@ -6,6 +6,7 @@
     python build.py
 """
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -35,6 +36,10 @@ def build_icons() -> tuple[str, str]:
 
 def build_exe(entry: str, name: str, icon: str, admin: bool):
     print(f"=== 2/3 打包 {name} ===")
+    # 打包前结束同名进程：PyInstaller 需覆盖 dist 下的旧 exe，
+    # 若旧实例仍在运行（文件被占用）会报 PermissionError [WinError 5] 拒绝访问。
+    subprocess.run(["taskkill", "/F", "/IM", f"{name}.exe"],
+                   capture_output=True, check=False)
     cmd = [
         VENV_PY, "-m", "PyInstaller",
         "--noconfirm", "--clean", "--onefile", "--noconsole",
@@ -43,6 +48,15 @@ def build_exe(entry: str, name: str, icon: str, admin: bool):
         "--distpath", str(ROOT / "dist"),
         "--workpath", str(ROOT / "build"),
         "--specpath", str(ROOT / "build"),
+        # 强制收集本地包的全部子模块：PyInstaller 对 app_common 的
+        # 静态分析会漏掉 app_config 等模块，导致打包后 exe 运行报
+        # "No module named 'app_common.app_config'"。
+        "--collect-submodules", "app_common",
+        "--collect-submodules", "client_app",
+        "--collect-submodules", "server_app",
+        # MCMod（MC 百科）数据库：mcmod.buf（PCL CE 数据，621KB）
+        "--add-data",
+        f"{ROOT / 'app_common' / 'data' / 'mcmod.buf'};app_common/data",
         str(ROOT / entry),
     ]
     if admin:
@@ -60,8 +74,8 @@ def assemble(client_ico: str, server_ico: str):
 
     server_dir = release / "MinecraftSyncServer"
     client_dir = release / "MinecraftSyncClient"
-    server_dir.mkdir()
-    client_dir.mkdir()
+    server_dir.mkdir(exist_ok=True)
+    client_dir.mkdir(exist_ok=True)
 
     # 单文件 exe
     shutil.copy(dist / "MinecraftSyncServer.exe", server_dir / "MinecraftSyncServer.exe")
@@ -75,7 +89,24 @@ def assemble(client_ico: str, server_ico: str):
     print("发布目录: ", release)
 
 
+def _ensure_venv() -> None:
+    """强制使用项目 .venv 解释器打包。
+
+    系统 Python（尤其 3.13）下 PyInstaller 收集模块异常，会漏掉
+    app_common 子模块，导致打包出的 exe 运行时报
+    "No module named 'app_common.app_config'"。这里自动切换到 .venv。
+    """
+    venv_py = ROOT / ".venv" / "Scripts" / "python.exe"
+    if not venv_py.exists():
+        return
+    if Path(sys.executable).resolve() == venv_py.resolve():
+        return
+    print(f">> 当前解释器不是 .venv（{sys.executable}），自动切换到 .venv\\Scripts\\python.exe 重新执行")
+    os.execv(str(venv_py), [str(venv_py), str(ROOT / "build.py")] + sys.argv[1:])
+
+
 def main() -> int:
+    _ensure_venv()
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-icons", action="store_true", help="跳过图标生成")
     args = parser.parse_args()
@@ -85,7 +116,7 @@ def main() -> int:
     if not args.skip_icons or not (Path(client_ico).exists() and Path(server_ico).exists()):
         client_ico, server_ico = build_icons()
     build_exe("entry_server.py", "MinecraftSyncServer", server_ico, admin=False)
-    build_exe("entry_client.py", "MinecraftSyncClient", client_ico, admin=True)
+    build_exe("entry_client.py", "MinecraftSyncClient", client_ico, admin=False)
     assemble(client_ico, server_ico)
     print("\n构建完成。使用 Inno Setup 编译 installer/setup.iss 生成安装程序。")
     return 0

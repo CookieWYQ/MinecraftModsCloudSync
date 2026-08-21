@@ -109,8 +109,69 @@ def confirm(parent, title: str, text: str, default_yes: bool = False) -> bool:
     return box.exec() == QMessageBox.Yes
 
 
+def confirm_list(parent, title: str, text: str, items: list[str],
+                 ok_label: str = "确定", cancel_label: str = "取消") -> bool:
+    """带可滚动条目列表的二次确认弹窗。
+
+    条目较多（批量操作）时使用，避免大量文本把弹窗撑得超出屏幕、按不到按钮。
+    """
+    from PySide6.QtWidgets import (
+        QDialog,
+        QDialogButtonBox,
+        QLabel,
+        QListWidget,
+        QVBoxLayout,
+    )
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.setMinimumSize(480, 380)
+    layout = QVBoxLayout(dlg)
+    if text:
+        tip = QLabel(text)
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+    lst = QListWidget()
+    lst.addItems(items)
+    layout.addWidget(lst, 1)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    buttons.button(QDialogButtonBox.Ok).setText(ok_label)
+    buttons.button(QDialogButtonBox.Ok).setDefault(True)
+    buttons.button(QDialogButtonBox.Cancel).setText(cancel_label)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    layout.addWidget(buttons)
+    return dlg.exec() == QDialog.Accepted
+
+
 def info(parent, title: str, text: str) -> None:
     QMessageBox.information(parent, title, text)
+
+
+def info_list(parent, title: str, items: list[str], text: str = "") -> None:
+    """带可滚动条目列表的信息弹窗（内容多时使用，避免撑出屏幕按不到按钮）。"""
+    from PySide6.QtWidgets import (
+        QDialog,
+        QDialogButtonBox,
+        QLabel,
+        QListWidget,
+        QVBoxLayout,
+    )
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.setMinimumSize(520, 420)
+    layout = QVBoxLayout(dlg)
+    if text:
+        tip = QLabel(text)
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+    lst = QListWidget()
+    lst.addItems(items)
+    layout.addWidget(lst, 1)
+    buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+    buttons.button(QDialogButtonBox.Ok).setText("确定")
+    buttons.accepted.connect(dlg.accept)
+    layout.addWidget(buttons)
+    dlg.exec()
 
 
 def warn(parent, title: str, text: str) -> None:
