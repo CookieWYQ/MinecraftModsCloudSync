@@ -78,6 +78,11 @@ class SettingsDialog(QDialog):
             if self.config is not None:
                 self.cb_notify.setChecked(self.config.notify)
             gform.addRow(self.cb_notify)
+
+        self.cb_update_check = QCheckBox("自动检查软件更新（从 GitHub / Gitee 定时检查软件新版本）")
+        if self.config is not None:
+            self.cb_update_check.setChecked(self.config.auto_update_check)
+        gform.addRow(self.cb_update_check)
         layout.addWidget(general)
 
         tip = QLabel("提示：本窗口管理软件本体设置；每个服务器对应的档案与数据请使用「配置管理」。")
@@ -120,6 +125,8 @@ class SettingsDialog(QDialog):
             interval_changed = True
         if self.cb_notify is not None:
             self.config.notify = self.cb_notify.isChecked()
+        if self.cb_update_check is not None:
+            self.config.auto_update_check = self.cb_update_check.isChecked()
         if self.on_changed is not None:
             try:
                 self.on_changed(interval_changed)

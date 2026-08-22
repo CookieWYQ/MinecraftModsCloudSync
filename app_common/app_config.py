@@ -39,6 +39,7 @@ class ServerConfig:
             "servers": [],
             "current_id": "",
             "window": {"width": 980, "height": 680, "tab": 0},
+            "auto_update_check": True,
         })
         self._migrate_legacy()
 
@@ -194,6 +195,16 @@ class ServerConfig:
             value = "system"
         self.store.set("theme", value)
 
+    # ---- 软件本体更新 ----
+    @property
+    def auto_update_check(self) -> bool:
+        """是否定时自动检查软件本体更新（GitHub / Gitee）。"""
+        return bool(self.store.get("auto_update_check", True))
+
+    @auto_update_check.setter
+    def auto_update_check(self, value: bool) -> None:
+        self.store.set("auto_update_check", bool(value))
+
     def host(self) -> str:
         return self.sftp.get("host", "")
 
@@ -314,6 +325,7 @@ class ClientConfig:
             "check_interval_min": 60,
             "autostart": False,
             "notify": True,
+            "auto_update_check": True,
             "profiles": [],
         })
 
@@ -401,6 +413,16 @@ class ClientConfig:
     @notify.setter
     def notify(self, value: bool) -> None:
         self.store.set("notify", bool(value))
+
+    # ---- 软件本体更新 ----
+    @property
+    def auto_update_check(self) -> bool:
+        """是否定时自动检查软件本体更新（GitHub / Gitee）。"""
+        return bool(self.store.get("auto_update_check", True))
+
+    @auto_update_check.setter
+    def auto_update_check(self, value: bool) -> None:
+        self.store.set("auto_update_check", bool(value))
 
     # ---- 主题 ----
     @property

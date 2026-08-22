@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """服务端 - 发布待办页：检测服务端改动（新增/替换/删除），选择是否发布到客户端。
 
 - 服务端改动树即任务清单：全部默认启用（发布），右键可禁用（变灰）/重新启用/批注。
@@ -36,6 +36,7 @@ from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
 from app_common.sftp import SFTPManager
 from app_common.snapshot import load_snapshot, save_snapshot
+from app_common.snapshot_dialog import SnapshotHistoryDialog
 from app_common.tasks import CATEGORY_LABELS, TaskItem, TodoManifest
 from app_common.worker import Worker, fmt_progress
 
@@ -144,6 +145,12 @@ class TodoPage(QWidget):
         self.lbl_pub_snap = QLabel("上次发布快照：无")
         self.lbl_pub_snap.setObjectName("muted")
         head_row.addWidget(self.lbl_pub_snap, 1)
+        self.btn_snapshots = QPushButton("快照历史…")
+        self.btn_snapshots.setToolTip(
+            "查看全部历史快照（时间戳 / 文件树）\n"
+            "可将任意历史快照设为发布基线，从而撤销 / 回滚客户端更新")
+        self.btn_snapshots.clicked.connect(self._open_snapshots)
+        head_row.addWidget(self.btn_snapshots)
         self.ed_search = QLineEdit()
         self.ed_search.setPlaceholderText("搜索名称（支持 * 通配）")
         self.ed_search.setClearButtonEnabled(True)  # 一键清空搜索
@@ -226,6 +233,12 @@ class TodoPage(QWidget):
         snap = load_snapshot(self.config.current_id(), "publish")
         self.lbl_pub_snap.setText(
             f"上次发布快照：{snap.get('saved_at') or '无（首次检测将对比空基线）'}")
+
+    def _open_snapshots(self):
+        """打开快照历史对话框（查看时间戳 / 文件树，可设为发布基线以撤销更新）。"""
+        dlg = SnapshotHistoryDialog(self, config=self.config)
+        dlg.exec()
+        self._refresh_pub_snap()  # 可能被设为新基线，刷新显示
 
     def _detect_changes(self, auto: bool = False):
         if self._detecting:

@@ -34,7 +34,7 @@ from app_common import winutil
 from app_common.app_config import ClientConfig
 from app_common.app_icon import get_app_icon
 from app_common.config_manager import ConfigManagerDialog
-from app_common.constants import APP_DISPLAY_NAME
+from app_common.constants import APP_DISPLAY_NAME, APP_VERSION
 from app_common.launcher import KnownVersions, parse_and_store
 from app_common.log_manager import LogManagerDialog
 from app_common.logger import get_logger, set_log_context
@@ -42,6 +42,18 @@ from app_common.notifications import notify
 from app_common.profile import PROFILE_FILTER, PROFILE_SUFFIX, parse_profile_content
 from app_common.settings_dialog import SettingsDialog
 from app_common.tasks import ACTION_LABELS, CATEGORY_LABELS, TodoManifest
+from app_common.updater import (
+    DownloadThread,
+    UpdateCheckThread,
+    launch_installer,
+    last_prompted_version,
+    parse_version,
+    release_page_url,
+    set_last_prompted_version,
+    show_check_failed,
+    show_update_result,
+    update_dir,
+)
 from app_common.version_dialog import VersionPickerDialog
 from app_common.worker import Worker
 
@@ -91,6 +103,9 @@ class ClientMainWindow(QWidget):
         self._has_new: dict[str, bool] = {}
         self._current_sid: str | None = None
         self._threads = []
+        self._update_thread = None
+        self._download_thread = None
+        self._update_manual = False
         self._build()
         self._load_state()
 
@@ -247,10 +262,14 @@ class ClientMainWindow(QWidget):
         btn_logs.clicked.connect(lambda: LogManagerDialog(self).exec())
         btn_cfg = QPushButton("配置管理…")
         btn_cfg.clicked.connect(self._open_config_manager)
+        self.btn_update = QPushButton("检查更新…")
+        self.btn_update.setToolTip(f"当前版本：{APP_VERSION}\n检查 GitHub 上的软件新版本")
+        self.btn_update.clicked.connect(lambda: self._check_update(manual=True))
         opt_row.addWidget(btn_settings)
         opt_row.addWidget(btn_logs)
         opt_row.addWidget(btn_cfg)
         opt_row.addStretch(1)
+        opt_row.addWidget(self.btn_update)
         right.addWidget(opt_box)
 
         body.addLayout(right, 3)
@@ -263,6 +282,12 @@ class ClientMainWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self._check(manual=False))
         self.timer.start(self.config.check_interval_min * 60_000)
+
+        # 软件本体更新：启动数秒后检查一次，之后每 6 小时自动检查（可在「设置」中关闭）
+        QTimer.singleShot(5000, lambda: self._check_update(manual=False))
+        self.timer_update = QTimer(self)
+        self.timer_update.timeout.connect(lambda: self._check_update(manual=False))
+        self.timer_update.start(6 * 60 * 60 * 1000)
 
         self._setup_tray()
 
@@ -754,6 +779,89 @@ class ClientMainWindow(QWidget):
         if interval_changed:
             self.timer.start(self.config.check_interval_min * 60_000)
         self.lbl_status.setText("软件设置已保存。")
+
+    # ---------- 软件本体更新（GitHub / Gitee） ----------
+    def _check_update(self, manual: bool = True):
+        """检查软件本体更新。manual=False 为定时/启动静默检查（尊重设置开关）。"""
+        if not manual and not self.config.auto_update_check:
+            return
+        if self._update_thread is not None and self._update_thread.isRunning():
+            return
+        self._update_manual = manual
+        self._update_thread = UpdateCheckThread(self)
+        self._update_thread.done.connect(self._on_update_checked)
+        self._update_thread.finished.connect(self._update_thread.deleteLater)
+        self._update_thread.start()
+
+    def _on_update_checked(self, ok: bool, result, err: str):
+        if not ok:
+            if self._update_manual and show_check_failed(self, err):
+                self._check_update(manual=True)
+            return
+        latest = (result or {}).get("latest")
+        releases = (result or {}).get("releases") or []
+        checked_at = (result or {}).get("checked_at") or ""
+        has_update = False
+        if latest is not None and latest.setup_url:
+            new_ver = parse_version(latest.tag)
+            cur_ver = parse_version(APP_VERSION)
+            has_update = bool(new_ver and cur_ver and new_ver > cur_ver)
+        if not has_update:
+            # 手动检查 → 展示结果（当前版本 / 检查时间 / 版本历史）；自动检查 → 静默
+            if self._update_manual:
+                show_update_result(self, latest, releases, checked_at,
+                                   has_update=False)
+            return
+        # 静默自动检查：已提示过该版本则不再打扰
+        if not self._update_manual and last_prompted_version() == latest.tag:
+            return
+        if not show_update_result(self, latest, releases, checked_at,
+                                  has_update=True):
+            return
+        set_last_prompted_version(latest.tag)
+        self._start_download(latest)
+
+    def _start_download(self, latest):
+        dest = update_dir() / latest.setup_name
+        progress = QProgressDialog("正在后台下载安装程序…", "取消", 0,
+                                   max(int(latest.setup_size) or 1, 1), self)
+        progress.setWindowTitle("下载安装程序")
+        progress.setWindowModality(Qt.NonModal)  # 后台静默下载：不阻塞界面操作
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+
+        thread = DownloadThread(latest.setup_url, str(dest), self)
+        progress.canceled.connect(thread.cancel)
+        thread.progress.connect(lambda cur, total, msg: (
+            progress.setRange(0, max(total or 1, 1)),
+            progress.setValue(cur),
+            progress.setLabelText(f"{msg}（{latest.setup_name}）"),
+        ))
+        thread.done.connect(lambda ok, path, err: self._on_update_downloaded(
+            ok, path, err, progress, latest))
+        thread.finished.connect(thread.deleteLater)
+        self._download_thread = thread
+        thread.start()
+
+    def _on_update_downloaded(self, ok: bool, path: str, err: str, progress, latest):
+        progress.close()
+        if not ok:
+            winutil.error(self, "下载失败",
+                          f"安装程序下载失败（已尝试直连与多个加速镜像）：\n{err}\n\n"
+                          f"可手动下载安装包：\n{release_page_url()}")
+            return
+        if not winutil.confirm(
+                self, "下载完成",
+                f"安装程序已下载：\n{path}\n\n"
+                f"即将启动安装程序并关闭本程序。\n"
+                f"请在弹出的安装向导中完成安装。"):
+            return
+        try:
+            launch_installer(path)
+        except Exception as exc:
+            winutil.error(self, "启动失败", f"无法启动安装程序：\n{exc}")
+            return
+        QApplication.quit()
 
     # ---------- 配置/日志管理 ----------
     def _open_config_manager(self):
