@@ -36,13 +36,18 @@ from PySide6.QtWidgets import (
 )
 
 from app_common import winutil
+from app_common.file_hash import hash_file, hash_remote_smart
 from app_common.logger import get_logger
 from app_common.mcmod_db import wiki_id_for
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_display_name
 from app_common.mod_env import jar_environment, mcmod_env_online
 from app_common.mod_identity import filename_base, jar_identifiers
 from app_common.sftp import SFTPManager
-from app_common.snapshot import load_snapshot, update_snapshot
+from app_common.snapshot import (
+    load_snapshot,
+    normalize_files,
+    update_snapshot,
+)
 from app_common.tasks import TodoManifest
 from app_common.worker import Worker, fmt_progress
 
@@ -51,7 +56,7 @@ from .remote_tree import RemoteTreeWidget, SelectTreeWidget, fmt_size
 log = get_logger("server.remote_page")
 
 STATUS_LABELS = {"new": "新增", "update": "更新", "server": "仅服务器",
-                 "obsolete": "旧版残留", "same": "已一致"}
+                 "obsolete": "旧版残留", "same": "已一致", "rename": "改名"}
 TARGET_LABELS = {"both": "双端", "client": "客户端", "server": "服务端", "skip": "跳过"}
 # 默认排除的顶层文件夹（非分发内容，可在「规则…」中修改）
 DEFAULT_EXCLUDE = {"logs", "cache", "crash-reports", "backups"}
@@ -161,10 +166,10 @@ class RemoteFilePage(QWidget):
         layout.addLayout(info_row)
 
         btn_row = QHBoxLayout()
-        self.btn_scan = QPushButton("手动创建快照")
+        self.btn_scan = QPushButton("刷新（重新检测差异）")
         self.btn_scan.setObjectName("primary")
-        self.btn_scan.setToolTip("重新读取服务端目录树，覆盖更新快照并对比本地差异\n"
-                                 "（程序启动与每次发送后会自动创建快照，此处为手动触发）")
+        self.btn_scan.setToolTip("手动刷新：重新读取服务端与本地目录，覆盖更新快照并重新对比差异\n"
+                                 "（程序启动与每次发送后会自动检测，此处为手动触发）")
         self.btn_add_local = QPushButton("从本地添加文件…")
         self.btn_remove = QPushButton("移除选中")
         self.btn_browse_remote = QPushButton("浏览服务端文件仓库…")
@@ -361,43 +366,128 @@ class RemoteFilePage(QWidget):
         worker.start()
 
     def _snapshot_scan_worker(self, progress_cb=None) -> str:
-        """读取服务端文件仓库 + 客户端文件目录（并行、跳过系统目录与排除目录）→ 覆盖式更新快照。
+        """读取服务端文件仓库 + 客户端文件目录 → 计算需要确认的远程哈希 → 覆盖式更新快照 → 对比本地差异。
 
         快照统一以「相对服务端文件仓库根目录」的键保存：
         - 服务端文件 → 相对 server_root 的路径（files_dir 位于其下时自动剔除，避免重复）
         - 客户端文件 → files_dir 的内容统一以 client_files/ 前缀并入
         （files_dir 可以是服务器上任意绝对位置，不再要求位于 server_root 之下）
+
+        哈希按需下载计算：仅对「本地与远程大小相同」的候选（确认是否一致）以及
+        「本地新增 ↔ 远程独有」的改名候选下载远程文件，避免全量下载。
         """
         excludes = list(self._excludes) or list(DEFAULT_EXCLUDE)
         server_root = self.config.server_root
         files_dir = self.config.files_dir
+        local_root = self.config.local_mc_dir
 
         def on_scan_progress(dirs: int, entries: int):
             if progress_cb:
                 progress_cb(dirs, 0,
                             f"正在读取服务端目录树…（已读 {dirs} 个目录 / {entries} 个条目）")
 
+        local = self._collect_local(local_root)
+        old_snap = normalize_files(
+            load_snapshot(self.config.current_id()).get("files", {}))
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
-            files: dict[str, int] = {}
+            files: dict[str, dict] = {}
             overlap = _overlap_prefix(files_dir, server_root)
             for rel, size in sftp.list_files_recursive_with_size(
                     server_root, excludes=excludes, skip_system=True,
                     progress_cb=on_scan_progress):
                 if overlap and (rel == overlap or rel.startswith(overlap + "/")):
                     continue  # 属于客户端文件目录，避免重复计入
-                files[rel] = size
+                files[rel] = {"size": size, "hash": None}
             for rel, size in sftp.list_files_recursive_with_size(
                     files_dir, excludes=excludes, skip_system=False,
                     progress_cb=on_scan_progress):
-                files[f"client_files/{rel}"] = size
+                files[f"client_files/{rel}"] = {"size": size, "hash": None}
+            # 从旧快照继承哈希：大小相同视为内容未变，沿用上次确认的哈希，
+            # 避免每次检测都重新下载计算（服务端文件被外部改动且大小不变属已知边界）。
+            for k, meta in files.items():
+                old = old_snap.get(k)
+                if old and old["size"] == meta["size"] and old.get("hash"):
+                    meta["hash"] = old["hash"]
+            self._fill_remote_hashes(sftp, files, local, progress_cb)
         snap = update_snapshot(self.config.current_id(), files)
-        rows = self._diff_local(files)
+        rows = self._diff_local(files, local)
         return json.dumps({"saved_at": snap.get("saved_at", ""),
                            "changed": snap.get("changed", False),
                            "aged": snap.get("aged", False),
                            "rows": rows, "repo_count": len(files)},
                           ensure_ascii=False)
+
+    def _collect_local(self, root: str) -> dict:
+        """收集本地新客户端文件：{rel: {"size", "mtime", "hash"}}（本地直接计算 MD5）。"""
+        excludes = self._excludes or set(DEFAULT_EXCLUDE)
+        local: dict[str, dict] = {}
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if not d.startswith(".") and d.lower() not in excludes]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, root).replace("\\", "/")
+                try:
+                    info = {"size": os.path.getsize(full),
+                            "mtime": os.path.getmtime(full),
+                            "hash": hash_file(full)}
+                except OSError:
+                    continue
+                local[rel] = info
+        return local
+
+    def _fill_remote_hashes(self, sftp, files: dict, local: dict,
+                            progress_cb=None) -> int:
+        """按需下载远程文件计算哈希并回填 files，返回下载数量。
+
+        两类候选：
+        1. 本地存在、远程同路径存在且大小相同 → 确认是否真的内容一致；
+        2. 本地新增 Y ↔ 远程独有 X（大小相同）→ 下载 X 哈希用于改名匹配。
+        """
+        need: list[str] = []
+        for rel, linfo in local.items():
+            target, _ = self._effective_target(rel)
+            for k in self._remote_keys_of(rel, target):
+                meta = files.get(k)
+                if (meta is not None and meta["size"] == linfo["size"]
+                        and not meta.get("hash")):
+                    need.append(k)
+        new_rels = [r for r in local
+                    if not any(k in files for k in
+                               self._remote_keys_of(r, self._effective_target(r)[0]))]
+        server_only_sizes: dict[int, list[str]] = {}
+        for k, meta in files.items():
+            if k in local:
+                continue
+            if k.startswith("client_files/"):
+                if k[len("client_files/"):] in local:
+                    continue
+            if meta.get("hash"):
+                continue
+            server_only_sizes.setdefault(meta["size"], []).append(k)
+        for y in new_rels:
+            for k in server_only_sizes.get(local[y]["size"], []):
+                if k not in need:
+                    need.append(k)
+        if not need:
+            return 0
+        total = len(need)
+        for i, k in enumerate(need):
+            if k.startswith("client_files/"):
+                remote = TodoManifest.remote_source_path(
+                    sftp, self.config.files_dir, k[len("client_files/"):])
+            else:
+                remote = TodoManifest.remote_source_path(
+                    sftp, self.config.server_root, k)
+            h = hash_remote_smart(sftp, remote)
+            if h:
+                files[k] = {**files[k], "hash": h}
+            if progress_cb:
+                progress_cb(i + 1, total, f"计算哈希 {k}")
+        return total
 
     def _on_scan_progress(self, current, total, message):
         """快照扫描进度：实时更新状态文本，避免看起来像卡死（目录树扫描无总进度）。"""
@@ -412,67 +502,71 @@ class RemoteFilePage(QWidget):
             return (f"client_files/{rel}",)
         return (rel, f"client_files/{rel}")
 
-    def _diff_status(self, rel: str, target: str, size: int,
+    def _diff_status(self, rel: str, target: str, size: int, hash_val: str | None,
                      snapshot_files: dict) -> tuple[str | None, int]:
         """对比文件在快照中的状态：None=已同步 / new=需要上传 / update=需要更新。
 
-        任一约定位置存在且大小一致 → 已同步（不强制双端副本都在）；
-        所有约定位置都不存在 → new；存在但大小不同 → update。
+        判定条件组合（大小 + 哈希双条件）：
+        - 任一约定位置存在且大小一致，且（快照无哈希或哈希一致）→ 已同步；
+        - 所有约定位置都不存在 → new；
+        - 存在但大小不同，或大小相同但哈希不同 → update。
         返回 (状态, 远程大小)。
         """
-        found = [snapshot_files[k] for k in self._remote_keys_of(rel, target) if k in snapshot_files]
+        found = [(k, snapshot_files[k]) for k in self._remote_keys_of(rel, target)
+                 if k in snapshot_files]
         if not found:
             return "new", 0
-        remote_size = found[0]
-        if any(s != size for s in found):
-            return "update", remote_size
+        remote_size = found[0][1]["size"]
+        for _, meta in found:
+            if meta["size"] != size:
+                return "update", remote_size
+            if meta.get("hash") and hash_val and meta["hash"] != hash_val:
+                return "update", remote_size
         return None, remote_size
 
-    def _diff_local(self, snapshot_files: dict) -> list:
-        """本地文件 vs 服务端快照对比：新增 / 更新 / 旧版残留 / 仅服务器。
+    def _diff_local(self, snapshot_files: dict, local: dict) -> list:
+        """本地文件 vs 服务端快照对比：新增 / 更新 / 改名 / 旧版残留 / 仅服务器。
 
         按目标类型找对应位置：客户端模组（client）对比 client_files/ 下，
         服务端/双端以服务端根目录为准（双端副本任一存在即视为已同步），
         避免把服务端已有但 client_files 未补的文件误判为新增。
+        本地新增文件与服务端独有文件内容相同（大小 + 哈希一致）→ 判定为「改名」。
         """
-        root = self.config.local_mc_dir
-        excludes = self._excludes or set(DEFAULT_EXCLUDE)
-        keywords = [k.lower() for k in self._client_keywords]
-        local: dict[str, dict] = {}
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames
-                           if not d.startswith(".") and d.lower() not in excludes]
-            for fn in filenames:
-                if fn.startswith("."):
-                    continue
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root).replace("\\", "/")
-                try:
-                    info = {"size": os.path.getsize(full),
-                            "mtime": os.path.getmtime(full)}
-                except OSError:
-                    continue
-                local[rel] = info
         rows = []
         for rel in sorted(local):
             info = local[rel]
             target, manual = self._effective_target(rel)
-            status, remote_size = self._diff_status(rel, target, info["size"], snapshot_files)
+            status, remote_size = self._diff_status(
+                rel, target, info["size"], info.get("hash"), snapshot_files)
             if status is None:
-                continue  # 目标位置均存在且大小一致 → 无需操作
+                continue  # 目标位置均存在且内容一致 → 无需操作
             row = {"rel": rel, "status": status, "size": info["size"],
                    "remote_size": remote_size, "mtime": info["mtime"],
                    "target": target, "manual": manual}
             if self._is_ignored(rel):
                 row["ignored"] = True  # 保留原状态，恢复时直接还原
             rows.append(row)
+
+        # 改名配对：本地新增 Y ↔ 服务端独有 X（大小 + 哈希都相同 → 视为改名而非 新增+删除）
+        matched = self._match_renames(snapshot_files, local)
+        if matched:
+            new_by_rel = {r["rel"]: r for r in rows if r["status"] == "new"}
+            for y, x in matched.items():
+                r = new_by_rel.get(y)
+                if r is None:
+                    continue
+                r["status"] = "rename"
+                r["old_rel"] = x
+                r["remote_size"] = snapshot_files[x]["size"]
+
         # 旧版残留：本地 mods 下的 jar 标识集合（modid + 文件名基名），
         # 服务端 mods 下本地不存在的 jar 若命中同一标识 → 视为旧版本残留（默认勾选删除）
         local_jar_ids: set[str] = set()
         for rel in local:
             if rel.split("/", 1)[0] == "mods" and rel.rsplit("/", 1)[-1].lower().endswith(".jar"):
                 try:
-                    local_jar_ids.update(i for i in jar_identifiers(os.path.join(root, rel)) if i)
+                    local_jar_ids.update(i for i in jar_identifiers(
+                        os.path.join(self.config.local_mc_dir, rel)) if i)
                 except Exception:
                     continue
         obsolete_rels: set[str] = set()
@@ -486,25 +580,57 @@ class RemoteFilePage(QWidget):
             if base and base in local_jar_ids:
                 obsolete_rels.add(rel)
                 row = {"rel": rel, "status": "obsolete", "size": 0,
-                       "remote_size": snapshot_files[rel], "mtime": 0,
+                       "remote_size": snapshot_files[rel]["size"], "mtime": 0,
                        "target": "server", "manual": False}
                 if self._is_ignored(rel):
                     row["ignored"] = True
                 rows.append(row)
+
+        matched_x = set(matched.values())
         for rel in sorted(snapshot_files):
-            if rel in local or rel in obsolete_rels:
+            if rel in local or rel in obsolete_rels or rel in matched_x:
                 continue
             # client_files/ 下的文件对应本地同路径（去掉前缀），本地存在 → 已同步，不是服务端独有
             if rel.startswith("client_files/"):
                 if rel[len("client_files/"):] in local:
                     continue
             row = {"rel": rel, "status": "server", "size": 0,
-                   "remote_size": snapshot_files[rel], "mtime": 0,
+                   "remote_size": snapshot_files[rel]["size"], "mtime": 0,
                    "target": "both", "manual": False}
             if self._is_ignored(rel):
                 row["ignored"] = True
             rows.append(row)
         return rows
+
+    def _match_renames(self, snapshot_files: dict, local: dict) -> dict:
+        """匹配改名对：{本地新增 Y: 服务端独有 X}（大小 + 哈希都相同 → 判定为改名）。
+
+        只匹配哈希已知的服务端文件（扫描时已按需下载计算）。
+        """
+        server_only: dict[tuple[int, str], list[str]] = {}
+        for k, meta in snapshot_files.items():
+            if k in local:
+                continue
+            if k.startswith("client_files/"):
+                if k[len("client_files/"):] in local:
+                    continue
+            if meta.get("hash"):
+                server_only.setdefault((meta["size"], meta["hash"]), []).append(k)
+        matched: dict[str, str] = {}
+        used: set[str] = set()
+        for y, info in sorted(local.items()):
+            if any(k in snapshot_files for k in
+                   self._remote_keys_of(y, self._effective_target(y)[0])):
+                continue  # 远程已有对应位置，不是新增
+            h = info.get("hash")
+            if not h:
+                continue
+            for k in server_only.get((info["size"], h), []):
+                if k not in used:
+                    matched[y] = k
+                    used.add(k)
+                    break
+        return matched
 
     def _on_snapshot_scan_done(self, ok: bool, msg: str):
         self._snapshot_busy = False
@@ -530,6 +656,7 @@ class RemoteFilePage(QWidget):
         self._refresh_tree()
         new_n = sum(1 for r in self._rows if r["status"] == "new")
         upd_n = sum(1 for r in self._rows if r["status"] == "update")
+        rnm_n = sum(1 for r in self._rows if r["status"] == "rename")
         srv_n = sum(1 for r in self._rows if r["status"] == "server")
         obs_n = sum(1 for r in self._rows if r["status"] == "obsolete")
         if changed:
@@ -547,11 +674,12 @@ class RemoteFilePage(QWidget):
                 "填写服务器文件实际所在根目录（默认 /）。")
         else:
             self.lbl_status.setText(
-                f"对比完成：新增 {new_n}、更新 {upd_n}、"
+                f"对比完成：新增 {new_n}、更新 {upd_n}"
+                f"{f'、改名 {rnm_n}' if rnm_n else ''}、"
                 f"旧版残留 {obs_n}、服务端独有 {srv_n} ✔"
                 f"（服务端仓库共 {repo_count} 个文件，{snap_note}）")
-        log.info("更新服务端对比完成: new=%d update=%d obsolete=%d server=%d repo=%d changed=%s aged=%s",
-                 new_n, upd_n, obs_n, srv_n, repo_count, changed, aged)
+        log.info("更新服务端对比完成: new=%d update=%d rename=%d obsolete=%d server=%d repo=%d changed=%s aged=%s",
+                 new_n, upd_n, rnm_n, obs_n, srv_n, repo_count, changed, aged)
 
     # ---------- 人工添加（本地浏览） ----------
     def _add_local_files(self):
@@ -737,6 +865,8 @@ class RemoteFilePage(QWidget):
                 "size": r.get("size", 0), "mtime": r.get("mtime", 0), "ftype": ftype})
             node.setToolTip(2, self._target_tooltip(r))  # 目标判断依据（手动标注）
             node.setToolTip(6, env_tip)  # 分析结果列：判断依据/未检测到提示
+            if r.get("old_rel"):
+                node.setToolTip(1, f"原名：{r['old_rel']}")
             if ignored:
                 node.setToolTip(1, "已忽略：不参与差异审查，右键可取消忽略恢复")
                 node.setToolTip(0, "已忽略（右键可取消）")
@@ -750,7 +880,7 @@ class RemoteFilePage(QWidget):
                 font = node.font(0)
                 font.setItalic(True)
                 node.setFont(0, font)
-            elif r["status"] in ("new", "update", "server", "obsolete"):
+            elif r["status"] in ("new", "update", "rename", "server", "obsolete"):
                 node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
                 node.setCheckState(0, Qt.Checked if r.get("checked") else Qt.Unchecked)
             else:
@@ -1206,12 +1336,17 @@ class RemoteFilePage(QWidget):
         return walk(root)
 
     def _collect_actions(self):
-        """收集发送动作：uploads=[(rel, target)]，deletes=[rel]，并返回其中旧版残留数量。"""
+        """收集发送动作：
+        uploads=[(rel, target)]，deletes=[server_root 相对路径]，deletes_client=[files_dir 相对路径]，
+        返回 (uploads, deletes, deletes_client, 旧版残留数量)。
+        改名 = 上传新文件 + 删除旧文件；client_files/ 前缀的删除走 files_dir。
+        """
         root = self.review_tree.topLevelItem(0)
         if root is None:
-            return [], [], 0
+            return [], [], [], 0
         uploads: list[tuple[str, str]] = []
         deletes: list[str] = []
+        deletes_client: list[str] = []
         obsolete_n = 0
 
         def walk(item):
@@ -1222,19 +1357,33 @@ class RemoteFilePage(QWidget):
                     return  # 已忽略项不参与发送
                 if item.checkState(0) != Qt.Checked:
                     return
-                if d.get("status") in ("new", "update"):
+                status = d.get("status")
+                if status in ("new", "update"):
                     if d.get("target") != "skip":
                         uploads.append((d["rel"], d.get("target", "both")))
-                elif d.get("status") in ("server", "obsolete"):
-                    deletes.append(d["rel"])
-                    if d.get("status") == "obsolete":
+                elif status == "rename":
+                    # 改名 = 上传新文件（按目标）+ 删除旧文件（按原位置）
+                    if d.get("target") != "skip":
+                        uploads.append((d["rel"], d.get("target", "both")))
+                    old = d.get("old_rel", "")
+                    if old.startswith("client_files/"):
+                        deletes_client.append(old[len("client_files/"):])
+                    else:
+                        deletes.append(old)
+                elif status in ("server", "obsolete"):
+                    rel = d["rel"]
+                    if rel.startswith("client_files/"):
+                        deletes_client.append(rel[len("client_files/"):])
+                    else:
+                        deletes.append(rel)
+                    if status == "obsolete":
                         obsolete_n += 1
             else:
                 for i in range(item.childCount()):
                     walk(item.child(i))
 
         walk(root)
-        return uploads, deletes, obsolete_n
+        return uploads, deletes, deletes_client, obsolete_n
 
     def _remove_rows(self):
         items = self.review_tree.selectedItems()
@@ -1385,10 +1534,10 @@ class RemoteFilePage(QWidget):
     # ---------- 发送 ----------
     def _send(self):
         root_dir = self.config.local_mc_dir
-        uploads, deletes, obsolete_n = self._collect_actions()
-        if not uploads and not deletes:
+        uploads, deletes, deletes_client, obsolete_n = self._collect_actions()
+        if not uploads and not deletes and not deletes_client:
             winutil.warn(self, "提示",
-                         "没有勾选任何操作。\n\n勾选「新增/更新」= 上传（按目标）；\n"
+                         "没有勾选任何操作。\n\n勾选「新增/更新/改名」= 上传（按目标，改名同时删除旧文件）；\n"
                          "勾选「旧版残留/服务端独有」= 从服务端删除。")
             return
         lines = []
@@ -1396,18 +1545,19 @@ class RemoteFilePage(QWidget):
             server_n = sum(1 for _, t in uploads if t in ("server", "both"))
             client_n = sum(1 for _, t in uploads if t in ("client", "both"))
             lines.append(f"【上传】{len(uploads)} 个文件（服务端 {server_n}、客户端 {client_n}）")
-        if deletes:
+        del_n = len(deletes) + len(deletes_client)
+        if del_n:
             if obsolete_n:
-                lines.append(f"【删除】{len(deletes)} 个文件（其中旧版残留 {obsolete_n} 个）")
+                lines.append(f"【删除】{del_n} 个文件（其中旧版残留 {obsolete_n} 个）")
             else:
-                lines.append(f"【删除】{len(deletes)} 个服务端独有文件")
+                lines.append(f"【删除】{del_n} 个服务端独有 / 改名旧文件")
         detail = "\n".join(lines)
         if not winutil.confirm(self, "确认发送",
                                f"即将把勾选的操作发送到服务器：\n\n{detail}\n\n是否继续？"):
             return
         self.btn_send.setEnabled(False)
         self.btn_scan.setEnabled(False)
-        worker = Worker(self._send_worker, uploads, deletes)
+        worker = Worker(self._send_worker, uploads, deletes, deletes_client)
         worker.progress.connect(self._on_progress)
         worker.done.connect(self._on_send_done)
         self._worker = worker
@@ -1420,16 +1570,18 @@ class RemoteFilePage(QWidget):
             return remote[len(root):]
         return remote
 
-    def _send_worker(self, uploads, deletes, progress_cb=None) -> str:
+    def _send_worker(self, uploads, deletes, deletes_client, progress_cb=None) -> str:
         """按目标上传：双端→服务端与 client_files 各一份，服务端→server_root，客户端→client_files。
 
+        删除分两类：deletes 删除 server_root 下的文件，deletes_client 删除 files_dir 下的文件
+        （client_files/ 前缀 / 改名旧文件）。
         进度消息显示远程目标路径（相对服务端根目录），
         客户端的一律带 client_files 前缀，避免与本地相对路径混淆。
         """
         def steps_of(target: str) -> int:
             return 2 if target == "both" else 1
 
-        total = sum(steps_of(t) for _, t in uploads) + len(deletes)
+        total = sum(steps_of(t) for _, t in uploads) + len(deletes) + len(deletes_client)
         root = self.config.local_mc_dir
         server_root = self.config.server_root
         client_dir = self.config.files_dir
@@ -1463,7 +1615,16 @@ class RemoteFilePage(QWidget):
                     sftp.delete(remote)
                 if progress_cb:
                     progress_cb(done, total, f"删除 {self._remote_disp(remote)}")
-        return f"已上传 {len(uploads)} 个、删除 {len(deletes)} 个。"
+            for rel in deletes_client:
+                done += 1
+                remote = TodoManifest.remote_source_path(sftp, client_dir, rel)
+                if sftp.is_dir(remote):
+                    sftp.delete_dir(remote)
+                else:
+                    sftp.delete(remote)
+                if progress_cb:
+                    progress_cb(done, total, f"删除 {self._remote_disp(remote)}")
+        return f"已上传 {len(uploads)} 个、删除 {len(deletes) + len(deletes_client)} 个。"
 
     def _on_progress(self, current, total, message):
         self.lbl_status.setText(fmt_progress(current, total, message, "发送进度"))

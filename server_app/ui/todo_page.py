@@ -32,10 +32,11 @@ from PySide6.QtWidgets import (
 
 from app_common import winutil
 from app_common.constants import config_dir
+from app_common.file_hash import hash_remote_smart
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
 from app_common.sftp import SFTPManager
-from app_common.snapshot import load_snapshot, save_snapshot
+from app_common.snapshot import load_snapshot, normalize_files, save_snapshot
 from app_common.snapshot_dialog import SnapshotHistoryDialog
 from app_common.tasks import CATEGORY_LABELS, TaskItem, TodoManifest
 from app_common.worker import Worker, fmt_progress
@@ -44,12 +45,13 @@ from .remote_tree import SelectTreeWidget
 
 log = get_logger("server.todo_page")
 
-# 服务端改动状态：new=新增（绿）、update=替换、deleted=服务端已移除、obsolete=旧版残留（后两者均为删除，红）
-CHANGE_LABELS = {"new": "新增", "update": "替换",
+# 服务端改动状态：new=新增（绿）、update=替换、rename=改名（蓝）、deleted=服务端已移除、obsolete=旧版残留（后两者均为删除，红）
+CHANGE_LABELS = {"new": "新增", "update": "替换", "rename": "改名",
                  "deleted": "删除", "obsolete": "删除"}
 CHANGE_COLORS = {"new": "#4caf50", "update": "#ff9800",
+                 "rename": "#2196f3",
                  "deleted": "#ef5350", "obsolete": "#ef5350"}
-_STATUS_ORDER = {"new": 0, "update": 1, "deleted": 2, "obsolete": 3}
+_STATUS_ORDER = {"new": 0, "update": 1, "rename": 2, "deleted": 3, "obsolete": 4}
 
 
 # 末尾版本段：-1.0 / -1.20.1 / _2.0 / .1.0 等（不含连字符连接的更多段）
@@ -101,6 +103,34 @@ def _save_todo_state(server_id: str, state: dict) -> None:
                        "notes": state["notes"]}, f, ensure_ascii=False)
     except OSError as exc:
         log.warning("保存待办状态失败: %s", exc)
+
+
+# ---------- 检测哈希缓存（避免每次检测都全量下载确认「大小相同」的文件） ----------
+def _hash_cache_path(server_id: str) -> str:
+    d = config_dir() / "snapshots"
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d / f"hash_cache_{server_id}.json")
+
+
+def _load_hash_cache(server_id: str) -> dict:
+    path = _hash_cache_path(server_id)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.warning("读取检测哈希缓存失败: %s", exc)
+        return {}
+
+
+def _save_hash_cache(server_id: str, cache: dict) -> None:
+    try:
+        with open(_hash_cache_path(server_id), "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+    except OSError as exc:
+        log.warning("保存检测哈希缓存失败: %s", exc)
 
 
 class TodoPage(QWidget):
@@ -189,8 +219,17 @@ class TodoPage(QWidget):
         self.lbl_status.setObjectName("muted")
         self.lbl_status.setWordWrap(True)
         pub_row.addWidget(self.lbl_status, 1)
+        self.btn_ignore = QPushButton("忽略本次快照更新")
+        self.btn_ignore.setToolTip("跳过本次检测到的所有改动（本次不发布）\n"
+                                   "已忽略的改动可随时通过「重新发布已忽略」恢复")
+        self.btn_ignore.clicked.connect(self._ignore_all)
+        self.btn_republish = QPushButton("重新发布已忽略")
+        self.btn_republish.setToolTip("把已忽略的改动恢复为可发布状态")
+        self.btn_republish.clicked.connect(self._republish_all)
         self.btn_publish = QPushButton("发布到服务器")
         self.btn_publish.setObjectName("primary")
+        pub_row.addWidget(self.btn_ignore)
+        pub_row.addWidget(self.btn_republish)
         pub_row.addWidget(self.btn_publish)
         layout.addLayout(pub_row)
 
@@ -265,7 +304,12 @@ class TodoPage(QWidget):
     def _detect_worker(self, progress_cb=None) -> str:
         """当前客户端文件夹（client_files） vs 上次发布基线，返回 JSON 行列表。
 
-        每行：{"rel": 相对路径, "status": new|update|deleted|obsolete, "size": 字节}
+        每行：{"rel", "status": new|update|rename|deleted|obsolete, "size", "old_rel"?}
+        判定条件组合（大小 + 哈希）：
+        - 基线无 → 新增；
+        - 大小不同，或大小相同但哈希不同 → 替换；
+        - 当前新增与基线已移除的文件内容相同（大小 + 哈希一致）→ 改名；
+        - 基线有、当前无且未配对 → 删除。
         """
 
         def on_scan(dirs: int, entries: int):
@@ -279,21 +323,84 @@ class TodoPage(QWidget):
             current = dict(sftp.list_files_recursive_with_size(
                 self.config.files_dir, max_workers=1,
                 progress_cb=on_scan))
-        base = load_snapshot(self.config.current_id(), "publish").get("files", {})
+            base = normalize_files(
+                load_snapshot(self.config.current_id(), "publish").get("files", {}))
+            # 需要下载当前文件计算哈希：
+            #  1) 基线存在、当前存在、大小相同且基线有哈希 → 确认是否真的内容一致
+            #     （上次检测已确认一致的走缓存，不重复下载）；
+            #  2) 当前新增（基线无）→ 与「服务端已移除」配对判断改名。
+            cache = _load_hash_cache(self.config.current_id())
+            need_hash = []
+            for rel, rsize in current.items():
+                bmeta = base.get(rel)
+                if bmeta is None:
+                    need_hash.append(rel)
+                elif bmeta["size"] == rsize and bmeta.get("hash"):
+                    cc = cache.get(rel)
+                    if not (cc and cc.get("size") == rsize
+                            and cc.get("hash") == bmeta["hash"]):
+                        need_hash.append(rel)
+            cur_hash: dict[str, str] = {}
+            total = len(need_hash)
+            for i, rel in enumerate(need_hash):
+                remote = TodoManifest.remote_source_path(
+                    sftp, self.config.files_dir, rel)
+                h = hash_remote_smart(sftp, remote)
+                if h:
+                    cur_hash[rel] = h
+                if progress_cb:
+                    progress_cb(i + 1, max(total, 1), f"计算哈希 {rel}")
+            # 更新哈希缓存：仅记录与基线一致（或无法确认但大小相同）的文件，
+            # 供下次检测跳过重复下载；大小变化 / 已移除的文件从缓存剔除。
+            new_cache = dict(cache)
+            for rel, rsize in current.items():
+                bmeta = base.get(rel)
+                if bmeta is None or bmeta["size"] != rsize:
+                    new_cache.pop(rel, None)
+                    continue
+                h = cur_hash.get(rel)
+                if h:
+                    new_cache[rel] = {"size": rsize, "hash": h}
+                elif rel not in new_cache:
+                    new_cache[rel] = {"size": rsize, "hash": bmeta.get("hash")}
+            for rel in list(new_cache):
+                if rel not in current:
+                    new_cache.pop(rel, None)
+            _save_hash_cache(self.config.current_id(), new_cache)
 
         rows = []
         for rel in sorted(current):
             rsize = current[rel]
-            bsize = base.get(rel)
-            if bsize is None:
-                rows.append({"rel": rel, "status": "new", "size": rsize})
-            elif bsize != rsize:
+            bmeta = base.get(rel)
+            if bmeta is None:
+                rows.append({"rel": rel, "status": "new", "size": rsize,
+                             "hash": cur_hash.get(rel)})
+            elif bmeta["size"] != rsize:
                 rows.append({"rel": rel, "status": "update", "size": rsize})
-        # 服务端已移除（基线里有、当前没有）→ 客户端应删除
-        for rel in sorted(base):
-            if rel not in current:
-                rows.append({"rel": rel, "status": "deleted",
-                             "size": base.get(rel, 0)})
+            else:
+                bh, ch = bmeta.get("hash"), cur_hash.get(rel)
+                if bh and ch and bh != ch:
+                    # 大小相同但内容不同 → 替换
+                    rows.append({"rel": rel, "status": "update", "size": rsize})
+                # 否则视为一致，不出行
+
+        # 服务端已移除（基线里有、当前没有）→ 客户端应删除；
+        # 内容与当前新增文件相同（大小 + 哈希一致）→ 判定为改名。
+        deleted_rels = [rel for rel in sorted(base) if rel not in current]
+        matched = self._match_rename_pairs(rows, base, deleted_rels)
+        final = []
+        for r in rows:
+            if r["rel"] in matched:
+                final.append({**r, "status": "rename",
+                              "old_rel": matched[r["rel"]]})
+            else:
+                final.append(r)
+        for rel in deleted_rels:
+            if rel in matched.values():
+                continue  # 已作为改名的旧文件，不再单独删除
+            final.append({"rel": rel, "status": "deleted",
+                          "size": base[rel]["size"]})
+        rows = final
 
         # 旧版残留：client_files/mods 下同模组（去末尾版本段）存在多个版本时，
         # 保留版本号最大的一个，其余标记为「旧版残留」（删除任务）。
@@ -314,6 +421,31 @@ class TodoPage(QWidget):
         for rel in sorted(obsolete_rels):
             rows.append({"rel": rel, "status": "obsolete", "size": current[rel]})
         return json.dumps(rows, ensure_ascii=False)
+
+    @staticmethod
+    def _match_rename_pairs(new_rows: list[dict], base: dict,
+                            deleted_rels: list[str]) -> dict:
+        """匹配改名对：{当前新增 Y: 基线移除 X}（大小 + 哈希都相同 → 判定为改名）。
+
+        只匹配基线中哈希已知的文件（发布时记录）；旧基线无哈希则按删除处理。
+        """
+        new_by_hash: dict[tuple[int, str], list[dict]] = {}
+        for r in new_rows:
+            h = r.get("hash")
+            if h:
+                new_by_hash.setdefault((r["size"], h), []).append(r)
+        matched: dict[str, str] = {}
+        used: set[str] = set()
+        for rel in deleted_rels:
+            bmeta = base.get(rel) or {}
+            if not bmeta.get("hash"):
+                continue
+            for r in new_by_hash.get((bmeta["size"], bmeta["hash"]), []):
+                if r["rel"] not in used:
+                    matched[r["rel"]] = rel
+                    used.add(r["rel"])
+                    break
+        return matched
 
     def _on_detect_done(self, ok: bool, msg: str):
         self._detecting = False
@@ -339,15 +471,18 @@ class TodoPage(QWidget):
             _save_todo_state(self.config.current_id(), self._state)
         new_n = sum(1 for r in rows if r["status"] == "new")
         upd_n = sum(1 for r in rows if r["status"] == "update")
+        rnm_n = sum(1 for r in rows if r["status"] == "rename")
         del_n = sum(1 for r in rows if r["status"] in ("deleted", "obsolete"))
         if not rows:
             self.lbl_status.setText(
                 "未检测到服务端改动：client_files 与上次发布基线一致。")
         else:
             self.lbl_status.setText(
-                f"服务端改动：新增 {new_n}、替换 {upd_n}、删除 {del_n}，共 {len(rows)} 项 ✔"
+                f"服务端改动：新增 {new_n}、替换 {upd_n}"
+                f"{f'、改名 {rnm_n}' if rnm_n else ''}、删除 {del_n}，共 {len(rows)} 项 ✔"
                 "（全部默认发布，右键可禁用）")
-        log.info("服务端改动检测完成: new=%d update=%d delete=%d", new_n, upd_n, del_n)
+        log.info("服务端改动检测完成: new=%d update=%d rename=%d delete=%d",
+                 new_n, upd_n, rnm_n, del_n)
 
     # ---------- 改动树 ----------
     def _build_changes_tree(self, rows):
@@ -372,11 +507,13 @@ class TodoPage(QWidget):
                     nodes[child_rel] = node
                 parent_rel = child_rel
                 parent_item = node
+            desc = f"原名：{r['old_rel']}" if r.get("old_rel") else ""
             node = QTreeWidgetItem(
-                [parts[-1], CHANGE_LABELS.get(r["status"], r["status"]), ""])
+                [parts[-1], CHANGE_LABELS.get(r["status"], r["status"]), desc])
             node.setData(0, Qt.UserRole,
                          {"rel": r["rel"], "kind": "file",
-                          "status": r["status"], "size": r.get("size", 0)})
+                          "status": r["status"], "size": r.get("size", 0),
+                          "old_rel": r.get("old_rel", "")})
             if parent_item is None:
                 self.changes_tree.addTopLevelItem(node)
             else:
@@ -474,6 +611,40 @@ class TodoPage(QWidget):
         for it in items:
             self._apply_state_item(it)  # 重新应用样式（目录含子树）
         self.lbl_status.setText(f"已{'禁用' if disable else '启用'} {len(rels)} 项")
+
+    def _ignore_all(self):
+        """忽略本次快照更新：把当前检测到的全部改动标记为不发布（可随时恢复）。"""
+        rels = [r["rel"] for r in self._rows]
+        if not rels:
+            winutil.warn(self, "提示", "当前没有检测到的服务端改动，无需忽略。")
+            return
+        if not winutil.confirm(
+                self, "忽略本次快照更新",
+                f"将忽略当前检测到的 {len(rels)} 项改动（本次不发布）。\n\n"
+                "已忽略的改动可随时通过「重新发布已忽略」恢复。是否继续？",
+                default_yes=False):
+            return
+        self._state["disabled"].update(rels)
+        _save_todo_state(self.config.current_id(), self._state)
+        self._apply_state_recursive_top()
+        self.lbl_status.setText(f"已忽略本次快照更新：{len(rels)} 项本次不发布")
+
+    def _republish_all(self):
+        """重新发布已忽略：把全部已忽略的改动恢复为可发布状态。"""
+        if not self._state["disabled"]:
+            winutil.warn(self, "提示", "当前没有已忽略的改动。")
+            return
+        count = len(self._state["disabled"])
+        if not winutil.confirm(
+                self, "重新发布已忽略",
+                f"将恢复 {count} 项已忽略的改动为可发布状态。\n\n"
+                "恢复后它们会随下一次发布一起发送给客户端。是否继续？",
+                default_yes=False):
+            return
+        self._state["disabled"] = set()
+        _save_todo_state(self.config.current_id(), self._state)
+        self._apply_state_recursive_top()
+        self.lbl_status.setText(f"已恢复 {count} 项改动为可发布状态")
 
     def _annotate_items(self, items):
         """批注选区：一次输入，应用到全部选中项（目录直接作用于目录行）。"""
@@ -647,7 +818,7 @@ class TodoPage(QWidget):
         }
 
     def _collect_publish_items(self) -> list[dict]:
-        """收集改动树中「启用」的文件行 [{rel, status, size}]（禁用的跳过）。"""
+        """收集改动树中「启用」的文件行 [{rel, status, size, old_rel?}]（禁用的跳过）。"""
         items: list[dict] = []
 
         def walk(item):
@@ -655,7 +826,8 @@ class TodoPage(QWidget):
             if d.get("kind") == "file":
                 if d["rel"] not in self._state["disabled"]:
                     items.append({"rel": d["rel"], "status": d["status"],
-                                  "size": d.get("size", 0)})
+                                  "size": d.get("size", 0),
+                                  "old_rel": d.get("old_rel", "")})
             else:
                 for i in range(item.childCount()):
                     walk(item.child(i))
@@ -685,7 +857,10 @@ class TodoPage(QWidget):
         detail = []
         for it in items:
             rel = it["rel"]
-            line = f"安装 {rel}" if it["status"] in ("new", "update") else f"删除 {rel}"
+            if it["status"] == "rename":
+                line = f"改名 {it.get('old_rel', '')} → {rel}"
+            else:
+                line = f"安装 {rel}" if it["status"] in ("new", "update") else f"删除 {rel}"
             note = self._state["notes"].get(rel, "")
             if note:
                 line += f"（{note}）"
@@ -716,10 +891,26 @@ class TodoPage(QWidget):
         tasks = []
         for it in items:
             rel = it["rel"]
+            note = notes.get(rel, "")
+            if it["status"] == "rename":
+                # 改名 = 删除旧文件 + 安装新文件（客户端旧文件移除、新文件落地）
+                old = it.get("old_rel", "")
+                old_parts = old.split("/")
+                old_cat = (old_parts[0] if len(old_parts) > 1
+                           and old_parts[0] in CATEGORY_LABELS else "other")
+                tasks.append(TaskItem(
+                    action="delete", category=old_cat, target=old,
+                    description=note or "改名（删除旧文件）"))
+                parts = rel.split("/")
+                category = (parts[0] if len(parts) > 1
+                            and parts[0] in CATEGORY_LABELS else "other")
+                tasks.append(TaskItem(
+                    action="install", category=category, target=rel, source=rel,
+                    description=note or "改名（安装新文件）"))
+                continue
             parts = rel.split("/")
             category = parts[0] if len(parts) > 1 and parts[0] in CATEGORY_LABELS \
                 else "other"
-            note = notes.get(rel, "")
             if it["status"] in ("new", "update"):
                 tasks.append(TaskItem(
                     action="install", category=category, target=rel, source=rel,
@@ -745,14 +936,21 @@ class TodoPage(QWidget):
             manifest.save_to_sftp(sftp, self.config.todo_dir)
             if progress_cb:
                 progress_cb(total, total, "写入清单")
-            # 更新发布基线：上一轮基线 + 本次「已发布」的改动。
+            # 更新发布基线：上一轮基线 + 本次「已发布」的改动（记录大小 + 哈希，
+            # 供下次检测判断「大小相同但内容不同」与改名配对）。
             # 禁用项保持旧状态 → 下次仍会检测出来（可重新启用后再发布）。
-            base = load_snapshot(self.config.current_id(), "publish").get("files", {})
+            base = normalize_files(
+                load_snapshot(self.config.current_id(), "publish").get("files", {}))
             for it in items:
-                if it["status"] in ("new", "update"):
-                    base[it["rel"]] = it["size"]
+                rel = it["rel"]
+                if it["status"] in ("new", "update", "rename"):
+                    if it["status"] == "rename" and it.get("old_rel"):
+                        base.pop(it["old_rel"], None)
+                    remote = TodoManifest.remote_source_path(sftp, client_dir, rel)
+                    base[rel] = {"size": it["size"],
+                                 "hash": hash_remote_smart(sftp, remote)}
                 else:
-                    base.pop(it["rel"], None)
+                    base.pop(rel, None)
             saved_at = save_snapshot(self.config.current_id(), base, "publish")
         if saved_at:
             self._pub_snap_time = saved_at

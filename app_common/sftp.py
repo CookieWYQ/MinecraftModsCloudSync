@@ -211,6 +211,40 @@ class SFTPManager:
         except Exception:
             return -1
 
+    def remote_hash(self, path: str, algo: str = "md5") -> str | None:
+        """尝试在远程直接计算文件哈希（SFTP check-file 扩展，OpenSSH 8+）。
+
+        无需下载整个文件，只在服务器端读取计算并返回哈希字符串，网络只传一个字符串，
+        避免慢网络下检测超时；服务器不支持该扩展时返回 None，由调用方回退到下载计算。
+        """
+        try:
+            from paramiko.sftp import CMD_EXTENDED, CMD_EXTENDED_REPLY
+
+            sftp = self._sftp
+            if not hasattr(sftp, "_async_request") or not hasattr(sftp, "_read_response"):
+                return None
+            remote = self._posix(path)
+            # check-file@openssh.com 请求：string path, string algorithm,
+            # string start（十进制偏移，0=文件开头）, string length（0=整个文件）
+            num = sftp._async_request(
+                type(None), CMD_EXTENDED,
+                b"check-file@openssh.com",
+                remote.encode("utf-8"),
+                algo.encode("ascii"),
+                b"0", b"0")
+            t, resp = sftp._read_response(num)
+            if t != CMD_EXTENDED_REPLY:
+                return None
+            count = resp.get_int()
+            for _ in range(count):
+                resp.get_string()  # 文件名
+                hval = resp.get_string().decode("ascii", "ignore")
+                return hval.strip().lower()
+            return None
+        except Exception as exc:
+            log.info("远程哈希计算不可用（回退下载）: %s（%s）", path, exc)
+            return None
+
     def mkdirs(self, path: str) -> None:
         """递归创建远程目录。"""
         _invalidate_scan_cache()

@@ -138,6 +138,23 @@ def update_snapshot(server_id: str, files: dict, key: str = "repo",
     return {"saved_at": saved_at, "changed": changed, "aged": aged}
 
 
+def normalize_files(files: dict) -> dict:
+    """归一化快照 files 值为 {rel: {"size": int, "hash": str|None}}。
+
+    兼容旧版 int 值快照；新格式额外携带哈希（用于大小相同但内容不同的判定）。
+    """
+    out: dict = {}
+    for rel, v in (files or {}).items():
+        if isinstance(v, dict):
+            size = v.get("size")
+            h = v.get("hash")
+            out[rel] = {"size": int(size or 0),
+                        "hash": h if isinstance(h, str) and h else None}
+        else:
+            out[rel] = {"size": int(v or 0), "hash": None}
+    return out
+
+
 def list_snapshots(server_id: str, key: str = "repo") -> list[dict]:
     """列出历史快照（按时间倒序）：[{ts, saved_at, count}]。"""
     if key not in _KEYS:

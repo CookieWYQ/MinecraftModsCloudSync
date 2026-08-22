@@ -4,7 +4,10 @@
 
 #define MyAppName "Minecraft 模组云端同步"
 #define MyAppNameShort "MinecraftModsCloudSync"
-#define MyAppVersion "1.0.0"
+; 版本号由 build.py 通过 /DMyAppVersion= 传入；手动编译时回退到默认值
+#ifndef MyAppVersion
+#define MyAppVersion "1.1.1"
+#endif
 #define MyAppPublisher "By CallMeACookieWYQ"
 #define MyAppExeServer "MinecraftSyncServer.exe"
 #define MyAppExeClient "MinecraftSyncClient.exe"
@@ -72,6 +75,61 @@ Filename: "{app}\{#MyAppExeClient}"; Description: "立即运行客户端"; Flags
 Filename: "{app}\{#MyAppExeServer}"; Description: "立即运行服务端工具"; Flags: nowait postinstall skipifsilent; Components: server
 
 [Code]
+// 安装前检测：旧版本程序正在运行时，提示先关闭再继续安装
+function IsAppRunning(ExeName: String): Boolean;
+var
+  FSWbemLocator: Variant;
+  FWMIService: Variant;
+  FWbemObjectSet: Variant;
+begin
+  Result := False;
+  try
+    FSWbemLocator := CreateOleObject('WbemScripting.SWbemLocator');
+    FWMIService := FSWbemLocator.ConnectServer('', 'root\CIMV2');
+    FWbemObjectSet := FWMIService.ExecQuery(
+      Format('SELECT * FROM Win32_Process WHERE Name = ''%s''', [ExeName]));
+    Result := (FWbemObjectSet.Count > 0);
+  except
+    Result := False;
+  end;
+end;
+
+function KillApp(ExeName: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec('taskkill.exe', Format('/F /IM %s', [ExeName]), '',
+                 SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function InitializeSetup(): Boolean;
+var
+  NeedKillClient: Boolean;
+  NeedKillServer: Boolean;
+  Answer: Integer;
+begin
+  Result := True;
+  NeedKillClient := IsAppRunning('{#MyAppExeClient}');
+  NeedKillServer := IsAppRunning('{#MyAppExeServer}');
+  if NeedKillClient or NeedKillServer then
+  begin
+    Answer := MsgBox('检测到旧版本程序正在运行。' + #13#10 +
+                     '建议先关闭旧版本，再继续安装新版本。' + #13#10 + #13#10 +
+                     '是否立即关闭正在运行的旧版本进程并继续安装？' + #13#10 +
+                     '（选择「否」将取消安装）',
+                     mbConfirmation, MB_YESNO);
+    if Answer = IDYES then
+    begin
+      if NeedKillClient then
+        KillApp('{#MyAppExeClient}');
+      if NeedKillServer then
+        KillApp('{#MyAppExeServer}');
+    end
+    else
+      Result := False;
+  end;
+end;
+
 // 卸载时询问是否删除本机配置与日志（数据位于安装目录下的隐藏文件夹 .mc-sync-data）
 procedure CurUninstallStepChanged(CurStep: TUninstallStep);
 var

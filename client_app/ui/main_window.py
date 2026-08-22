@@ -100,6 +100,7 @@ class ClientMainWindow(QWidget):
         self.config = config
         self._status: dict[str, str] = {}       # server_id -> 连接状态文本
         self._manifests: dict[str, TodoManifest] = {}
+        self._c2c_manifests: dict[str, TodoManifest] = {}
         self._has_new: dict[str, bool] = {}
         self._current_sid: str | None = None
         self._threads = []
@@ -393,18 +394,27 @@ class ClientMainWindow(QWidget):
         self.lbl_conn.setText(self._status.get(sid, CONN_UNKNOWN))
         self.lbl_applied.setText(profile.get("last_applied_version") or "—")
         self.lbl_applied_time.setText(profile.get("last_applied_at") or "—")
-        self.lbl_latest.setText(profile.get("last_seen_version") or "—")
         manifest = self._manifests.get(sid)
+        c2c = self._c2c_manifests.get(sid)
+        versions = []
+        tasks = []
         if manifest is not None:
-            self.lbl_latest.setText(f"{manifest.version}（{manifest.formatted_time()}）")
-            self._fill_table(manifest)
+            versions.append(f"S2C {manifest.version}（{manifest.formatted_time()}）")
+            tasks += list(manifest.tasks)
+        if c2c is not None:
+            versions.append(f"C2C {c2c.version}（{c2c.formatted_time()}）")
+            tasks += list(c2c.tasks)
+        if versions:
+            self.lbl_latest.setText("\n".join(versions))
+            self._fill_tasks(tasks)
         else:
+            self.lbl_latest.setText(profile.get("last_seen_version") or "—")
             self.table.setRowCount(0)
         self.btn_apply.setEnabled(bool(self._has_new.get(sid)))
 
-    def _fill_table(self, manifest: TodoManifest):
-        self.table.setRowCount(len(manifest.tasks))
-        for row, task in enumerate(manifest.tasks):
+    def _fill_tasks(self, tasks: list):
+        self.table.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
             self.table.setItem(row, 0, QTableWidgetItem(ACTION_LABELS.get(task.action, task.action)))
             self.table.setItem(row, 1, QTableWidgetItem(CATEGORY_LABELS.get(task.category, task.category)))
             self.table.setItem(row, 2, QTableWidgetItem(task.target))
@@ -426,6 +436,7 @@ class ClientMainWindow(QWidget):
         self.config.add_profile(name, sid, content, created_at)
         self._status.pop(sid, None)
         self._manifests.pop(sid, None)
+        self._c2c_manifests.pop(sid, None)
         self._has_new.pop(sid, None)
         self.refresh_list()
         self._current_sid = sid
@@ -502,6 +513,7 @@ class ClientMainWindow(QWidget):
         self.config.remove_profile(sid)
         self._status.pop(sid, None)
         self._manifests.pop(sid, None)
+        self._c2c_manifests.pop(sid, None)
         self._has_new.pop(sid, None)
         self._current_sid = None
         self.refresh_list()
@@ -539,9 +551,17 @@ class ClientMainWindow(QWidget):
         for sid, result in results.items():
             if result.get("ok"):
                 manifest = result.get("manifest")
+                c2c = result.get("c2c_manifest")
                 self._manifests[sid] = manifest
-                is_new = manifest is not None and manifest.version != \
-                    self.config.profile_by_id(sid).get("last_applied_version", "")
+                self._c2c_manifests[sid] = c2c
+                profile = self.config.profile_by_id(sid) or {}
+                is_new = False
+                if manifest is not None and manifest.version != \
+                        profile.get("last_applied_version", ""):
+                    is_new = True
+                if c2c is not None and c2c.version != \
+                        profile.get("last_applied_c2c", ""):
+                    is_new = True
                 self._has_new[sid] = is_new
                 self._status[sid] = CONN_OK
                 if is_new:
@@ -565,12 +585,17 @@ class ClientMainWindow(QWidget):
                         winutil.error(self, "检查失败", f"无法连接服务器「{profile.get('name')}」：\n{error_text}")
                 elif self._has_new.get(sid):
                     manifest = self._manifests.get(sid)
+                    c2c = self._c2c_manifests.get(sid)
+                    lines = [f"服务器「{profile.get('name')}」"]
                     if manifest:
-                        winutil.info(self, "发现新更新",
-                                     f"服务器「{profile.get('name')}」\n"
-                                     f"版本号：{manifest.version}\n"
-                                     f"发布时间：{manifest.formatted_time()}\n"
-                                     f"共 {len(manifest.tasks)} 个待办任务。")
+                        lines += [f"S2C 版本号：{manifest.version}",
+                                  f"S2C 发布时间：{manifest.formatted_time()}",
+                                  f"S2C 待办任务：{len(manifest.tasks)} 项"]
+                    if c2c:
+                        lines += [f"C2C 版本号：{c2c.version}",
+                                  f"C2C 发布时间：{c2c.formatted_time()}",
+                                  f"C2C 待办任务：{len(c2c.tasks)} 项"]
+                    winutil.info(self, "发现新更新", "\n".join(lines))
                 else:
                     self.lbl_status.setText("检查完成 ✔")
             if new_count == 0:
@@ -594,63 +619,89 @@ class ClientMainWindow(QWidget):
             return
         profile = self.config.profile_by_id(sid)
         manifest = self._manifests.get(sid)
-        if profile is None or manifest is None:
+        c2c = self._c2c_manifests.get(sid)
+        if profile is None or (manifest is None and c2c is None):
             return
-        installs = [t for t in manifest.tasks if t.action == "install"]
-        deletes = [t for t in manifest.tasks if t.action == "delete"]
         lines = []
-        if installs:
-            lines.append("【将下载并安装/替换】")
-            lines += [f"  · {t.target}" for t in installs]
-        if deletes:
-            lines.append("【将删除】")
-            lines += [f"  · {t.target}" for t in deletes]
-        settings_text = manifest.settings_summary()
-        if settings_text:
-            lines.append("【客户端软件设置（随更新下发）】")
-            lines += [f"  · {s.strip()}" for s in settings_text.split("、")]
+        if manifest:
+            installs = [t for t in manifest.tasks if t.action == "install"]
+            deletes = [t for t in manifest.tasks if t.action == "delete"]
+            if installs:
+                lines.append("【S2C 将下载并安装/替换】")
+                lines += [f"  · {t.target}" for t in installs]
+            if deletes:
+                lines.append("【S2C 将删除】")
+                lines += [f"  · {t.target}" for t in deletes]
+            settings_text = manifest.settings_summary()
+            if settings_text:
+                lines.append("【客户端软件设置（随更新下发）】")
+                lines += [f"  · {s.strip()}" for s in settings_text.split("、")]
+        if c2c:
+            c2c_installs = [t for t in c2c.tasks if t.action == "install"]
+            c2c_deletes = [t for t in c2c.tasks if t.action == "delete"]
+            if c2c_installs:
+                lines.append("【C2C 将下载并安装/替换（本地对本地发布）】")
+                lines += [f"  · {t.target}" for t in c2c_installs]
+            if c2c_deletes:
+                lines.append("【C2C 将删除】")
+                lines += [f"  · {t.target}" for t in c2c_deletes]
         if not lines:
             lines = ["（无任务）"]
+        head = f"服务器「{profile.get('name')}」即将应用更新。"
+        if manifest:
+            head += f"\nS2C 版本 {manifest.version}（{manifest.formatted_time()}）"
+        if c2c:
+            head += f"\nC2C 版本 {c2c.version}（{c2c.formatted_time()}）"
         if not winutil.confirm_list(
-                self, "确认应用更新",
-                f"服务器「{profile.get('name')}」即将应用版本 {manifest.version}"
-                f"（{manifest.formatted_time()}）。是否继续？",
+                self, "确认应用更新", head + "\n是否继续？",
                 lines, ok_label="应用更新", cancel_label="取消"):
             return
 
-        progress = QProgressDialog("正在应用更新…", None, 0, max(len(manifest.tasks), 1), self)
+        total = len(manifest.tasks) if manifest else 0
+        total += len(c2c.tasks) if c2c else 0
+        progress = QProgressDialog("正在应用更新…", None, 0, max(total, 1), self)
         progress.setWindowTitle("应用更新")
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
 
-        thread = ApplyThread(self.config, profile, manifest)
+        thread = ApplyThread(self.config, profile, manifest, c2c)
         thread.progress.connect(lambda cur, total, msg: (
             progress.setValue(cur),
             progress.setLabelText(f"[{cur}/{total}] {msg}"),
         ))
         thread.done.connect(lambda ok, summary, err: self._on_apply_done(
-            ok, summary, err, profile, manifest, progress))
+            ok, summary, err, profile, manifest, c2c, progress))
         thread.finished.connect(thread.deleteLater)
         self._threads.append(thread)
         thread.start()
 
-    def _on_apply_done(self, ok: bool, summary, err: str, profile, manifest, progress):
+    def _on_apply_done(self, ok: bool, summary, err: str, profile, manifest,
+                       c2c, progress):
         progress.close()
         if not ok:
             winutil.error(self, "应用失败", f"应用更新过程中发生错误：\n{err}")
             return
         sid = profile.get("server_id")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.config.mark_applied(sid, manifest.version, now)
+        if manifest is not None:
+            self.config.mark_applied(sid, manifest.version, now)
+        if c2c is not None:
+            self.config.mark_applied_c2c(sid, c2c.version)
         self._has_new[sid] = False
         self._status[sid] = CONN_OK
-        self._apply_settings_ui(manifest.settings or {})
+        if manifest is not None:
+            self._apply_settings_ui(manifest.settings or {})
         self._update_list_status()
         self._refresh_detail()
+        versions = []
+        if manifest is not None:
+            versions.append(f"S2C {manifest.version}")
+        if c2c is not None:
+            versions.append(f"C2C {c2c.version}")
         lines = [
             f"服务器：{profile.get('name')}",
-            f"已应用版本：{manifest.version}",
+            f"已应用版本：{'、'.join(versions)}",
             f"时间：{now}",
             f"安装/替换：{len(summary['installed'])} 项",
             f"删除：{len(summary['deleted'])} 项",
@@ -663,12 +714,12 @@ class ClientMainWindow(QWidget):
             lines.append("")
             lines.append("失败详情：")
             lines += summary["errors"]
-        self.lbl_status.setText(f"已应用版本 {manifest.version} ✔")
+        self.lbl_status.setText(f"已应用版本 {'、'.join(versions)} ✔")
         if self.config.notify:
             notify(f"{APP_DISPLAY_NAME} - 更新完成",
-                   f"已应用版本 {manifest.version}", self.tray)
+                   f"已应用版本 {'、'.join(versions)}", self.tray)
         winutil.info_list(self, "更新完成", lines)
-        log.info("应用更新完成: %s - %s", profile.get("name"), manifest.version)
+        log.info("应用更新完成: %s - %s", profile.get("name"), "、".join(versions))
 
     # ---------- 设置 ----------
     def _browse_dir(self):
@@ -876,6 +927,7 @@ class ClientMainWindow(QWidget):
         """配置恢复后刷新界面（部分设置重启后完全生效）。"""
         self._status.clear()
         self._manifests.clear()
+        self._c2c_manifests.clear()
         self._has_new.clear()
         self._current_sid = None
         self._load_state()

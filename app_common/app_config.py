@@ -4,6 +4,7 @@ from .config import JsonStore
 from .constants import (
     CLIENT_CONFIG_PATH,
     DEFAULT_CLIENT_ONLY_KEYWORDS,
+    DEFAULT_REMOTE_C2C_DIR,
     DEFAULT_REMOTE_FILES_DIR,
     DEFAULT_REMOTE_TODO_DIR,
     DEFAULT_SYNC_EXCLUDE_PATTERNS,
@@ -229,6 +230,29 @@ class ServerConfig:
         return _abs_remote_dir(self.remote.get("files_dir"), DEFAULT_REMOTE_FILES_DIR)
 
     @property
+    def c2c_dir(self) -> str:
+        """C2C（本地对本地）发布目录（服务器上的绝对路径）。"""
+        return _abs_remote_dir(self.remote.get("c2c_dir"), DEFAULT_REMOTE_C2C_DIR)
+
+    @property
+    def server_code(self) -> str:
+        """服务端（本机工具）代号，用于 C2C 名单去重。"""
+        return (self.remote.get("server_code") or "").strip()
+
+    @server_code.setter
+    def server_code(self, value: str) -> None:
+        self.remote = {**self.remote, "server_code": (value or "").strip()}
+
+    @property
+    def c2c_local_dir(self) -> str:
+        """C2C 发送的本地源目录（保持文件结构发布）。"""
+        return (self.remote.get("c2c_local_dir") or "").strip()
+
+    @c2c_local_dir.setter
+    def c2c_local_dir(self, value: str) -> None:
+        self.remote = {**self.remote, "c2c_local_dir": (value or "").strip()}
+
+    @property
     def server_root(self) -> str:
         """服务端文件仓库的实际根目录（服务端工具读写/对比用），默认 / 表示服务器根目录。"""
         root = self.remote.get("server_root", "")
@@ -353,6 +377,8 @@ class ClientConfig:
             "last_applied_at": "",
             "last_seen_version": "",
             "last_seen_at": "",
+            "last_applied_c2c": "",
+            "last_seen_c2c": "",
         })
         self.store.set("profiles", profiles)
 
@@ -377,6 +403,12 @@ class ClientConfig:
         self._update_profile(server_id,
                              last_seen_version=version,
                              last_seen_at=seen_at)
+
+    def mark_applied_c2c(self, server_id: str, version: str) -> None:
+        self._update_profile(server_id, last_applied_c2c=version)
+
+    def mark_seen_c2c(self, server_id: str, version: str, seen_at: str) -> None:
+        self._update_profile(server_id, last_seen_c2c=version)
 
     # ---------- 明文设置 ----------
     @property

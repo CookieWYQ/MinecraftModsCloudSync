@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_common import winutil
+from app_common.c2c import abs_c2c_dir, register_code
 from app_common.launcher import KnownVersions
 from app_common.logger import get_logger
 from app_common.sftp import SFTPManager
@@ -140,6 +141,36 @@ class ServerSettingsPage(QWidget):
         lr.addWidget(btn_browse)
         layout.addWidget(local_box)
 
+        # ---- C2C（本地对本地）发布设置 ----
+        c2c_box = QGroupBox("C2C（本地对本地）发布设置")
+        c2c_form = QFormLayout(c2c_box)
+        c2c_form.setSpacing(8)
+        code_row = QHBoxLayout()
+        self.ed_server_code = QLineEdit()
+        self.ed_server_code.setPlaceholderText("本服务端唯一的代号，如 admin-01")
+        self.ed_server_code.setToolTip("代号用于在 C2C 名单中区分各服务端，登记后全局唯一")
+        code_row.addWidget(self.ed_server_code, 1)
+        self.btn_register_code = QPushButton("登记代号并上传名单")
+        self.btn_register_code.setToolTip("把代号写入服务器 C2C 目录下的名单（roster.json），重复代号会被拒绝")
+        self.btn_register_code.clicked.connect(self._register_code)
+        code_row.addWidget(self.btn_register_code)
+        c2c_form.addRow("服务端代号", code_row)
+        self.lbl_code_status = QLabel("")
+        self.lbl_code_status.setObjectName("muted")
+        self.lbl_code_status.setWordWrap(True)
+        c2c_form.addRow(self.lbl_code_status)
+        self.ed_c2c_dir = QLineEdit()
+        self.ed_c2c_dir.setPlaceholderText("例如 /c2c")
+        self.ed_c2c_dir.setToolTip("C2C 名单、客户端文件与清单都单独存放在该目录下")
+        c2c_form.addRow("C2C 远程目录", self.ed_c2c_dir)
+        c2c_hint = QLabel("说明：代号在所有服务端中必须唯一。登记后写入 C2C 远程目录下的名单文件"
+                          "（roster.json，名单单独存放），相同代号会被拒绝；"
+                          "客户端文件与清单也按客户端编号单独存放在该目录下。")
+        c2c_hint.setObjectName("muted")
+        c2c_hint.setWordWrap(True)
+        c2c_form.addRow(c2c_hint)
+        layout.addWidget(c2c_box)
+
         # ---- 差异排除 ----
         excl_box = QGroupBox("差异审核排除（logs、cache 等硬性跳过，每行一个，忽略大小写）")
         er = QVBoxLayout(excl_box)
@@ -224,6 +255,9 @@ class ServerSettingsPage(QWidget):
         self.ed_password.setText(info.get("password", ""))
         self.ed_todo_dir.setText(self.config.todo_dir)
         self.ed_files_dir.setText(self.config.files_dir)
+        self.ed_server_code.setText(self.config.server_code)
+        self.ed_c2c_dir.setText(self.config.c2c_dir)
+        self.lbl_code_status.setText("")
         self.cb_self_autostart.setChecked(winutil.is_autostart_enabled())
         self.ed_local.setText(self.config.local_mc_dir)
         self.ed_server_root.setText(self.config.server_root)
@@ -267,6 +301,9 @@ class ServerSettingsPage(QWidget):
         self.config.sftp = data["sftp"]
         # 合并而非整体替换：保留 server_root、排除规则、模组关键词等其它 remote 字段
         self.config.remote = {**self.config.remote, **data["remote"]}
+        # C2C 设置立即持久化（含服务端代号，登记后回填）
+        self.config.server_code = self.ed_server_code.text().strip()
+        self.ed_c2c_dir.setText(self.config.c2c_dir)
         if self.cb_self_autostart.isChecked() != winutil.is_autostart_enabled():
             winutil.set_autostart(self.cb_self_autostart.isChecked())
         log.info("服务器设置已保存: host=%s root=%s",
@@ -288,13 +325,59 @@ class ServerSettingsPage(QWidget):
             "remote": {
                 "todo_dir": _abs_dir(self.ed_todo_dir.text(), "/todo"),
                 "files_dir": _abs_dir(self.ed_files_dir.text(), "/client_files"),
+                "c2c_dir": abs_c2c_dir(self.ed_c2c_dir.text()),
             },
         }
 
+    # ---------- C2C 代号登记 ----------
+    def _register_code(self):
+        host = self.config.host()
+        if not host:
+            winutil.warn(self, "提示", "请先填写服务器地址（SFTP 连接信息）。")
+            return
+        code = self.ed_server_code.text().strip()
+        if not code:
+            winutil.warn(self, "提示", "请填写服务端代号。")
+            return
+        c2c_dir = abs_c2c_dir(self.ed_c2c_dir.text())
+        server_name = self.config.export_name() or (
+            next((s.get("name", "") for s in self.config.servers
+                  if s.get("id") == self.config.current_id()), ""))
+        self.btn_register_code.setEnabled(False)
+        self.lbl_code_status.setText("正在登记代号…")
+        worker = Worker(self._register_worker, code, c2c_dir, server_name)
+        worker.done.connect(self._on_register_done)
+        self._code_worker = worker
+        worker.start()
+
+    def _register_worker(self, code: str, c2c_dir: str, server_name: str,
+                         progress_cb=None):
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            return register_code(sftp, c2c_dir, code, server_name)
+
+    def _on_register_done(self, ok: bool, msg: str):
+        self.btn_register_code.setEnabled(True)
+        if not ok:
+            self.lbl_code_status.setText("登记失败 ✘")
+            winutil.error(self, "登记失败", f"无法登记代号到服务器名单：\n{msg}")
+            return
+        if msg:
+            # register_code 返回非空错误消息 = 代号重复被拒绝
+            self.lbl_code_status.setText("代号重复 ✘")
+            winutil.warn(self, "代号重复", msg)
+            return
+        self.config.server_code = self.ed_server_code.text().strip()
+        self.lbl_code_status.setText(f"代号已登记并上传名单 ✔（{self.config.c2c_dir}/roster.json）")
+        winutil.info(self, "登记成功",
+                     f"服务端代号「{self.ed_server_code.text().strip()}」已登记并写入名单：\n"
+                     f"{self.config.c2c_dir}/roster.json\n\n"
+                     f"该代号全局唯一，其他服务端将无法重复使用。")
+        if self.main_window is not None:
+            self.main_window.set_sftp_status(True)
+
     def _test_worker(self, data, progress_cb=None) -> str:
         with SFTPManager(**data["sftp"]) as sftp:
-            todo = data["remote"]["todo_dir"]
-            files = data["remote"]["files_dir"]
             sftp.mkdirs(todo)
             sftp.mkdirs(files)
             exists = sftp.exists(todo) and sftp.exists(files)
@@ -359,7 +442,7 @@ class ServerSettingsPage(QWidget):
         path = QFileDialog.getExistingDirectory(self, "选择客户端根目录",
                                                 self.ed_local.text())
         if path:
-            self.ed_local.setText(path)
+            self._set_local_dir(path)
 
     def _choose_known_version(self):
         dlg = VersionPickerDialog(self, KnownVersions(), title="选择已知版本",
@@ -367,4 +450,10 @@ class ServerSettingsPage(QWidget):
         if dlg.exec() == VersionPickerDialog.Accepted:
             entry = dlg.selected_entry()
             if entry:
-                self.ed_local.setText(entry["version_dir"])
+                self._set_local_dir(entry["version_dir"])
+
+    def _set_local_dir(self, path: str):
+        """设置本地新客户端根目录并立即持久化（无需再点「保存设置」）。"""
+        path = (path or "").strip()
+        self.ed_local.setText(path)
+        self.config.local_mc_dir = path

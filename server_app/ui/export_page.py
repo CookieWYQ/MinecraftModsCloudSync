@@ -298,6 +298,7 @@ class ExportPage(QWidget):
             "password": self.config.password(),
             "todo_dir": self.config.todo_dir,
             "files_dir": self.config.files_dir,
+            "c2c_dir": self.config.c2c_dir,
         }
         content = build_profile_content(name, server_id, info)
         with open(output_path, "w", encoding="utf-8") as f:

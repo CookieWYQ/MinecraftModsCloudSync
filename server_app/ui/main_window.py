@@ -45,6 +45,7 @@ from app_common.updater import (
 )
 from app_common.worker import Worker
 
+from .c2c_page import C2CPage
 from .export_page import ExportPage
 from .log_page import LogPage
 from .remote_page import RemoteFilePage
@@ -172,12 +173,14 @@ class ServerMainWindow(QMainWindow):
         self.todo_page = TodoPage(self.config, status_cb=self.set_sftp_status)
         self.remote_page = RemoteFilePage(self.config, status_cb=self.set_sftp_status)
         self.export_page = ExportPage(self.config, status_cb=self.set_sftp_status)
+        self.c2c_page = C2CPage(self.config, status_cb=self.set_sftp_status)
         self.settings_page = ServerSettingsPage(self.config, main_window=self)
         self.log_page = LogPage(self.config)
         self.settings_page.saved.connect(self._on_settings_saved)
         self.tabs.addTab(self.remote_page, "更新服务端（C2S）")
         self.tabs.addTab(self.todo_page, "发布待办（S2C）")
         self.tabs.addTab(self.export_page, "导出客户端配置")
+        self.tabs.addTab(self.c2c_page, "C2C 文件发布（本地对本地）")
         self.tabs.addTab(self.settings_page, "服务器设置")
         self.tabs.addTab(self.log_page, "日志")
         hbox.addWidget(self.tabs, 4)
@@ -304,6 +307,10 @@ class ServerMainWindow(QMainWindow):
         except Exception as exc:
             log.warning("刷新导出页失败: %s", exc)
         try:
+            self.c2c_page.reload()
+        except Exception as exc:
+            log.warning("刷新 C2C 页失败: %s", exc)
+        try:
             self.settings_page.reload()
         except Exception as exc:
             log.warning("刷新服务器设置页失败: %s", exc)
@@ -327,6 +334,10 @@ class ServerMainWindow(QMainWindow):
             self.todo_page.reload()
         except Exception as exc:
             log.warning("设置保存后刷新发布待办页失败: %s", exc)
+        try:
+            self.c2c_page.reload()
+        except Exception as exc:
+            log.warning("设置保存后刷新 C2C 页失败: %s", exc)
 
     def _add_server(self):
         path = QFileDialog.getExistingDirectory(

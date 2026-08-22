@@ -58,6 +58,7 @@ class TodoManifest:
     created_at: str = ""              # ISO 8601 时间戳
     tasks: list[TaskItem] = field(default_factory=list)
     settings: dict = field(default_factory=dict)  # 客户端软件设置（随待办下发）
+    meta: dict = field(default_factory=dict)      # 附加元数据（如 C2C 文件哈希表 {"files": {rel: md5}}）
 
     @classmethod
     def new(cls, version: str) -> "TodoManifest":
@@ -66,11 +67,13 @@ class TodoManifest:
     @classmethod
     def from_dict(cls, d: dict) -> "TodoManifest":
         settings = d.get("settings", {})
+        meta = d.get("meta", {})
         return cls(
             version=d.get("version", ""),
             created_at=d.get("created_at", ""),
             tasks=[TaskItem.from_dict(t) for t in d.get("tasks", [])],
             settings=settings if isinstance(settings, dict) else {},
+            meta=meta if isinstance(meta, dict) else {},
         )
 
     def to_dict(self) -> dict:
@@ -79,6 +82,7 @@ class TodoManifest:
             "created_at": self.created_at,
             "tasks": [t.to_dict() for t in self.tasks],
             "settings": dict(self.settings),
+            "meta": dict(self.meta),
         }
 
     def settings_summary(self) -> str:

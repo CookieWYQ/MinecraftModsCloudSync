@@ -23,7 +23,12 @@ from PySide6.QtWidgets import (
 )
 
 from . import winutil
-from .snapshot import list_snapshots, load_snapshot_at, save_snapshot
+from .snapshot import (
+    list_snapshots,
+    load_snapshot_at,
+    normalize_files,
+    save_snapshot,
+)
 
 SNAP_LABELS = {"publish": "发布基线", "repo": "仓库快照"}
 
@@ -148,11 +153,11 @@ class SnapshotHistoryDialog(QDialog):
         self.tree.clear()
         if entry is None:
             return
-        files = load_snapshot_at(self.config.current_id(),
-                                 self._current_key(), entry["ts"]).get("files", {})
+        files = normalize_files(load_snapshot_at(self.config.current_id(),
+                                 self._current_key(), entry["ts"]).get("files", {}))
         nodes: dict[str, QTreeWidgetItem] = {}
         for rel in sorted(files):
-            size = files[rel]
+            size = files[rel]["size"]
             parts = rel.split("/")
             parent = None
             parent_rel = ""

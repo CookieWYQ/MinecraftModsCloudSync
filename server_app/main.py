@@ -37,6 +37,11 @@ def main() -> int:
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setQuitOnLastWindowClosed(False)  # 关闭窗口仅最小化到托盘
 
+    # 单实例：已有服务端在运行时提示关闭旧版本或退出（--tray 自启冲突时静默退出）
+    from app_common.single_instance import ensure_single_instance
+    if not ensure_single_instance("server", silent="--tray" in sys.argv):
+        return 0
+
     config = ServerConfig()
     apply_style(app, theme_is_dark(config.theme))
     app.setWindowIcon(get_app_icon("server"))

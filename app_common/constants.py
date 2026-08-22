@@ -7,7 +7,7 @@ from .hide import set_hidden
 
 APP_NAME = "MinecraftModsCloudSync"
 APP_DISPLAY_NAME = "Minecraft 模组云端同步"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.1"
 
 # 客户端加密密钥派生盐值（构建时可通过环境变量 MC_SYNC_SECRET 覆盖密钥本体）
 CRYPTO_SALT = "mc-mods-cloud-sync-7f3a9c2e5b1d"
@@ -15,6 +15,7 @@ CRYPTO_SALT = "mc-mods-cloud-sync-7f3a9c2e5b1d"
 # SFTP 默认远程目录（服务器上的绝对路径）
 DEFAULT_REMOTE_TODO_DIR = "/todo"          # 待办任务目录
 DEFAULT_REMOTE_FILES_DIR = "/client_files"  # 客户端文件仓库目录
+DEFAULT_REMOTE_C2C_DIR = "/c2c"             # C2C（本地对本地）发布目录
 MANIFEST_FILENAME = "manifest.json"
 
 # 同步分类（对应 Minecraft 游戏目录子文件夹）
