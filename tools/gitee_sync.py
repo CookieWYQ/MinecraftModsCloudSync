@@ -49,6 +49,98 @@ GITHUB_IMPORT_HINT = (
     "「从 GitHub 克隆导入」创建，或手动在仓库「管理」里配置 GitHub 镜像。"
 )
 
+# ---------- Gitee 令牌的安全存取（Windows 凭据管理器） ----------
+# 私人令牌不建议写进环境变量或脚本明文；优先存入 Windows 凭据管理器
+# （Credential Manager，由系统 DPAPI 加密，仅当前 Windows 用户可读）。
+_CRED_TARGET = "MinecraftModsCloudSync/GiteeToken"
+_CRED_TYPE_GENERIC = 1
+
+
+def _wincred_read(target: str = _CRED_TARGET) -> str:
+    """从 Windows 凭据管理器读取令牌；非 Windows / 不存在返回空字符串。"""
+    if os.name != "nt":
+        return ""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CREDENTIALW(ctypes.Structure):
+            _fields_ = [
+                ("Flags", wintypes.DWORD),
+                ("Type", wintypes.DWORD),
+                ("TargetName", wintypes.LPWSTR),
+                ("Comment", wintypes.LPWSTR),
+                ("LastWritten", wintypes.FILETIME),
+                ("CredentialBlobSize", wintypes.DWORD),
+                ("CredentialBlob", ctypes.c_void_p),
+                ("Persist", wintypes.DWORD),
+                ("AttributeCount", wintypes.DWORD),
+                ("Attributes", ctypes.c_void_p),
+                ("TargetAlias", wintypes.LPWSTR),
+                ("UserName", wintypes.LPWSTR),
+            ]
+
+        advapi32 = ctypes.WinDLL("advapi32")
+        advapi32.CredReadW.argtypes = [
+            wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            ctypes.POINTER(ctypes.POINTER(CREDENTIALW))]
+        advapi32.CredReadW.restype = wintypes.BOOL
+        advapi32.CredFree.argtypes = [ctypes.c_void_p]
+        advapi32.CredFree.restype = None
+        pcred = ctypes.POINTER(CREDENTIALW)()
+        if not advapi32.CredReadW(target, _CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
+            return ""
+        try:
+            cred = pcred.contents
+            if cred.CredentialBlob and cred.CredentialBlobSize:
+                raw = ctypes.string_at(cred.CredentialBlob, cred.CredentialBlobSize)
+                return raw.decode("utf-16-le").rstrip("\x00")
+        finally:
+            advapi32.CredFree(pcred)
+    except Exception:
+        return ""
+    return ""
+
+
+def _wincred_save(token: str, target: str = _CRED_TARGET) -> None:
+    """把令牌写入 Windows 凭据管理器（DPAPI 加密，仅当前用户可读）。"""
+    if os.name != "nt":
+        raise RuntimeError("Windows 凭据管理器仅适用于 Windows。")
+    if not token:
+        raise ValueError("令牌不能为空。")
+    import ctypes
+    from ctypes import wintypes
+
+    class CREDENTIALW(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.c_void_p),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32")
+    advapi32.CredWriteW.argtypes = [ctypes.POINTER(CREDENTIALW), wintypes.DWORD]
+    advapi32.CredWriteW.restype = wintypes.BOOL
+    buf = ctypes.create_unicode_buffer(token)
+    cred = CREDENTIALW()
+    cred.Type = _CRED_TYPE_GENERIC
+    cred.TargetName = target
+    cred.UserName = "gitee"
+    cred.CredentialBlobSize = len(token) * 2
+    cred.CredentialBlob = ctypes.cast(buf, ctypes.c_void_p)
+    cred.Persist = 3  # CRED_PERSIST_ENTERPRISE：本机持久保存
+    if not advapi32.CredWriteW(ctypes.byref(cred), 0):
+        raise ctypes.WinError()
+
 
 # ---------- HTTP 基础 ----------
 class _FileBody:
@@ -279,8 +371,12 @@ def sync_via_browser(owner: str, repo: str, gh_repo: str) -> int:
 # ---------- 入口 ----------
 def main() -> int:
     parser = argparse.ArgumentParser(description="同步 GitHub 仓库/Release 到 Gitee")
-    parser.add_argument("--token", default=os.environ.get("GITEE_TOKEN", ""),
-                        help="Gitee 私人令牌（或设置环境变量 GITEE_TOKEN）")
+    parser.add_argument("--token", default="",
+                        help="Gitee 私人令牌（省略时依次读取环境变量 GITEE_TOKEN、"
+                             "Windows 凭据管理器）")
+    parser.add_argument("--save-token", default="",
+                        help="把令牌安全保存到 Windows 凭据管理器后退出"
+                             "（以后自动读取，无需再设置环境变量）")
     parser.add_argument("--owner", default="", help="Gitee 用户名（默认取令牌对应用户）")
     parser.add_argument("--repo", default="MinecraftModsCloudSync", help="Gitee 仓库名")
     parser.add_argument("--gh-repo", default="CookieWYQ/MinecraftModsCloudSync",
@@ -293,6 +389,12 @@ def main() -> int:
     parser.add_argument("--browser", action="store_true", help="使用浏览器模拟模式（Playwright）")
     args = parser.parse_args()
 
+    if args.save_token:
+        _wincred_save(args.save_token)
+        print(f"已把 Gitee 令牌安全保存到 Windows 凭据管理器（目标：{_CRED_TARGET}）")
+        print("以后运行 python build.py --gitee 会自动读取，无需再设置环境变量。")
+        return 0
+
     gh_owner, _, gh_repo_name = args.gh_repo.partition("/")
     gh_repo = args.gh_repo
 
@@ -300,11 +402,15 @@ def main() -> int:
         return sync_via_browser(args.owner, args.repo, gh_repo)
 
     # ---- API 模式 ----
-    if not args.token:
-        print("缺少 Gitee 令牌：请用 --token 传入，或设置环境变量 GITEE_TOKEN")
-        print("获取方式：Gitee → 个人头像 → 设置 → 安全设置 → 私人令牌 → 生成新令牌")
+    # 令牌解析顺序：--token > 环境变量 GITEE_TOKEN > Windows 凭据管理器
+    token = args.token or os.environ.get("GITEE_TOKEN", "") or _wincred_read()
+    if not token:
+        print("缺少 Gitee 令牌（已检查 --token / 环境变量 GITEE_TOKEN / Windows 凭据管理器）")
+        print("获取方式：登录 Gitee → 右上角头像 → 设置 → 安全设置 → 私人令牌 → 生成新令牌")
+        print("          权限勾选：projects（仓库读写）、releases（发行版管理）")
+        print("安全保存：python tools/gitee_sync.py --save-token 你的令牌")
         return 2
-    owner = args.owner or _request("GET", "/user", args.token).get("login", "")
+    owner = args.owner or _request("GET", "/user", token).get("login", "")
     if not owner:
         print("无法确定 Gitee 用户名，请用 --owner 指定")
         return 2
@@ -312,7 +418,7 @@ def main() -> int:
 
     # 1. 代码同步
     print("[1/3] 同步代码…")
-    msg = sync_code(args.token, owner, args.repo, gh_repo,
+    msg = sync_code(token, owner, args.repo, gh_repo,
                     description=f"GitHub 仓库 {gh_repo} 的镜像")
     print(f"  {msg}")
 
@@ -326,14 +432,14 @@ def main() -> int:
         body = Path(args.body_file).read_text(encoding="utf-8")
     elif args.body:
         body = args.body
-    release_id = ensure_release(args.token, owner, args.repo,
+    release_id = ensure_release(token, owner, args.repo,
                                 args.tag or args.name, args.name or args.tag, body)
     print(f"  发行版已就绪：https://gitee.com/{owner}/{args.repo}/releases/{args.tag or args.name}")
 
     # 3. 附件
     if args.assets:
         print("[3/3] 上传附件…")
-        uploaded = upload_assets(args.token, owner, args.repo, release_id, args.assets)
+        uploaded = upload_assets(token, owner, args.repo, release_id, args.assets)
         print(f"  已上传：{', '.join(uploaded) if uploaded else '（无）'}")
     else:
         print("[3/3] 跳过（未指定 --assets）")

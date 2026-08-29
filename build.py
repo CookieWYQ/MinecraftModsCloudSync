@@ -157,7 +157,8 @@ def assemble(client_ico: str, server_ico: str):
 def gitee_sync(version: str, body_file: str = "") -> int:
     """调用 tools/gitee_sync.py：同步代码到 Gitee + 创建/更新发行版 + 上传 3 个附件。
 
-    需要设置环境变量 GITEE_TOKEN（Gitee 私人令牌），否则仅打印提示。
+    令牌按顺序自动获取：命令行 --token > 环境变量 GITEE_TOKEN > Windows 凭据管理器
+    （可先运行 python tools/gitee_sync.py --save-token 你的令牌 永久保存）。
     """
     print("=== 5/5 同步 Gitee ===")
     release = ROOT / "release"
@@ -175,10 +176,6 @@ def gitee_sync(version: str, body_file: str = "") -> int:
     ]
     if body_file:
         cmd += ["--body-file", str(body_file)]
-    if not os.environ.get("GITEE_TOKEN"):
-        print("!! 未设置环境变量 GITEE_TOKEN，跳过 Gitee 同步。")
-        print("   设置方法：set GITEE_TOKEN=你的私人令牌，然后重新运行 python build.py --gitee")
-        return 1
     run(cmd)
     return 0
 
