@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QTreeWidget,
@@ -28,11 +29,30 @@ from PySide6.QtWidgets import (
 )
 
 from app_common import winutil
-from app_common.c2c import local_files, send_worker
+from app_common.c2c import abs_c2c_dir, local_files, send_worker
 from app_common.logger import get_logger
+from app_common.sftp import SFTPManager
+from app_common.upload_files import (
+    cleanup_expired,
+    collect_upload_items,
+    delete_files,
+    list_remote_files,
+    upload_files,
+)
 from app_common.worker import Worker, fmt_progress
 
 log = get_logger("server.c2c_page")
+
+# 共享文件保存时限选项：(显示文本, 小时数；0=永久)
+TTL_OPTIONS = (
+    ("永久保存", 0),
+    ("1 小时", 1),
+    ("6 小时", 6),
+    ("1 天", 24),
+    ("3 天", 72),
+    ("7 天", 168),
+    ("30 天", 720),
+)
 
 
 class _ClientItem(QWidget):
@@ -60,6 +80,8 @@ class C2CPage(QWidget):
         self._worker = None
         self._entries: list[dict] = []
         self._local_files: list[tuple[str, str]] = []
+        self._shared_files: list[dict] = []
+        self._upload_progress = None
         self._build()
         self.reload()
 
@@ -168,6 +190,61 @@ class C2CPage(QWidget):
         send_row.addWidget(self.btn_send_all)
         layout.addLayout(send_row)
 
+        # ---- 共享文件区（.upload_files 临时下载区） ----
+        shared_box = QGroupBox("共享文件（.upload_files 临时下载区：上传共享 / 设置密钥 / 设置保存时限）")
+        sl = QVBoxLayout(shared_box)
+        sl.setSpacing(6)
+        op_row = QHBoxLayout()
+        btn_up_file = QPushButton("上传文件…")
+        btn_up_file.clicked.connect(lambda: self._browse_shared_upload(folder=False))
+        btn_up_dir = QPushButton("上传文件夹…")
+        btn_up_dir.clicked.connect(lambda: self._browse_shared_upload(folder=True))
+        op_row.addWidget(btn_up_file)
+        op_row.addWidget(btn_up_dir)
+        op_row.addSpacing(8)
+        op_row.addWidget(QLabel("下载密钥"))
+        self.ed_shared_key = QLineEdit()
+        self.ed_shared_key.setPlaceholderText("留空=不加密；填写后客户端需输入相同密钥才能下载")
+        self.ed_shared_key.setMaximumWidth(180)
+        op_row.addWidget(self.ed_shared_key)
+        op_row.addWidget(QLabel("保存时限"))
+        self.cb_ttl = QComboBox()
+        for text, hours in TTL_OPTIONS:
+            self.cb_ttl.addItem(text, hours)
+        self.cb_ttl.setMaximumWidth(110)
+        op_row.addWidget(self.cb_ttl)
+        op_row.addStretch(1)
+        btn_cleanup = QPushButton("清理过期")
+        btn_cleanup.setToolTip("删除已到保存时限的共享文件（也可在「服务器设置」页配置自动清理）")
+        btn_cleanup.clicked.connect(self._cleanup_shared_expired)
+        op_row.addWidget(btn_cleanup)
+        btn_refresh = QPushButton("刷新")
+        btn_refresh.clicked.connect(self._refresh_shared)
+        op_row.addWidget(btn_refresh)
+        sl.addLayout(op_row)
+
+        self.tree_shared = QTreeWidget()
+        self.tree_shared.setColumnCount(4)
+        self.tree_shared.setHeaderLabels(["文件（保留相对结构）", "大小", "密钥", "过期时间"])
+        self.tree_shared.setAlternatingRowColors(True)
+        self.tree_shared.setSelectionMode(QTreeWidget.ExtendedSelection)
+        sh = self.tree_shared.header()
+        sh.setSectionResizeMode(0, QHeaderView.Stretch)
+        sh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        sh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        sh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        sl.addWidget(self.tree_shared, 1)
+
+        del_row = QHBoxLayout()
+        self.lbl_shared_status = QLabel("")
+        self.lbl_shared_status.setObjectName("muted")
+        del_row.addWidget(self.lbl_shared_status, 1)
+        btn_del = QPushButton("删除选中")
+        btn_del.clicked.connect(self._delete_shared_selected)
+        del_row.addWidget(btn_del)
+        sl.addLayout(del_row)
+        layout.addWidget(shared_box)
+
         tip = QLabel("说明：C2C 用于把任意保持结构的文件从本机（服务端工具）发布给指定客户端。"
                      "发送时自动对比上次发布内容，新增 / 更新 / 改名（如 foo.jar → foo.jar.disabled 用于禁用）/ "
                      "删除的文件都会同步到客户端（保持文件结构）。"
@@ -183,6 +260,8 @@ class C2CPage(QWidget):
         self.ed_local.setText(self.config.c2c_local_dir)
         self._refresh_list()
         self._refresh_tree()
+        if self.config.host():
+            self._refresh_shared()
 
     def _refresh_list(self):
         self._re_sort()
@@ -392,6 +471,204 @@ class C2CPage(QWidget):
             winutil.error(self, "发送失败", f"C2C 发送过程中发生错误：\n{msg}")
             if self.status_cb:
                 self.status_cb(False)
+
+    # ---------- 共享文件区（.upload_files 临时下载区） ----------
+    def _require_sftp_config(self) -> bool:
+        if not self.config.host():
+            winutil.warn(self, "提示", "请先在「服务器设置」页填写服务器信息。")
+            return False
+        return True
+
+    def _shared_dir(self) -> str:
+        return abs_c2c_dir(self.config.c2c_dir)
+
+    def _browse_shared_upload(self, folder: bool):
+        if not self._require_sftp_config():
+            return
+        if folder:
+            path = QFileDialog.getExistingDirectory(self, "选择要上传的文件夹（保留相对结构）")
+            paths = [path] if path else []
+        else:
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "选择要上传的文件（可多选）")
+        if not paths:
+            return
+        items = collect_upload_items(paths)
+        if not items:
+            winutil.warn(self, "提示", "所选内容为空或不可读。")
+            return
+        total_bytes = sum(os.path.getsize(a) for _, a in items)
+        key = self.ed_shared_key.text().strip()
+        ttl_hours = int(self.cb_ttl.currentData() or 0)
+        key_tip = f"（加密：下载需输入密钥）" if key else ""
+        ttl_tip = "永久保存" if ttl_hours <= 0 else f"{ttl_hours} 小时后过期"
+        if not winutil.confirm(
+                self, "确认上传共享文件",
+                f"将上传 {len(items)} 个文件（共 {_fmt_size(total_bytes)}）到服务器的共享下载区：\n"
+                f"路径：{self._shared_dir()}/.upload_files\n"
+                f"保存时限：{ttl_tip}\n"
+                f"密钥：{key_tip or '无（明文）'}\n\n"
+                "上传内容保留相对文件结构，客户端可在「共享文件」中下载。"):
+            return
+        self._run_shared_upload(items, key, ttl_hours)
+
+    def _run_shared_upload(self, items, key, ttl_hours):
+        total_bytes = sum(os.path.getsize(a) for _, a in items)
+        progress = QProgressDialog("正在上传共享文件…", "取消", 0,
+                                   max(total_bytes, 1), self)
+        progress.setWindowTitle("上传共享文件")
+        progress.setWindowModality(Qt.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        self._upload_progress = progress
+        worker = Worker(self._shared_upload_worker, items, key, ttl_hours)
+        worker.progress.connect(self._on_shared_upload_progress)
+        worker.done.connect(lambda ok, msg: self._on_shared_upload_done(
+            ok, msg, progress))
+        self._worker = worker
+        worker.start()
+
+    def _shared_upload_worker(self, items, key, ttl_hours, progress_cb=None):
+        state = {"total": sum(os.path.getsize(a) for _, a in items)}
+        def byte_cb(transferred, total):
+            if progress_cb:
+                progress_cb(transferred, max(state["total"], 1), "")
+        def file_cb(i, n, msg):
+            if progress_cb:
+                progress_cb(state["total"], max(state["total"], 1), msg)
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            cleanup_expired(sftp, self._shared_dir())  # 上传前先清理过期
+            result = upload_files(sftp, self._shared_dir(), items,
+                                  key=key, ttl_hours=ttl_hours,
+                                  progress_cb=file_cb, byte_progress_cb=byte_cb)
+        expires = result["expires_at"]
+        tip = f"，{_fmt_expires(expires)}" if expires else ""
+        return f"已上传 {result['uploaded']} 个共享文件{tip}。"
+
+    def _on_shared_upload_progress(self, cur, total, msg):
+        progress = self._upload_progress
+        if progress is None:
+            return
+        progress.setRange(0, max(total, 1))
+        progress.setValue(cur)
+        if msg:
+            progress.setLabelText(f"{msg}（{cur / max(total, 1):.0%}）")
+
+    def _on_shared_upload_done(self, ok: bool, msg: str, progress):
+        progress.close()
+        self._upload_progress = None
+        if ok:
+            winutil.info(self, "上传成功", msg)
+            self._refresh_shared()
+        else:
+            winutil.error(self, "上传失败", f"共享文件上传失败：\n{msg}")
+
+    def _refresh_shared(self):
+        if not self._require_sftp_config():
+            return
+        self.lbl_shared_status.setText("正在读取共享文件列表…")
+        worker = Worker(self._shared_refresh_worker)
+        worker.done.connect(self._on_shared_refresh_done)
+        self._worker = worker
+        worker.start()
+
+    def _shared_refresh_worker(self, progress_cb=None):
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            cleanup_expired(sftp, self._shared_dir())  # 读取前顺带清理过期
+            return list_remote_files(sftp, self._shared_dir())
+
+    def _on_shared_refresh_done(self, ok: bool, result):
+        if not ok:
+            self.lbl_shared_status.setText("读取失败 ✘")
+            winutil.error(self, "读取失败", f"无法读取共享文件列表：\n{result}")
+            return
+        self._shared_files = result or []
+        self._rebuild_shared_tree()
+        expired = sum(1 for f in self._shared_files if f["expired"])
+        self.lbl_shared_status.setText(
+            f"共 {len(self._shared_files)} 个共享文件，其中 {expired} 个已过期（可在服务器设置中开启自动清理）")
+
+    def _rebuild_shared_tree(self):
+        self.tree_shared.clear()
+        for f in self._shared_files:
+            name = f["rel"]
+            if f["expired"]:
+                name = f"{name}（已过期）"
+            item = QTreeWidgetItem([
+                name, _fmt_size(f["size"]),
+                "是" if f["encrypted"] else "—",
+                _fmt_expires(f["expires_at"]) or "永久",
+            ])
+            item.setData(0, Qt.UserRole, f["rel"])
+            self.tree_shared.addTopLevelItem(item)
+
+    def _selected_shared_rels(self) -> list[str]:
+        rels = []
+        for item in self.tree_shared.selectedItems():
+            rel = item.data(0, Qt.UserRole)
+            if rel:
+                rels.append(rel)
+        return rels
+
+    def _delete_shared_selected(self):
+        rels = self._selected_shared_rels()
+        if not rels:
+            winutil.warn(self, "提示", "请先在共享文件列表中选择要删除的文件。")
+            return
+        if not winutil.confirm(
+                self, "确认删除",
+                f"将从服务器删除 {len(rels)} 个共享文件：\n"
+                + "\n".join(f"  · {r}" for r in rels[:10])
+                + ("\n  …" if len(rels) > 10 else "")):
+            return
+        self._run_shared_misc(self._shared_delete_worker, rels)
+
+    def _shared_delete_worker(self, rels, progress_cb=None):
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            n = delete_files(sftp, self._shared_dir(), rels)
+        return f"已删除 {n} 个共享文件。"
+
+    def _cleanup_shared_expired(self):
+        if not winutil.confirm(
+                self, "确认清理",
+                "将删除所有已到保存时限的过期共享文件，是否继续？"):
+            return
+        self._run_shared_misc(self._shared_cleanup_worker)
+
+    def _shared_cleanup_worker(self, progress_cb=None):
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            n = cleanup_expired(sftp, self._shared_dir())
+        return f"已清理 {n} 个过期共享文件。" if n else "没有过期共享文件。"
+
+    def _run_shared_misc(self, worker_fn, *args):
+        worker = Worker(worker_fn, *args)
+        worker.done.connect(self._on_shared_misc_done)
+        self._worker = worker
+        worker.start()
+
+    def _on_shared_misc_done(self, ok: bool, msg: str):
+        if ok:
+            self.lbl_shared_status.setText("操作完成 ✔")
+            winutil.info(self, "完成", msg)
+        else:
+            self.lbl_shared_status.setText("操作失败 ✘")
+            winutil.error(self, "操作失败", msg)
+        self._refresh_shared()
+
+
+def _fmt_expires(expires_at: str) -> str:
+    """ISO 时间 → 显示文本；空 → 永久。"""
+    if not expires_at:
+        return "永久"
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(expires_at).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return expires_at
 
 
 def _fmt_size(n) -> str:

@@ -73,5 +73,18 @@ Release 产物：
 
 ## 说明
 
-- 服务端与客户端通过 SFTP 交换数据：待办清单（`manifest.json`）、客户端文件仓库、授权编号清单。
+- 服务端与客户端通过 SFTP 交换数据：待办清单（`manifest.json`）、客户端文件仓库、授权编号清单、C2C 共享文件区（`.upload_files`）。
 - 客户端配置文件为加密存储，仅服务端导出的配置文件可被客户端识别。
+
+## 致谢与数据来源
+
+本项目的部分数据与代码逻辑来自 **PCL CE（Plain Craft Launcher Community Edition）**，特此说明并致谢：
+
+- **MC 百科 Mod 信息数据库**（`app_common/data/mcmod.buf`）：取自 PCL CE 仓库的 `Resources/mcmod.buf`（gzip 压缩的 protobuf-net 序列化数据），用于本地检索模组在 MC 百科中的页面与关联链接。
+- **百科检索与链接逻辑**（`app_common/mcmod_link.py`）：搜索词构造、百科搜索 / 详情页链接生成，移植自 PCL CE（`PageInstanceCompResource.xaml.cs`、`ModComp.cs`）。
+- **模组显示名识别**（`app_common/mod_identity.py`）：jar / toml / json 元数据解析逻辑参考 PCL CE（`ModLocalComp.cs`）。
+
+各文件内的具体出处（源文件与行号）详见对应模块的文档字符串注释。
+
+- 源码仓库：https://github.com/PCL-Community/PCL-CE
+- PCL CE 开源协议以该仓库 LICENSE 为准。

@@ -9,6 +9,8 @@ from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -44,6 +46,7 @@ from app_common.settings_dialog import SettingsDialog
 from app_common.tasks import ACTION_LABELS, CATEGORY_LABELS, TodoManifest
 from app_common.updater import (
     DownloadThread,
+    TrayProgressDialog,
     UpdateCheckThread,
     launch_installer,
     last_prompted_version,
@@ -56,6 +59,7 @@ from app_common.updater import (
 )
 from app_common.version_dialog import VersionPickerDialog
 from app_common.worker import Worker
+from .shared_download import SharedDownloadDialog
 
 from ..engine import (
     ApplyThread,
@@ -106,6 +110,7 @@ class ClientMainWindow(QWidget):
         self._threads = []
         self._update_thread = None
         self._download_thread = None
+        self._download_progress = None
         self._update_manual = False
         self._build()
         self._load_state()
@@ -266,10 +271,14 @@ class ClientMainWindow(QWidget):
         self.btn_update = QPushButton("检查更新…")
         self.btn_update.setToolTip(f"当前版本：{APP_VERSION}\n检查 GitHub 上的软件新版本")
         self.btn_update.clicked.connect(lambda: self._check_update(manual=True))
+        btn_shared = QPushButton("共享文件…")
+        btn_shared.setToolTip("浏览并下载服务器的 .upload_files 临时共享文件\n（上传方可能设置下载密钥与保存时限）")
+        btn_shared.clicked.connect(self._open_shared_download)
         opt_row.addWidget(btn_settings)
         opt_row.addWidget(btn_logs)
         opt_row.addWidget(btn_cfg)
         opt_row.addStretch(1)
+        opt_row.addWidget(btn_shared)
         opt_row.addWidget(self.btn_update)
         right.addWidget(opt_box)
 
@@ -418,7 +427,11 @@ class ClientMainWindow(QWidget):
             self.table.setItem(row, 0, QTableWidgetItem(ACTION_LABELS.get(task.action, task.action)))
             self.table.setItem(row, 1, QTableWidgetItem(CATEGORY_LABELS.get(task.category, task.category)))
             self.table.setItem(row, 2, QTableWidgetItem(task.target))
-            self.table.setItem(row, 3, QTableWidgetItem(task.description))
+            desc = task.description or ""
+            tags = task.tags
+            if tags:
+                desc = f"{desc}  [{'、'.join(tags)}]" if desc else f"[{'、'.join(tags)}]"
+            self.table.setItem(row, 3, QTableWidgetItem(desc))
 
     def _update_list_status(self):
         """刷新列表中每台服务器的连接状态（仅更新状态小字，名称保持用户可读名称）。"""
@@ -518,6 +531,16 @@ class ClientMainWindow(QWidget):
         self._current_sid = None
         self.refresh_list()
 
+    # ---------- 共享文件下载 ----------
+    def _open_shared_download(self):
+        sid = self._current_sid
+        profile = self.config.profile_by_id(sid) if sid else None
+        if profile is None:
+            winutil.warn(self, "提示", "请先在列表中选择一台服务器，再打开共享文件。")
+            return
+        dlg = SharedDownloadDialog(self.config, profile, self)
+        dlg.exec()
+
     # ---------- 更新检查 ----------
     def _check(self, manual: bool = False):
         if not self.config.profiles():
@@ -566,6 +589,14 @@ class ClientMainWindow(QWidget):
                 self._status[sid] = CONN_OK
                 if is_new:
                     new_count += 1
+                    # 多次更新未应用提醒：每发现一次未应用累计，达阈值时托盘提示
+                    n = self.config.bump_unapplied(sid)
+                    if n in (3, 5, 10):
+                        self.tray.showMessage(
+                            APP_DISPLAY_NAME,
+                            f"「{profile.get('name', sid)}」已有 {n} 次更新未应用，"
+                            f"请尽快检查并应用更新。",
+                            QSystemTrayIcon.Information, 5000)
             else:
                 self._status[sid] = CONN_AUTH if result.get("error", "").startswith("授权:") else CONN_FAIL
                 self._has_new[sid] = False
@@ -625,26 +656,38 @@ class ClientMainWindow(QWidget):
         lines = []
         if manifest:
             installs = [t for t in manifest.tasks if t.action == "install"]
+            downloads = [t for t in manifest.tasks if t.action == "download"]
             deletes = [t for t in manifest.tasks if t.action == "delete"]
             if installs:
                 lines.append("【S2C 将下载并安装/替换】")
-                lines += [f"  · {t.target}" for t in installs]
+                lines += [f"  · {t.target}{_task_tags(t)}" for t in installs]
+            if downloads:
+                lines.append("【S2C 将从共享区下载安装】")
+                lines += [f"  · {t.target}{_task_tags(t)}" for t in downloads]
             if deletes:
                 lines.append("【S2C 将删除】")
-                lines += [f"  · {t.target}" for t in deletes]
+                lines += [f"  · {t.target}{_task_tags(t)}" for t in deletes]
+            if manifest.note:
+                lines.append(f"【发布说明】{manifest.note}")
             settings_text = manifest.settings_summary()
             if settings_text:
                 lines.append("【客户端软件设置（随更新下发）】")
                 lines += [f"  · {s.strip()}" for s in settings_text.split("、")]
         if c2c:
             c2c_installs = [t for t in c2c.tasks if t.action == "install"]
+            c2c_downloads = [t for t in c2c.tasks if t.action == "download"]
             c2c_deletes = [t for t in c2c.tasks if t.action == "delete"]
             if c2c_installs:
                 lines.append("【C2C 将下载并安装/替换（本地对本地发布）】")
-                lines += [f"  · {t.target}" for t in c2c_installs]
+                lines += [f"  · {t.target}{_task_tags(t)}" for t in c2c_installs]
+            if c2c_downloads:
+                lines.append("【C2C 将从共享区下载安装】")
+                lines += [f"  · {t.target}{_task_tags(t)}" for t in c2c_downloads]
             if c2c_deletes:
                 lines.append("【C2C 将删除】")
-                lines += [f"  · {t.target}" for t in c2c_deletes]
+                lines += [f"  · {t.target}{_task_tags(t)}" for t in c2c_deletes]
+            if c2c.note:
+                lines.append(f"【C2C 发布说明】{c2c.note}")
         if not lines:
             lines = ["（无任务）"]
         head = f"服务器「{profile.get('name')}」即将应用更新。"
@@ -657,6 +700,16 @@ class ClientMainWindow(QWidget):
                 lines, ok_label="应用更新", cancel_label="取消"):
             return
 
+        # 可选任务：弹窗让用户勾选（默认全选，取消勾选 = 跳过）
+        optional_tasks = [t for t in ((manifest.tasks if manifest else [])
+                                      + (c2c.tasks if c2c else [])) if t.optional]
+        skip_ids: set[str] = set()
+        if optional_tasks:
+            dlg = _OptionalTasksDialog(optional_tasks, self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            skip_ids = dlg.skipped_ids()
+
         total = len(manifest.tasks) if manifest else 0
         total += len(c2c.tasks) if c2c else 0
         progress = QProgressDialog("正在应用更新…", None, 0, max(total, 1), self)
@@ -665,7 +718,7 @@ class ClientMainWindow(QWidget):
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
 
-        thread = ApplyThread(self.config, profile, manifest, c2c)
+        thread = ApplyThread(self.config, profile, manifest, c2c, skip_ids)
         thread.progress.connect(lambda cur, total, msg: (
             progress.setValue(cur),
             progress.setLabelText(f"[{cur}/{total}] {msg}"),
@@ -688,6 +741,7 @@ class ClientMainWindow(QWidget):
             self.config.mark_applied(sid, manifest.version, now)
         if c2c is not None:
             self.config.mark_applied_c2c(sid, c2c.version)
+        self.config.reset_unapplied(sid)
         self._has_new[sid] = False
         self._status[sid] = CONN_OK
         if manifest is not None:
@@ -874,12 +928,11 @@ class ClientMainWindow(QWidget):
 
     def _start_download(self, latest):
         dest = update_dir() / latest.setup_name
-        progress = QProgressDialog("正在后台下载安装程序…", "取消", 0,
-                                   max(int(latest.setup_size) or 1, 1), self)
-        progress.setWindowTitle("下载安装程序")
-        progress.setWindowModality(Qt.NonModal)  # 后台静默下载：不阻塞界面操作
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
+        progress = TrayProgressDialog(
+            "下载安装程序", "正在后台下载安装程序…", "取消",
+            0, max(int(latest.setup_size) or 1, 1),
+            tray=self.tray, parent=self)
+        self._download_progress = progress
 
         thread = DownloadThread(latest.setup_url, str(dest), self)
         progress.canceled.connect(thread.cancel)
@@ -896,10 +949,27 @@ class ClientMainWindow(QWidget):
 
     def _on_update_downloaded(self, ok: bool, path: str, err: str, progress, latest):
         progress.close()
+        self._download_progress = None
         if not ok:
             winutil.error(self, "下载失败",
                           f"安装程序下载失败（已尝试直连与多个加速镜像）：\n{err}\n\n"
                           f"可手动下载安装包：\n{release_page_url()}")
+            return
+        # 完整性兜底校验：下载文件大小与远程声明不一致 → 视为损坏，提示重新下载
+        try:
+            actual = os.path.getsize(path)
+        except OSError:
+            actual = 0
+        if latest.setup_size and actual and actual != latest.setup_size:
+            winutil.error(
+                self, "安装包损坏",
+                f"下载的安装程序不完整（{actual / 1048576:.1f} MB，"
+                f"应为 {latest.setup_size / 1048576:.1f} MB）。\n\n"
+                f"请删除后重新下载，或手动下载安装包：\n{release_page_url()}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
             return
         if not winutil.confirm(
                 self, "下载完成",
@@ -949,8 +1019,18 @@ class ClientMainWindow(QWidget):
         self.activateWindow()
 
     def _on_tray_activated(self, reason):
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._show_window()
+        if reason not in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            return
+        # 若下载进度窗被最小化隐藏到托盘，点击托盘优先恢复它
+        progress = getattr(self, "_download_progress", None)
+        if (progress is not None and progress.is_background_hidden()
+                and self._download_thread is not None
+                and self._download_thread.isRunning()):
+            progress.showNormal()
+            progress.raise_()
+            progress.activateWindow()
+            return
+        self._show_window()
 
     def closeEvent(self, event):
         event.ignore()
@@ -963,3 +1043,41 @@ class ClientMainWindow(QWidget):
             return
         self.tray.hide()
         QApplication.quit()
+
+
+def _task_tags(task) -> str:
+    """任务标签文本：可选/静默。"""
+    tags = task.tags
+    return f"（{'、'.join(tags)}）" if tags else ""
+
+
+class _OptionalTasksDialog(QDialog):
+    """选择要应用的可选任务（默认全部勾选，取消勾选 = 跳过）。"""
+
+    def __init__(self, tasks: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("可选任务（可跳过）")
+        self.setMinimumSize(520, 400)
+        lay = QVBoxLayout(self)
+        tip = QLabel("以下任务被标记为「可选」待办：取消勾选将跳过该任务。")
+        tip.setWordWrap(True)
+        lay.addWidget(tip)
+        self._checks: list[tuple] = []
+        for t in tasks:
+            text = t.summary()
+            tags = t.tags
+            if tags:
+                text = f"{text}  （{'、'.join(tags)}）"
+            cb = QCheckBox(text)
+            cb.setChecked(True)
+            self._checks.append((t, cb))
+            lay.addWidget(cb)
+        lay.addStretch(1)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("应用勾选的任务")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def skipped_ids(self) -> set[str]:
+        return {t.id for t, cb in self._checks if not cb.isChecked()}

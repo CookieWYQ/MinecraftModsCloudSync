@@ -3,6 +3,7 @@ PySide6>=6.6.0
 paramiko>=3.4.0
 cryptography>=42.0.0
 winotify>=1.1.0
+markdown>=3.6.0  # 更新日志 Markdown → HTML 渲染
 
 # 打包/构建依赖（仅开发机需要）
 pyinstaller>=6.6.0

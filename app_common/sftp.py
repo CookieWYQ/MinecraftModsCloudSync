@@ -506,21 +506,33 @@ class SFTPManager:
         except Exception as exc:
             raise SFTPError(f"写入远程文件失败: {path} ({exc})") from exc
 
-    def upload(self, local_path: str | Path, remote_path: str) -> None:
+    def upload(self, local_path: str | Path, remote_path: str,
+               progress_cb=None) -> None:
+        """上传文件。progress_cb(已传字节, 总字节) 可选（paramiko put callback）。"""
         _invalidate_scan_cache()
         local = Path(local_path)
         remote = self._posix(remote_path)
         self.mkdirs(str(PurePosixPath(remote).parent))
         try:
-            self._sftp.put(str(local), remote)
+            if progress_cb:
+                self._sftp.put(str(local), remote,
+                               callback=lambda t, total: progress_cb(t, total))
+            else:
+                self._sftp.put(str(local), remote)
         except Exception as exc:
             raise SFTPError(f"上传失败: {local.name} ({exc})") from exc
 
-    def download(self, remote_path: str, local_path: str | Path) -> None:
+    def download(self, remote_path: str, local_path: str | Path,
+                 progress_cb=None) -> None:
+        """下载文件。progress_cb(已传字节, 总字节) 可选（paramiko get callback）。"""
         local = Path(local_path)
         local.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self._sftp.get(self._posix(remote_path), str(local))
+            if progress_cb:
+                self._sftp.get(self._posix(remote_path), str(local),
+                               callback=lambda t, total: progress_cb(t, total))
+            else:
+                self._sftp.get(self._posix(remote_path), str(local))
         except Exception as exc:
             raise SFTPError(f"下载失败: {remote_path} ({exc})") from exc
 

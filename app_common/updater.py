@@ -7,15 +7,19 @@
 
 「已提示过的版本」记录在本地 update_state.json，避免每次启动静默检查时反复打扰。
 """
+import http.client
 import json
 import os
 import re
-import urllib.error
+import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from PySide6.QtCore import QThread, Signal
+import markdown as _md  # 更新日志 Markdown → HTML（渲染成带样式的富文本）
+from PySide6.QtCore import QEvent, QThread, QTimer, Signal, Qt
+from PySide6.QtWidgets import QProgressDialog, QSystemTrayIcon
 
 from .constants import APP_NAME, APP_VERSION, appdata_dir
 from .logger import get_logger
@@ -26,6 +30,8 @@ GITHUB_REPO = "CookieWYQ/MinecraftModsCloudSync"
 LATEST_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 SETUP_PREFIX = "MinecraftModsCloudSync_Setup_"
 _CHUNK = 64 * 1024
+# 下载断线后的自动重试次数（配合断点续传，重试无需重新下载已完成的字节）
+DOWNLOAD_MAX_RETRIES = 3
 
 # 常见 GitHub 下载加速镜像（按顺序尝试；仅用于安装包下载，版本查询仍走官方 API）。
 # 直连失败时自动降级到镜像，任一通道成功后即完成下载。
@@ -245,27 +251,91 @@ def download_setup(url: str, dest: str, progress_cb=None,
 
 def _download_one(url: str, dest: str, progress_cb=None,
                   cancelled_cb=None, timeout: int = 30) -> str:
-    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        total = int(resp.headers.get("Content-Length") or 0)
-        if progress_cb:
-            progress_cb(0, total, "开始下载…")
-        downloaded = 0
-        with open(dest, "wb") as f:
-            while True:
-                if cancelled_cb and cancelled_cb():
-                    raise RuntimeError("已取消下载")
-                chunk = resp.read(_CHUNK)
-                if not chunk:
-                    break
-                f.write(chunk)
-                downloaded += len(chunk)
+    """下载单个 URL 到 dest（HTTP keep-alive + 断点续传 + 断线自动重试 + 完整性校验）。
+
+    - 每次进入本通道前清除 dest 残留：防止与「不同来源/不同版本」的旧文件拼接导致安装包损坏；
+    - 复用连接（Connection: keep-alive）；同一通道内断线重试时发送 Range 断点续传；
+    - 下载完成后按 Content-Length 校验字节数（http.client 读到 EOF 不会主动报不完整）；
+    - 416（Range 无效）表示本地残留与服务器不符，清空后从头下载，不再误判「已完成」。
+    """
+    parts = urlsplit(url)
+    path = parts.path + (("?" + parts.query) if parts.query else "")
+    if os.path.exists(dest):
+        try:
+            os.remove(dest)  # 清残留：确保从头下载、内容正确
+        except OSError:
+            pass
+    total = 0
+    for attempt in range(DOWNLOAD_MAX_RETRIES):
+        have = os.path.getsize(dest) if os.path.exists(dest) else 0
+        conn = None
+        try:
+            if parts.scheme == "https":
+                conn = http.client.HTTPSConnection(parts.netloc, timeout=timeout)
+            else:
+                conn = http.client.HTTPConnection(parts.netloc, timeout=timeout)
+            headers = {
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+                "Connection": "keep-alive",
+            }
+            if have:
+                headers["Range"] = f"bytes={have}-"
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            if resp.status == 416:
+                # Range 起点超过文件末尾：本地残留与服务器不符 → 清空从头下载
+                conn.close()
+                try:
+                    os.remove(dest)
+                except OSError:
+                    pass
                 if progress_cb:
-                    mb = downloaded / 1024 / 1024
-                    progress_cb(downloaded, total, f"已下载 {mb:.1f} MB")
-    if progress_cb:
-        progress_cb(downloaded, total, "下载完成")
-    return dest
+                    progress_cb(0, 0, "本地残留与服务器不一致，重新下载…")
+                continue
+            if resp.status not in (200, 206):
+                raise RuntimeError(f"HTTP {resp.status}")
+            if resp.status == 206:
+                total = have + int(resp.headers.get("Content-Length") or 0)
+                mode = "ab"
+            else:
+                # 服务端不支持断点续传：从头下载（覆盖已有文件）
+                have = 0
+                total = int(resp.headers.get("Content-Length") or 0)
+                mode = "wb"
+            if progress_cb:
+                progress_cb(have, total, "开始下载…")
+            with open(dest, mode) as f:
+                while True:
+                    if cancelled_cb and cancelled_cb():
+                        raise RuntimeError("已取消下载")
+                    chunk = resp.read(_CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    have += len(chunk)
+                    if progress_cb:
+                        progress_cb(have, total, f"已下载 {have / 1048576:.1f} MB")
+            conn.close()
+            # 完整性校验：服务器声明了总字节时必须下载齐全，否则视为失败重试
+            if total and have != total:
+                raise RuntimeError(f"下载不完整（{have}/{total} 字节）")
+            if progress_cb:
+                progress_cb(have, total, "下载完成")
+            return dest
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            if (cancelled_cb and cancelled_cb()) or attempt >= DOWNLOAD_MAX_RETRIES - 1:
+                raise
+            log.warning("下载中断（第 %s/%s 次），自动重试: %s",
+                        attempt + 1, DOWNLOAD_MAX_RETRIES, exc)
+            if progress_cb:
+                progress_cb(have, total, f"连接中断，自动重试（{attempt + 1}/{DOWNLOAD_MAX_RETRIES}）…")
+            time.sleep(1)
+    raise RuntimeError("下载失败")
 
 
 def launch_installer(path: str) -> None:
@@ -326,6 +396,40 @@ def set_last_check_time(value: str) -> None:
 
 
 # ---------- 界面辅助（客户端 / 服务端共用） ----------
+# 更新日志渲染样式：使用 palette() 跟随系统深浅主题，避免亮瞎眼或看不清
+_MD_CSS = """
+body { font-family: "Microsoft YaHei UI", "Segoe UI", sans-serif; font-size: 13px; margin: 6px; }
+h1, h2, h3, h4 { font-weight: bold; margin: 8px 0 4px; }
+h1 { font-size: 17px; } h2 { font-size: 15px; } h3 { font-size: 14px; } h4 { font-size: 13px; }
+p { margin: 4px 0; }
+ul, ol { margin: 4px 0; padding-left: 22px; }
+li { margin: 2px 0; }
+code { font-family: Consolas, "Courier New", monospace; background: palette(midlight); padding: 1px 3px; }
+pre { background: palette(midlight); padding: 6px; border-radius: 3px; white-space: pre-wrap; }
+pre code { background: transparent; padding: 0; }
+blockquote { border-left: 3px solid palette(mid); margin: 4px 0; padding-left: 8px; color: palette(dark); }
+a { color: palette(link); }
+table { border-collapse: collapse; }
+td, th { border: 1px solid palette(mid); padding: 2px 6px; }
+th { font-weight: bold; }
+hr { border: none; border-top: 1px solid palette(mid); }
+"""
+
+
+def render_markdown(body: str) -> str:
+    """将 Release 更新日志（Markdown）渲染为带样式的富文本 HTML。
+
+    - 使用 markdown 库解析（extra 扩展：表格、围栏代码、定义列表、脚注等）；
+    - 颜色全部走 palette()，自动适配系统深色/浅色主题；
+    - 仅保留安全子集：不启用 raw_html，避免注入脚本（更新内容来自远端）。
+    """
+    html = _md.markdown(body or "", extensions=["extra", "sane_lists", "nl2br"])
+    # 移除可能的 raw HTML（markdown 库默认透传原始 HTML，这里做一层兜底过滤）
+    html = re.sub(r"<(script|iframe|object|embed)\b[^>]*>.*?</\1>", "", html,
+                  flags=re.IGNORECASE | re.DOTALL)
+    return f"<style>{_MD_CSS}</style>{html}"
+
+
 def show_update_result(parent, latest, releases: list[dict],
                        checked_at: str, has_update: bool) -> bool:
     """展示检查更新结果：当前版本、上次检查时间、更新日志、版本历史列表。
@@ -338,7 +442,7 @@ def show_update_result(parent, latest, releases: list[dict],
         QDialogButtonBox,
         QLabel,
         QListWidget,
-        QPlainTextEdit,
+        QTextBrowser,
         QVBoxLayout,
     )
     dlg = QDialog(parent)
@@ -365,9 +469,10 @@ def show_update_result(parent, latest, releases: list[dict],
 
     if has_update and latest is not None and latest.body.strip():
         layout.addWidget(QLabel("更新日志："))
-        txt = QPlainTextEdit()
+        txt = QTextBrowser()
         txt.setReadOnly(True)
-        txt.setPlainText(latest.body.strip())
+        txt.setOpenExternalLinks(True)
+        txt.setHtml(render_markdown(latest.body))
         txt.setMaximumHeight(200)
         layout.addWidget(txt)
 
@@ -475,3 +580,39 @@ class DownloadThread(QThread):
 
     def _emit_progress(self, current: int, total: int, message: str):
         self.progress.emit(current, total, message)
+
+
+class TrayProgressDialog(QProgressDialog):
+    """支持「最小化到系统托盘」的下载进度窗口。
+
+    用户点最小化后不再占用任务栏，而是隐藏到系统托盘并弹出气泡提示；
+    点击托盘图标即可恢复该窗口。下载始终在后台线程进行，不受影响。
+    """
+
+    def __init__(self, title: str, label: str, cancel_text: str,
+                 minimum: int, maximum: int, tray=None, parent=None):
+        super().__init__(label, cancel_text, minimum, maximum, parent)
+        self._tray = tray
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.NonModal)          # 后台下载：不阻塞界面操作
+        self.setMinimumDuration(0)
+        self.setAutoClose(False)
+        self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
+
+    def changeEvent(self, event):
+        # 最小化 → 延迟一帧隐藏到托盘（直接 hide 会让窗口状态机混乱）
+        if event.type() == QEvent.WindowStateChange and self.isMinimized():
+            QTimer.singleShot(0, self._minimize_to_tray)
+        super().changeEvent(event)
+
+    def _minimize_to_tray(self):
+        self.hide()
+        if self._tray is not None and QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray.showMessage(
+                "下载仍在后台进行",
+                f"{self.windowTitle()}已最小化到托盘，点击托盘图标恢复。",
+                QSystemTrayIcon.Information, 3000)
+
+    def is_background_hidden(self) -> bool:
+        """窗口是否已被最小化隐藏到托盘（供托盘图标点击时恢复）。"""
+        return self.isHidden() and not self.isVisible()

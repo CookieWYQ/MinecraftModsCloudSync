@@ -33,6 +33,7 @@ from app_common.logger import get_logger, set_log_context
 from app_common.settings_dialog import SettingsDialog
 from app_common.updater import (
     DownloadThread,
+    TrayProgressDialog,
     UpdateCheckThread,
     launch_installer,
     last_prompted_version,
@@ -106,6 +107,7 @@ class ServerMainWindow(QMainWindow):
         self.config = config
         self._update_thread = None
         self._download_thread = None
+        self._download_progress = None
         self._update_manual = False
         self._build()
         self._restore_state()
@@ -212,6 +214,12 @@ class ServerMainWindow(QMainWindow):
         self.timer_update = QTimer(self)
         self.timer_update.timeout.connect(lambda: self._check_update(manual=False))
         self.timer_update.start(6 * 60 * 60 * 1000)
+
+        # 共享文件（.upload_files）过期自动清理：启动 1 分钟后 + 每 6 小时
+        QTimer.singleShot(60_000, self._cleanup_shared_expired)
+        self.timer_cleanup = QTimer(self)
+        self.timer_cleanup.timeout.connect(self._cleanup_shared_expired)
+        self.timer_cleanup.start(6 * 60 * 60 * 1000)
 
         # 托盘
         self.tray = None
@@ -446,6 +454,33 @@ class ServerMainWindow(QMainWindow):
         dlg.exec()
 
     # ---------- 软件本体更新（GitHub / Gitee） ----------
+    def _cleanup_shared_expired(self):
+        """定时清理 .upload_files 中已过保存时限的共享文件（静默执行，无过期则跳过）。"""
+        if not self.config.host():
+            return
+        from app_common.c2c import abs_c2c_dir
+        from app_common.sftp import SFTPManager
+        from app_common.upload_files import cleanup_expired
+
+        def _work(progress_cb=None):
+            c2c_dir = abs_c2c_dir(self.config.c2c_dir)
+            with SFTPManager(self.config.host(), self.config.port(),
+                             self.config.username(), self.config.password()) as sftp:
+                return cleanup_expired(sftp, c2c_dir)
+
+        worker = Worker(_work)
+        worker.done.connect(self._on_cleanup_shared_done)
+        self._cleanup_worker = worker
+        worker.start()
+
+    def _on_cleanup_shared_done(self, ok: bool, msg: str):
+        if ok and msg:
+            log.info("已清理过期共享文件：%s", msg)
+            try:
+                self.c2c_page._refresh_shared()
+            except Exception:
+                pass
+
     def _check_update(self, manual: bool = True):
         """检查软件本体更新。manual=False 为定时/启动静默检查（尊重设置开关）。"""
         if not manual and not self.config.auto_update_check:
@@ -488,12 +523,11 @@ class ServerMainWindow(QMainWindow):
 
     def _start_download(self, latest):
         dest = update_dir() / latest.setup_name
-        progress = QProgressDialog("正在后台下载安装程序…", "取消", 0,
-                                   max(int(latest.setup_size) or 1, 1), self)
-        progress.setWindowTitle("下载安装程序")
-        progress.setWindowModality(Qt.NonModal)  # 后台静默下载：不阻塞界面操作
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
+        progress = TrayProgressDialog(
+            "下载安装程序", "正在后台下载安装程序…", "取消",
+            0, max(int(latest.setup_size) or 1, 1),
+            tray=self.tray, parent=self)
+        self._download_progress = progress
 
         thread = DownloadThread(latest.setup_url, str(dest), self)
         progress.canceled.connect(thread.cancel)
@@ -510,10 +544,27 @@ class ServerMainWindow(QMainWindow):
 
     def _on_update_downloaded(self, ok: bool, path: str, err: str, progress, latest):
         progress.close()
+        self._download_progress = None
         if not ok:
             winutil.error(self, "下载失败",
                           f"安装程序下载失败（已尝试直连与多个加速镜像）：\n{err}\n\n"
                           f"可手动下载安装包：\n{release_page_url()}")
+            return
+        # 完整性兜底校验：下载文件大小与远程声明不一致 → 视为损坏，提示重新下载
+        try:
+            actual = os.path.getsize(path)
+        except OSError:
+            actual = 0
+        if latest.setup_size and actual and actual != latest.setup_size:
+            winutil.error(
+                self, "安装包损坏",
+                f"下载的安装程序不完整（{actual / 1048576:.1f} MB，"
+                f"应为 {latest.setup_size / 1048576:.1f} MB）。\n\n"
+                f"请删除后重新下载，或手动下载安装包：\n{release_page_url()}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
             return
         if not winutil.confirm(
                 self, "下载完成",
@@ -671,8 +722,18 @@ class ServerMainWindow(QMainWindow):
         self.activateWindow()
 
     def _on_tray_activated(self, reason):
-        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
-            self._show_window()
+        if reason not in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            return
+        # 若下载进度窗被最小化隐藏到托盘，点击托盘优先恢复它
+        progress = getattr(self, "_download_progress", None)
+        if (progress is not None and progress.is_background_hidden()
+                and self._download_thread is not None
+                and self._download_thread.isRunning()):
+            progress.showNormal()
+            progress.raise_()
+            progress.activateWindow()
+            return
+        self._show_window()
 
     def closeEvent(self, event):
         if self.tray is not None:

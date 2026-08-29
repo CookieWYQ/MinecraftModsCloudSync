@@ -11,6 +11,7 @@ from datetime import datetime
 
 from PySide6.QtCore import QThread, Signal
 
+from app_common import winutil
 from app_common.app_config import ClientConfig
 from app_common.c2c import files_root as c2c_files_root
 from app_common.c2c import load_client_manifest
@@ -19,12 +20,12 @@ from app_common.constants import (
     DEFAULT_REMOTE_FILES_DIR,
     DEFAULT_REMOTE_TODO_DIR,
 )
-from app_common import winutil
 from app_common.license import AuthError, verify
 from app_common.logger import get_logger
 from app_common.profile import parse_profile_content
 from app_common.sftp import SFTPError, SFTPManager
 from app_common.tasks import TodoManifest, safe_target
+from app_common.upload_files import upload_files_dir
 
 log = get_logger("client.engine")
 
@@ -135,23 +136,29 @@ def check_all(config: ClientConfig, progress_cb=None) -> dict:
 
 # ---------------- 应用更新 ----------------
 class ApplyThread(QThread):
-    """应用指定服务器的待办清单（S2C + C2C）。"""
+    """应用指定服务器的待办清单（S2C + C2C）。
+
+    skip_optional_ids: 用户取消勾选的可选任务 id 集合（这些任务将被跳过）。
+    """
 
     done = Signal(bool, object, str)  # (成功, summary dict, 错误信息)
     progress = Signal(int, int, str)
 
     def __init__(self, config: ClientConfig, profile: dict, manifest: TodoManifest,
-                 c2c_manifest: TodoManifest | None = None, parent=None):
+                 c2c_manifest: TodoManifest | None = None,
+                 skip_optional_ids: set[str] | None = None, parent=None):
         super().__init__(parent)
         self.config = config
         self.profile = profile
         self.manifest = manifest
         self.c2c_manifest = c2c_manifest
+        self.skip_optional_ids = skip_optional_ids or set()
 
     def run(self):
         try:
             summary = apply_update(self.config, self.profile, self.manifest,
-                                   self.c2c_manifest, self._progress)
+                                   self.c2c_manifest, self._progress,
+                                   self.skip_optional_ids)
             self.done.emit(True, summary, "")
         except AuthError as exc:
             log.warning("授权校验未通过: %s", exc)
@@ -166,28 +173,42 @@ class ApplyThread(QThread):
 
 def apply_update(config: ClientConfig, profile: dict, manifest: TodoManifest,
                  c2c_manifest: TodoManifest | None = None,
-                 progress_cb=None) -> dict:
-    """校验编号后应用清单：下载/替换文件、删除文件（S2C 与 C2C）。"""
+                 progress_cb=None, skip_optional_ids: set[str] | None = None) -> dict:
+    """校验编号后应用清单：下载/替换文件、删除文件、下载共享文件（S2C 与 C2C）。
+
+    - download 任务：从 .upload_files 共享区下载到游戏目录（未加密共享文件）；
+    - optional 任务：id 在 skip_optional_ids 中时跳过（用户未勾选）；
+    - silent 任务：不影响执行，仅由界面层决定是否静默展示。
+    """
     info = profile_sftp_info(profile)
     sid = profile.get("server_id", "")
     game_dir = config.local_mc_dir
     if not game_dir or not os.path.isdir(game_dir):
         raise RuntimeError("游戏目录无效，请先在主界面选择客户端根目录。")
 
+    skip_ids = skip_optional_ids or set()
     summary = {"installed": [], "deleted": [], "skipped": [], "errors": [],
                "settings": []}
     s2c_tasks = list(manifest.tasks) if manifest else []
     c2c_tasks = list(c2c_manifest.tasks) if c2c_manifest else []
     total = len(s2c_tasks) + len(c2c_tasks)
+    shared_root = upload_files_dir(info["c2c_dir"])
     with _connect(info) as sftp:
         verify(sftp, sid)
         with tempfile.TemporaryDirectory(prefix="mc_sync_") as tmp:
             count = [0]
 
             def apply_tasks(tasks, source_root):
-                """按任务应用：install 从 source_root 下载，delete 直接删除。"""
+                """按任务应用：install 从 source_root 下载，download 从共享区下载，delete 删除。"""
                 for task in tasks:
                     try:
+                        if task.optional and task.id in skip_ids:
+                            summary["skipped"].append(
+                                f"{task.target}（可选任务未勾选，已跳过）")
+                            count[0] += 1
+                            if progress_cb:
+                                progress_cb(count[0], total, task.summary())
+                            continue
                         target = safe_target(task.target)
                         abs_target = os.path.join(game_dir, target)
                         if task.action == "delete":
@@ -211,6 +232,21 @@ def apply_update(config: ClientConfig, profile: dict, manifest: TodoManifest,
                                 shutil.move(local_tmp, abs_target)
                                 summary["installed"].append(target)
                                 log.info("已安装: %s", target)
+                        elif task.action == "download":
+                            # 从 .upload_files 共享区下载到游戏目录（保留相对结构）
+                            remote = SFTPManager.join(shared_root,
+                                                      task.source or target)
+                            if not sftp.exists(remote):
+                                summary["errors"].append(
+                                    f"{target}（共享文件不存在或已过期）")
+                            else:
+                                local_tmp = os.path.join(tmp, f"c{count[0]}")
+                                sftp.download(remote, local_tmp)
+                                os.makedirs(os.path.dirname(abs_target),
+                                            exist_ok=True)
+                                shutil.move(local_tmp, abs_target)
+                                summary["installed"].append(target)
+                                log.info("已下载安装: %s", target)
                         else:
                             summary["skipped"].append(
                                 f"{target}（未知操作 {task.action}）")

@@ -12,8 +12,8 @@ from .sftp import SFTPError, SFTPManager
 
 log = get_logger("tasks")
 
-# 动作：install=安装/替换文件，delete=删除文件
-ACTION_LABELS = {"install": "安装/替换", "delete": "删除"}
+# 动作：install=安装/替换文件，delete=删除文件，download=从共享区下载到游戏目录
+ACTION_LABELS = {"install": "安装/替换", "delete": "删除", "download": "下载安装"}
 # 分类：对应游戏目录下的子目录
 CATEGORY_LABELS = {"mods": "模组", "resourcepacks": "资源包", "config": "配置", "other": "其他"}
 
@@ -21,11 +21,13 @@ CATEGORY_LABELS = {"mods": "模组", "resourcepacks": "资源包", "config": "�
 @dataclass
 class TaskItem:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    action: str = "delete"            # install | delete
+    action: str = "delete"            # install | delete | download
     category: str = "mods"            # mods | resourcepacks | config | other
     target: str = ""                  # 游戏目录内相对路径，如 mods/foo.jar
-    source: str = ""                  # install 时对应 files 目录下相对路径
+    source: str = ""                  # install/download 时的源相对路径
     description: str = ""             # 说明
+    optional: bool = False            # 可选任务：客户端应用时可勾选跳过
+    silent: bool = False              # 静默任务：客户端后台应用，不弹窗打扰
     local_file: str = ""              # 仅界面使用：本地源文件路径，不入库
 
     @classmethod
@@ -37,6 +39,8 @@ class TaskItem:
             target=d.get("target", ""),
             source=d.get("source", ""),
             description=d.get("description", ""),
+            optional=bool(d.get("optional", False)),
+            silent=bool(d.get("silent", False)),
         )
 
     def to_dict(self) -> dict:
@@ -49,13 +53,26 @@ class TaskItem:
         cat = CATEGORY_LABELS.get(self.category, self.category)
         if self.action == "delete":
             return f"删除{cat}：{self.target}"
+        if self.action == "download":
+            return f"下载{cat}：{self.target}"
         return f"安装{cat}：{self.target}"
+
+    @property
+    def tags(self) -> list[str]:
+        """任务标签（界面展示用）。"""
+        out = []
+        if self.optional:
+            out.append("可选")
+        if self.silent:
+            out.append("静默")
+        return out
 
 
 @dataclass
 class TodoManifest:
     version: str = ""                 # 版本号，可自定义，如 hotfix-1.0
     created_at: str = ""              # ISO 8601 时间戳
+    note: str = ""                    # 发布说明（可选，随待办下发展示）
     tasks: list[TaskItem] = field(default_factory=list)
     settings: dict = field(default_factory=dict)  # 客户端软件设置（随待办下发）
     meta: dict = field(default_factory=dict)      # 附加元数据（如 C2C 文件哈希表 {"files": {rel: md5}}）
@@ -71,6 +88,7 @@ class TodoManifest:
         return cls(
             version=d.get("version", ""),
             created_at=d.get("created_at", ""),
+            note=d.get("note", ""),
             tasks=[TaskItem.from_dict(t) for t in d.get("tasks", [])],
             settings=settings if isinstance(settings, dict) else {},
             meta=meta if isinstance(meta, dict) else {},
@@ -80,6 +98,7 @@ class TodoManifest:
         return {
             "version": self.version,
             "created_at": self.created_at,
+            "note": self.note,
             "tasks": [t.to_dict() for t in self.tasks],
             "settings": dict(self.settings),
             "meta": dict(self.meta),

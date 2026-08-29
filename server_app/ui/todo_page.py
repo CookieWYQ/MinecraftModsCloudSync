@@ -16,13 +16,18 @@ from PySide6.QtCore import QUrl, Qt
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMenu,
     QPushButton,
     QTreeWidgetItem,
@@ -31,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_common import winutil
+from app_common.c2c import abs_c2c_dir
 from app_common.constants import config_dir
 from app_common.file_hash import hash_remote_smart
 from app_common.logger import get_logger
@@ -38,7 +44,8 @@ from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
 from app_common.sftp import SFTPManager
 from app_common.snapshot import load_snapshot, normalize_files, save_snapshot
 from app_common.snapshot_dialog import SnapshotHistoryDialog
-from app_common.tasks import CATEGORY_LABELS, TaskItem, TodoManifest
+from app_common.tasks import CATEGORY_LABELS, TaskItem, TodoManifest, safe_target
+from app_common.upload_files import list_remote_files
 from app_common.worker import Worker, fmt_progress
 
 from .remote_tree import SelectTreeWidget
@@ -144,6 +151,7 @@ class TodoPage(QWidget):
         self._last_auto_detect = 0.0
         self._rows: list[dict] = []
         self._state = _load_todo_state(self.config.current_id())
+        self._shared_tasks: list[dict] = []  # 共享文件下载任务 [{rel, target, category}]
         self._build()
         self._refresh_pub_snap()
 
@@ -163,6 +171,34 @@ class TodoPage(QWidget):
         self.lbl_time.setObjectName("muted")
         head.addWidget(self.lbl_time)
         layout.addLayout(head)
+
+        # 发布设置：可选 / 静默 / 发布说明 / 共享文件下载任务
+        opt_row = QHBoxLayout()
+        self.chk_optional = QCheckBox("本批待办为可选（客户端可勾选跳过）")
+        self.chk_silent = QCheckBox("静默下载应用（客户端后台执行，不弹窗打扰）")
+        opt_row.addWidget(self.chk_optional)
+        opt_row.addWidget(self.chk_silent)
+        opt_row.addSpacing(10)
+        opt_row.addWidget(QLabel("发布说明："))
+        self.ed_note = QLineEdit()
+        self.ed_note.setPlaceholderText("可选：本次发布的说明（时间自动记录，随待办下发展示给客户端）")
+        opt_row.addWidget(self.ed_note, 1)
+        layout.addLayout(opt_row)
+
+        shared_row = QHBoxLayout()
+        self.btn_add_shared = QPushButton("添加共享下载任务…")
+        self.btn_add_shared.setToolTip("从 .upload_files 共享区选择文件，作为「下载安装」待办发布给客户端")
+        self.btn_add_shared.clicked.connect(self._add_shared_task)
+        self.btn_remove_shared = QPushButton("移除选中")
+        self.btn_remove_shared.setToolTip("移除选中的共享下载任务")
+        self.btn_remove_shared.clicked.connect(self._remove_shared_task)
+        shared_row.addWidget(self.btn_add_shared)
+        shared_row.addWidget(self.btn_remove_shared)
+        self.list_shared_tasks = QListWidget()
+        self.list_shared_tasks.setMaximumHeight(84)
+        self.list_shared_tasks.setSelectionMode(QListWidget.ExtendedSelection)
+        shared_row.addWidget(self.list_shared_tasks, 1)
+        layout.addLayout(shared_row)
 
         # 服务端改动检测：改动树即任务清单，全部默认发布，右键可禁用/批注
         detect_box = QGroupBox(
@@ -871,27 +907,47 @@ class TodoPage(QWidget):
                       "autostart": f"开机自启={'开' if settings['autostart'] else '关'}",
                       "notify": f"系统通知={'开' if settings['notify'] else '关'}"}
             detail.append("客户端软件设置：" + "、".join(labels.values()))
+        note = self.ed_note.text().strip()
+        if note:
+            detail.append(f"发布说明：{note}")
+        flags = []
+        if self.chk_optional.isChecked():
+            flags.append("本批可选（客户端可勾选跳过）")
+        if self.chk_silent.isChecked():
+            flags.append("静默下载应用（后台执行）")
+        if flags:
+            detail.append("任务标记：" + "、".join(flags))
+        for t in self._shared_tasks:
+            detail.append(f"下载任务：{self._task_line(t)}")
+        detail.append(f"发布时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         if not winutil.confirm_list(
                 self, "确认发布",
-                f"即将发布 {len(items)} 项改动到服务器 {host}，版本号：{version}。是否继续？",
+                f"即将发布 {len(items)} 项改动 + {len(self._shared_tasks)} 个共享下载任务"
+                f"到服务器 {host}，版本号：{version}。是否继续？",
                 detail, ok_label="发布", cancel_label="取消"):
             return
 
         self.btn_publish.setEnabled(False)
         self.lbl_status.setText("正在发布…")
         worker = Worker(self._publish_worker, version, items,
-                        dict(self._state["notes"]), settings)
+                        dict(self._state["notes"]), settings, note,
+                        self.chk_optional.isChecked(),
+                        self.chk_silent.isChecked(),
+                        list(self._shared_tasks))
         worker.progress.connect(self._on_progress)
         worker.done.connect(self._on_publish_done)
         self._worker = worker
         worker.start()
 
-    def _publish_worker(self, version, items, notes, settings, progress_cb=None):
+    def _publish_worker(self, version, items, notes, settings,
+                        note="", optional=False, silent=False,
+                        shared_tasks=None, progress_cb=None):
         manifest = TodoManifest.new(version)
+        manifest.note = note
         tasks = []
         for it in items:
             rel = it["rel"]
-            note = notes.get(rel, "")
+            note_desc = notes.get(rel, "")
             if it["status"] == "rename":
                 # 改名 = 删除旧文件 + 安装新文件（客户端旧文件移除、新文件落地）
                 old = it.get("old_rel", "")
@@ -900,13 +956,15 @@ class TodoPage(QWidget):
                            and old_parts[0] in CATEGORY_LABELS else "other")
                 tasks.append(TaskItem(
                     action="delete", category=old_cat, target=old,
-                    description=note or "改名（删除旧文件）"))
+                    description=note_desc or "改名（删除旧文件）",
+                    optional=optional, silent=silent))
                 parts = rel.split("/")
                 category = (parts[0] if len(parts) > 1
                             and parts[0] in CATEGORY_LABELS else "other")
                 tasks.append(TaskItem(
                     action="install", category=category, target=rel, source=rel,
-                    description=note or "改名（安装新文件）"))
+                    description=note_desc or "改名（安装新文件）",
+                    optional=optional, silent=silent))
                 continue
             parts = rel.split("/")
             category = parts[0] if len(parts) > 1 and parts[0] in CATEGORY_LABELS \
@@ -914,13 +972,22 @@ class TodoPage(QWidget):
             if it["status"] in ("new", "update"):
                 tasks.append(TaskItem(
                     action="install", category=category, target=rel, source=rel,
-                    description=note or "来自服务端改动检测"))
+                    description=note_desc or "来自服务端改动检测",
+                    optional=optional, silent=silent))
             else:
-                desc = note or ("旧版残留自动检测" if it["status"] == "obsolete"
-                                else "服务端已移除")
+                desc = note_desc or ("旧版残留自动检测" if it["status"] == "obsolete"
+                                     else "服务端已移除")
                 tasks.append(TaskItem(
                     action="delete", category=category, target=rel,
-                    description=desc))
+                    description=desc, optional=optional, silent=silent))
+        # 共享文件下载任务（action=download：客户端从 .upload_files 下载到游戏目录）
+        for st in shared_tasks or []:
+            tasks.append(TaskItem(
+                action="download", category=st.get("category", "other"),
+                target=safe_target(st.get("target", "")),
+                source=safe_target(st.get("rel", "")),
+                description="共享文件下载任务",
+                optional=optional, silent=silent))
         manifest.tasks = tasks
         manifest.settings = dict(settings)
         total = len(tasks) + 1
@@ -970,7 +1037,122 @@ class TodoPage(QWidget):
             self._refresh_pub_snap()
             winutil.info(self, "发布成功", msg)
             log.info("待办发布成功: %s", msg)
+            self._shared_tasks = []
+            self._update_shared_tasks_ui()
             self._auto_detect(force=True)  # 发布后立即重新检测，刷新剩余改动
         else:
             self.lbl_status.setText("发布失败 ✘")
             winutil.error(self, "发布失败", f"发布过程中发生错误：\n{msg}")
+
+    # ---------- 共享文件下载任务（download 待办） ----------
+    def _add_shared_task(self):
+        if not self.config.host():
+            winutil.warn(self, "提示", "请先在「SFTP 设置」页填写服务器信息。")
+            return
+        self.btn_add_shared.setEnabled(False)
+        worker = Worker(self._load_shared_entries)
+        worker.done.connect(self._on_shared_entries_loaded)
+        self._worker = worker
+        worker.start()
+
+    def _load_shared_entries(self, progress_cb=None):
+        c2c_dir = abs_c2c_dir(self.config.c2c_dir)
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            return list_remote_files(sftp, c2c_dir)
+
+    def _on_shared_entries_loaded(self, ok: bool, result):
+        self.btn_add_shared.setEnabled(True)
+        if not ok:
+            winutil.error(self, "读取失败", f"无法读取共享文件列表：\n{result}")
+            return
+        dlg = _SharedDownloadDialog(result or [], self)
+        if dlg.exec() == QDialog.Accepted:
+            for t in dlg.selected_tasks():
+                if any(x.get("rel") == t["rel"] and x.get("target") == t["target"]
+                       for x in self._shared_tasks):
+                    continue
+                self._shared_tasks.append(t)
+            self._update_shared_tasks_ui()
+
+    def _remove_shared_task(self):
+        selected = {it.text() for it in self.list_shared_tasks.selectedItems()}
+        if not selected:
+            winutil.warn(self, "提示", "请先在共享下载任务列表中选择要移除的任务。")
+            return
+        self._shared_tasks = [t for t in self._shared_tasks
+                              if self._task_line(t) not in selected]
+        self._update_shared_tasks_ui()
+
+    def _task_line(self, t: dict) -> str:
+        cat = CATEGORY_LABELS.get(t.get("category", ""), t.get("category", ""))
+        return f"{t.get('rel', '')} → 安装到{cat}"
+
+    def _update_shared_tasks_ui(self):
+        self.list_shared_tasks.clear()
+        for t in self._shared_tasks:
+            self.list_shared_tasks.addItem(self._task_line(t))
+
+
+class _SharedDownloadDialog(QDialog):
+    """选择 .upload_files 共享文件，生成「下载安装」待办任务。加密文件不可选。"""
+
+    def __init__(self, entries: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("添加共享下载任务")
+        self.setMinimumSize(560, 420)
+        lay = QVBoxLayout(self)
+        tip = QLabel("选择共享区文件作为「下载安装」待办：客户端应用待办时会自动下载到游戏目录。\n"
+                     "已加密的文件无法作为待办自动下载（需客户端输入密钥手动下载），已置灰。")
+        tip.setWordWrap(True)
+        tip.setObjectName("muted")
+        lay.addWidget(tip)
+        self.list_files = QListWidget()
+        self.list_files.setSelectionMode(QListWidget.ExtendedSelection)
+        for e in entries:
+            line = f"{e.get('rel', '')}（{_fmt_size(e.get('size', 0))}）"
+            if e.get("expired"):
+                line += "  [已过期]"
+            item = QListWidgetItem(line)
+            item.setData(Qt.UserRole, e)
+            if e.get("encrypted") or e.get("expired"):
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                item.setToolTip("已加密 / 已过期：需客户端手动处理，不能作为待办")
+            else:
+                item.setToolTip("未加密，可作为待办自动下载")
+            self.list_files.addItem(item)
+        lay.addWidget(self.list_files, 1)
+        cat_row = QHBoxLayout()
+        cat_row.addWidget(QLabel("安装到游戏目录："))
+        self.cb_cat = QComboBox()
+        for key, label in CATEGORY_LABELS.items():
+            self.cb_cat.addItem(label, key)
+        cat_row.addWidget(self.cb_cat)
+        cat_row.addStretch(1)
+        lay.addLayout(cat_row)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.button(QDialogButtonBox.Ok).setText("添加任务")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def selected_tasks(self) -> list[dict]:
+        """返回 [{rel, target, category}]；target 保留共享文件相对结构。"""
+        tasks = []
+        cat = self.cb_cat.currentData() or "other"
+        for item in self.list_files.selectedItems():
+            e = item.data(Qt.UserRole)
+            if e and not e.get("encrypted") and not e.get("expired"):
+                rel = e.get("rel", "")
+                tasks.append({"rel": rel, "target": f"{cat}/{rel}", "category": cat})
+        return tasks
+
+
+def _fmt_size(n) -> str:
+    n = int(n or 0)
+    if n < 1024:
+        return f"{n} B"
+    kb = n / 1024
+    if kb < 1024:
+        return f"{kb:.1f} KB"
+    return f"{kb / 1024:.2f} MB"

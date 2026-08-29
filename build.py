@@ -6,6 +6,8 @@
     python build.py                # 完整构建（图标 + 双端 exe + 汇总 + 安装程序）
     python build.py --skip-icons   # 跳过图标生成（已有图标时更快）
     python build.py --skip-setup   # 跳过安装程序编译（未安装 Inno Setup 时）
+    python build.py --gitee        # 构建完成后自动同步 Gitee（需环境变量 GITEE_TOKEN）
+    python build.py --gitee --gitee-body-file release_note.txt  # 附版本介绍
 
 前置条件：
     - Python 3 + .venv（PyInstaller、PySide6、paramiko 等）
@@ -152,6 +154,35 @@ def assemble(client_ico: str, server_ico: str):
     print("发布目录: ", release)
 
 
+def gitee_sync(version: str, body_file: str = "") -> int:
+    """调用 tools/gitee_sync.py：同步代码到 Gitee + 创建/更新发行版 + 上传 3 个附件。
+
+    需要设置环境变量 GITEE_TOKEN（Gitee 私人令牌），否则仅打印提示。
+    """
+    print("=== 5/5 同步 Gitee ===")
+    release = ROOT / "release"
+    setup = release / f"MinecraftModsCloudSync_Setup_{version}.exe"
+    tag = f"v{version}" if not str(version).startswith("v") else str(version)
+    cmd = [
+        VENV_PY, str(ROOT / "tools" / "gitee_sync.py"),
+        "--repo", "MinecraftModsCloudSync",
+        "--tag", tag,
+        "--name", tag,
+        "--assets",
+        str(release / "MinecraftSyncClient" / "MinecraftSyncClient.exe"),
+        str(release / "MinecraftSyncServer" / "MinecraftSyncServer.exe"),
+        str(setup),
+    ]
+    if body_file:
+        cmd += ["--body-file", str(body_file)]
+    if not os.environ.get("GITEE_TOKEN"):
+        print("!! 未设置环境变量 GITEE_TOKEN，跳过 Gitee 同步。")
+        print("   设置方法：set GITEE_TOKEN=你的私人令牌，然后重新运行 python build.py --gitee")
+        return 1
+    run(cmd)
+    return 0
+
+
 def compile_setup(version: str) -> Path | None:
     """调用 Inno Setup 编译器（ISCC.exe）生成 Windows 安装程序（输出到 release\\）。
 
@@ -198,6 +229,10 @@ def main() -> int:
     parser.add_argument("--skip-icons", action="store_true", help="跳过图标生成")
     parser.add_argument("--skip-setup", action="store_true",
                         help="跳过安装程序编译（Inno Setup 未安装时）")
+    parser.add_argument("--gitee", action="store_true",
+                        help="构建完成后自动同步 Gitee（代码 + 发行版 + 附件，需 GITEE_TOKEN）")
+    parser.add_argument("--gitee-body-file", default="",
+                        help="Gitee 发行版版本介绍文本文件（UTF-8），配合 --gitee 使用")
     args = parser.parse_args()
 
     version = read_app_version()
@@ -221,6 +256,8 @@ def main() -> int:
     print(f"  {ROOT / 'release' / 'MinecraftSyncClient' / 'MinecraftSyncClient.exe'}")
     print(f"  {ROOT / 'release' / 'MinecraftSyncServer' / 'MinecraftSyncServer.exe'}")
     print(f"  {setup}")
+    if args.gitee:
+        gitee_sync(version, args.gitee_body_file)
     return 0
 
 

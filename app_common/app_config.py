@@ -410,6 +410,24 @@ class ClientConfig:
     def mark_seen_c2c(self, server_id: str, version: str, seen_at: str) -> None:
         self._update_profile(server_id, last_seen_c2c=version)
 
+    # ---------- 多次更新未应用提醒（客户端） ----------
+    def unapplied_count(self, server_id: str) -> int:
+        p = self.profile_by_id(server_id)
+        try:
+            return max(0, int((p or {}).get("unapplied_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def bump_unapplied(self, server_id: str) -> int:
+        """客户端发现新更新但未应用时累计次数，返回累计值。"""
+        n = self.unapplied_count(server_id) + 1
+        self._update_profile(server_id, unapplied_count=n)
+        return n
+
+    def reset_unapplied(self, server_id: str) -> None:
+        """应用成功后清零未应用次数。"""
+        self._update_profile(server_id, unapplied_count=0)
+
     # ---------- 明文设置 ----------
     @property
     def local_mc_dir(self) -> str:
