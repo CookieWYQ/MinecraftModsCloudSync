@@ -28,7 +28,7 @@ def main() -> int:
     app.setApplicationName(APP_DISPLAY_NAME)
     app.setQuitOnLastWindowClosed(False)
 
-    # 单实例：已有客户端在运行时提示关闭旧版本或退出（--tray 自启冲突时静默退出）
+    # 单实例：已有客户端在运行时自动将其窗口激活到前台，本实例退出
     from app_common.single_instance import ensure_single_instance
     if not ensure_single_instance("client", silent="--tray" in sys.argv):
         return 0
