@@ -233,9 +233,35 @@ def _request(method: str, path: str, token: str,
 
 
 # ---------- 代码同步 ----------
+def _git_push_code(owner: str, repo: str, token: str) -> str:
+    """直接用 git push 把本地仓库代码推到 Gitee（不依赖镜像 sync 接口）。
+
+    返回空字符串表示无法执行（本地无仓库 / push 失败），否则返回成功消息。
+    """
+    import subprocess
+    root = ROOT
+    if not (root / ".git").exists():
+        return ""
+    url = f"https://{owner}:{token}@gitee.com/{owner}/{repo}.git"
+    try:
+        r = subprocess.run(["git", "-C", str(root), "push", url, "master"],
+                           capture_output=True, text=True, timeout=600)
+        if r.returncode != 0:
+            return ""
+        subprocess.run(["git", "-C", str(root), "push", url, "--tags"],
+                       capture_output=True, text=True, timeout=600)
+        return f"已通过 git push 同步代码到 Gitee：https://gitee.com/{owner}/{repo}"
+    except Exception:
+        return ""
+
+
 def sync_code(token: str, owner: str, repo: str, gh_repo: str,
               description: str = "") -> str:
-    """确保 Gitee 仓库存在（不存在则从 GitHub 导入），并触发一次同步。返回消息。"""
+    """确保 Gitee 仓库存在（不存在则从 GitHub 导入），并触发一次同步。返回消息。
+
+    代码同步优先调 Gitee 官方 sync 接口（仅对「从 GitHub 导入」的镜像仓库有效）；
+    若仓库不是镜像（接口返回 405/403 等）→ 自动回退为 git push 直接推送，效果等价。
+    """
     try:
         info = _request("GET", f"/repos/{owner}/{repo}", token)
         # 仓库已存在 → 触发同步
@@ -246,7 +272,13 @@ def sync_code(token: str, owner: str, repo: str, gh_repo: str,
             if "同步" in str(exc) or "import" in str(exc).lower():
                 return (f"仓库已存在：{info.get('html_url', '')}\n"
                         f"但同步失败（{exc}）。\n{GITHUB_IMPORT_HINT}")
-            raise
+            # 非镜像仓库（405 等）→ 回退为 git push 直接推送
+            msg = _git_push_code(owner, repo, token)
+            if msg:
+                return msg
+            return (f"仓库已存在：{info.get('html_url', '')}\n"
+                    f"但同步接口不可用（{exc}），且本地 git push 也失败。\n"
+                    f"{GITHUB_IMPORT_HINT}")
     except RuntimeError as exc:
         if "404" not in str(exc):
             raise
@@ -265,26 +297,25 @@ def sync_code(token: str, owner: str, repo: str, gh_repo: str,
 # ---------- 发行版（Release） ----------
 def ensure_release(token: str, owner: str, repo: str,
                    tag: str, name: str, body: str) -> int:
-    """确保发行版存在（不存在则创建），返回 release_id。已存在则更新 name/body。"""
-    try:
-        r = _request("GET", f"/repos/{owner}/{repo}/releases/tags/{tag}", token)
-        rid = r.get("id")
-        if not rid:
-            raise RuntimeError("no id")
+    """确保发行版存在（不存在则创建），返回 release_id。已存在则更新 name/body。
+
+    注意：Gitee 对「tag 不存在」的 GET 返回 HTTP 200 + body `null`（并非 404），
+    因此 r 为 None / 无 id 均视为不存在，走创建分支。
+    """
+    r = _request("GET", f"/repos/{owner}/{repo}/releases/tags/{tag}", token)
+    rid = (r or {}).get("id")
+    if rid:
         _request("PATCH", f"/repos/{owner}/{repo}/releases/{rid}", token,
                  params={"name": name, "body": body, "tag_name": tag})
         return int(rid)
-    except RuntimeError as exc:
-        if "404" not in str(exc):
-            raise
-        r = _request("POST", f"/repos/{owner}/{repo}/releases", token, params={
-            "tag_name": tag,
-            "name": name,
-            "body": body,
-            "target_commitish": "master",
-            "prerelease": False,
-        })
-        return int(r["id"])
+    r = _request("POST", f"/repos/{owner}/{repo}/releases", token, params={
+        "tag_name": tag,
+        "name": name,
+        "body": body,
+        "target_commitish": "master",
+        "prerelease": False,
+    })
+    return int(r["id"])
 
 
 def upload_assets(token: str, owner: str, repo: str,
