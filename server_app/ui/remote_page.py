@@ -45,7 +45,6 @@ from app_common.mod_identity import filename_base, jar_identifiers
 from app_common.sftp import SFTPManager
 from app_common.snapshot import (
     load_snapshot,
-    normalize_files,
     update_snapshot,
 )
 from app_common.tasks import TodoManifest
@@ -373,8 +372,9 @@ class RemoteFilePage(QWidget):
         - 客户端文件 → files_dir 的内容统一以 client_files/ 前缀并入
         （files_dir 可以是服务器上任意绝对位置，不再要求位于 server_root 之下）
 
-        哈希按需下载计算：仅对「本地与远程大小相同」的候选（确认是否一致）以及
-        「本地新增 ↔ 远程独有」的改名候选下载远程文件，避免全量下载。
+        哈希一律在远程直接计算（SFTP check-file 快速哈希，不下载文件内容）：
+        「本地与远程大小相同」的候选总是重新确认，防止服务端文件被替换
+        但大小不变时漏检；「本地新增 ↔ 远程独有」的改名候选也一并计算用于匹配。
         """
         excludes = list(self._excludes) or list(DEFAULT_EXCLUDE)
         server_root = self.config.server_root
@@ -387,8 +387,6 @@ class RemoteFilePage(QWidget):
                             f"正在读取服务端目录树…（已读 {dirs} 个目录 / {entries} 个条目）")
 
         local = self._collect_local(local_root)
-        old_snap = normalize_files(
-            load_snapshot(self.config.current_id()).get("files", {}))
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
             files: dict[str, dict] = {}
@@ -403,12 +401,8 @@ class RemoteFilePage(QWidget):
                     files_dir, excludes=excludes, skip_system=False,
                     progress_cb=on_scan_progress):
                 files[f"client_files/{rel}"] = {"size": size, "hash": None}
-            # 从旧快照继承哈希：大小相同视为内容未变，沿用上次确认的哈希，
-            # 避免每次检测都重新下载计算（服务端文件被外部改动且大小不变属已知边界）。
-            for k, meta in files.items():
-                old = old_snap.get(k)
-                if old and old["size"] == meta["size"] and old.get("hash"):
-                    meta["hash"] = old["hash"]
+            # 大小相同一律重新远程计算哈希确认内容（快速哈希，不下载文件），
+            # 不再从旧快照继承哈希，防止服务端文件被外部改动且大小不变时漏检。
             self._fill_remote_hashes(sftp, files, local, progress_cb)
         snap = update_snapshot(self.config.current_id(), files)
         rows = self._diff_local(files, local)
@@ -441,19 +435,18 @@ class RemoteFilePage(QWidget):
 
     def _fill_remote_hashes(self, sftp, files: dict, local: dict,
                             progress_cb=None) -> int:
-        """按需下载远程文件计算哈希并回填 files，返回下载数量。
+        """远程计算哈希并回填 files，返回计算数量（优先 SFTP check-file 快速哈希）。
 
         两类候选：
-        1. 本地存在、远程同路径存在且大小相同 → 确认是否真的内容一致；
-        2. 本地新增 Y ↔ 远程独有 X（大小相同）→ 下载 X 哈希用于改名匹配。
+        1. 本地存在、远程同路径存在且大小相同 → 总是重新确认内容是否一致；
+        2. 本地新增 Y ↔ 远程独有 X（大小相同）→ 计算 X 哈希用于改名匹配。
         """
         need: list[str] = []
         for rel, linfo in local.items():
             target, _ = self._effective_target(rel)
             for k in self._remote_keys_of(rel, target):
                 meta = files.get(k)
-                if (meta is not None and meta["size"] == linfo["size"]
-                        and not meta.get("hash")):
+                if (meta is not None and meta["size"] == linfo["size"]):
                     need.append(k)
         new_rels = [r for r in local
                     if not any(k in files for k in
@@ -465,8 +458,6 @@ class RemoteFilePage(QWidget):
             if k.startswith("client_files/"):
                 if k[len("client_files/"):] in local:
                     continue
-            if meta.get("hash"):
-                continue
             server_only_sizes.setdefault(meta["size"], []).append(k)
         for y in new_rels:
             for k in server_only_sizes.get(local[y]["size"], []):

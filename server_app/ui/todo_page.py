@@ -361,21 +361,17 @@ class TodoPage(QWidget):
                 progress_cb=on_scan))
             base = normalize_files(
                 load_snapshot(self.config.current_id(), "publish").get("files", {}))
-            # 需要下载当前文件计算哈希：
-            #  1) 基线存在、当前存在、大小相同且基线有哈希 → 确认是否真的内容一致
-            #     （上次检测已确认一致的走缓存，不重复下载）；
-            #  2) 当前新增（基线无）→ 与「服务端已移除」配对判断改名。
+            # 需要计算当前文件哈希（快速哈希：SFTP 远程计算，不下载内容）：
+            #  1) 当前新增（基线无）→ 与「服务端已移除」配对判断改名；
+            #  2) 基线存在、大小相同 → 总是远程计算当前哈希确认内容是否一致
+            #     （即使基线已存哈希也重新确认：服务端文件被替换但大小不变时同样能检出）。
+            #     （大小不同 → 直接判定替换，无需哈希，最快。）
             cache = _load_hash_cache(self.config.current_id())
             need_hash = []
             for rel, rsize in current.items():
                 bmeta = base.get(rel)
-                if bmeta is None:
+                if bmeta is None or bmeta["size"] == rsize:
                     need_hash.append(rel)
-                elif bmeta["size"] == rsize and bmeta.get("hash"):
-                    cc = cache.get(rel)
-                    if not (cc and cc.get("size") == rsize
-                            and cc.get("hash") == bmeta["hash"]):
-                        need_hash.append(rel)
             cur_hash: dict[str, str] = {}
             total = len(need_hash)
             for i, rel in enumerate(need_hash):
@@ -414,11 +410,17 @@ class TodoPage(QWidget):
             elif bmeta["size"] != rsize:
                 rows.append({"rel": rel, "status": "update", "size": rsize})
             else:
-                bh, ch = bmeta.get("hash"), cur_hash.get(rel)
+                # 大小相同：基线哈希优先；基线无哈希（旧数据）时用缓存中上次确认的哈希
+                bh = bmeta.get("hash")
+                if not bh:
+                    cc = cache.get(rel)
+                    if cc and cc.get("size") == rsize and cc.get("hash"):
+                        bh = cc["hash"]
+                ch = cur_hash.get(rel)
                 if bh and ch and bh != ch:
                     # 大小相同但内容不同 → 替换
                     rows.append({"rel": rel, "status": "update", "size": rsize})
-                # 否则视为一致，不出行
+                # 否则视为一致，不出行（当前哈希已写入缓存，下次可直接比对）
 
         # 服务端已移除（基线里有、当前没有）→ 客户端应删除；
         # 内容与当前新增文件相同（大小 + 哈希一致）→ 判定为改名。
