@@ -320,18 +320,30 @@ def ensure_release(token: str, owner: str, repo: str,
 
 def upload_assets(token: str, owner: str, repo: str,
                   release_id: int, assets: list[str]) -> list[str]:
-    """上传附件到发行版（multipart）。返回已上传文件名列表。"""
+    """上传附件到发行版（multipart）。返回已上传文件名列表。
+
+    先查询发行版现有附件，**跳过已存在的同名附件**，避免重复上传。
+    """
+    existing: set[str] = set()
+    try:
+        rel = _request("GET", f"/repos/{owner}/{repo}/releases/{release_id}", token)
+        existing = {a.get("name") for a in (rel.get("assets") or [])}
+    except RuntimeError:
+        pass
     uploaded = []
     for path in assets:
         if not os.path.isfile(path):
-            print(f"  !! 附件不存在，跳过：{path}")
             continue
         name = os.path.basename(path)
+        if name in existing:
+            print(f"  附件已存在，跳过：{name}")
+            continue
         size = os.path.getsize(path)
         print(f"  上传附件 {name}（{size / 1048576:.1f} MB）…")
         _request("POST", f"/repos/{owner}/{repo}/releases/{release_id}/attach_files",
                  token, files=[path], timeout=600)
         uploaded.append(name)
+        existing.add(name)
     return uploaded
 
 
