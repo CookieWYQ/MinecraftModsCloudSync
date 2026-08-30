@@ -176,7 +176,10 @@ class _FileBody:
                 return chunk
             self._fh.close()
             self._fh = None
-            return b"\r\n"               # 文件读完 → 补尾部换行
+            # 文件读完：落到下方队列继续读取（文件分隔符 \r\n 已在队列中预置，
+            # 此处绝不能返回 b"\r\n" —— 会与队列里的 \r\n 叠加成两个，
+            # 被服务器把多余的 \r\n 解析进文件内容导致安装包损坏）。
+            # 同时也不能返回 b""：http.client 会把空串当作 body 结束而截断上传。
         while self._qi < len(self._queue):
             item = self._queue[self._qi]
             self._qi += 1
