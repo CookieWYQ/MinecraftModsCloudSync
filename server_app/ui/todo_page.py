@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 from app_common import winutil
 from app_common.c2c import abs_c2c_dir
 from app_common.constants import config_dir
-from app_common.file_hash import hash_remote_smart
+from app_common.file_hash import hash_remote_parallel
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
 from app_common.sftp import SFTPManager
@@ -373,15 +373,17 @@ class TodoPage(QWidget):
                 if bmeta is None or bmeta["size"] == rsize:
                     need_hash.append(rel)
             cur_hash: dict[str, str] = {}
-            total = len(need_hash)
-            for i, rel in enumerate(need_hash):
-                remote = TodoManifest.remote_source_path(
-                    sftp, self.config.files_dir, rel)
-                h = hash_remote_smart(sftp, remote)
-                if h:
-                    cur_hash[rel] = h
+
+            def on_hash_progress(done: int, count: int, key: str):
                 if progress_cb:
-                    progress_cb(i + 1, max(total, 1), f"计算哈希 {rel}")
+                    progress_cb(done, count, f"计算哈希 {key}")
+
+            tasks = [(rel, TodoManifest.remote_source_path(
+                sftp, self.config.files_dir, rel)) for rel in need_hash]
+            cur_hash = hash_remote_parallel(
+                sftp, self.config.host(), self.config.port(),
+                self.config.username(), self.config.password(),
+                tasks, on_hash_progress)
             # 更新哈希缓存：仅记录与基线一致（或无法确认但大小相同）的文件，
             # 供下次检测跳过重复下载；大小变化 / 已移除的文件从缓存剔除。
             new_cache = dict(cache)

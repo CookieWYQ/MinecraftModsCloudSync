@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from app_common import winutil
-from app_common.file_hash import hash_file, hash_remote_smart
+from app_common.file_hash import hash_file, hash_remote_parallel
 from app_common.logger import get_logger
 from app_common.mcmod_db import wiki_id_for
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_display_name
@@ -425,9 +425,11 @@ class RemoteFilePage(QWidget):
                 full = os.path.join(dirpath, fn)
                 rel = os.path.relpath(full, root).replace("\\", "/")
                 try:
+                    # 忽略的文件不参与差异检测：跳过本地 MD5 计算（省 IO）
+                    local_hash = None if self._is_ignored(rel) else hash_file(full)
                     info = {"size": os.path.getsize(full),
                             "mtime": os.path.getmtime(full),
-                            "hash": hash_file(full)}
+                            "hash": local_hash}
                 except OSError:
                     continue
                 local[rel] = info
@@ -435,22 +437,25 @@ class RemoteFilePage(QWidget):
 
     def _fill_remote_hashes(self, sftp, files: dict, local: dict,
                             progress_cb=None) -> int:
-        """远程计算哈希并回填 files，返回计算数量（优先 SFTP check-file 快速哈希）。
+        """远程计算哈希并回填 files，返回计算数量（快速哈希优先，多线程并行）。
 
-        两类候选：
-        1. 本地存在、远程同路径存在且大小相同 → 总是重新确认内容是否一致；
-        2. 本地新增 Y ↔ 远程独有 X（大小相同）→ 计算 X 哈希用于改名匹配。
+        只处理需要检测的文件：**被「忽略」的本地文件完全跳过**（不算远程哈希、
+        不参与改名匹配），只对标注为 client / server / both 且大小相同的候选
+        重新确认内容，防止服务端文件被替换但大小不变时漏检。
         """
         need: list[str] = []
         for rel, linfo in local.items():
+            if self._is_ignored(rel):
+                continue  # 忽略的文件不参与差异检测
             target, _ = self._effective_target(rel)
             for k in self._remote_keys_of(rel, target):
                 meta = files.get(k)
                 if (meta is not None and meta["size"] == linfo["size"]):
                     need.append(k)
         new_rels = [r for r in local
-                    if not any(k in files for k in
-                               self._remote_keys_of(r, self._effective_target(r)[0]))]
+                    if not self._is_ignored(r)
+                    and not any(k in files for k in
+                                self._remote_keys_of(r, self._effective_target(r)[0]))]
         server_only_sizes: dict[int, list[str]] = {}
         for k, meta in files.items():
             if k in local:
@@ -465,20 +470,25 @@ class RemoteFilePage(QWidget):
                     need.append(k)
         if not need:
             return 0
-        total = len(need)
-        for i, k in enumerate(need):
-            if k.startswith("client_files/"):
-                remote = TodoManifest.remote_source_path(
-                    sftp, self.config.files_dir, k[len("client_files/"):])
-            else:
-                remote = TodoManifest.remote_source_path(
-                    sftp, self.config.server_root, k)
-            h = hash_remote_smart(sftp, remote)
-            if h:
-                files[k] = {**files[k], "hash": h}
+
+        def on_progress(done: int, total: int, key: str):
             if progress_cb:
-                progress_cb(i + 1, total, f"计算哈希 {k}")
-        return total
+                progress_cb(done, total, f"计算哈希 {key}")
+
+        tasks = []
+        for k in need:
+            if k.startswith("client_files/"):
+                root, rel = self.config.files_dir, k[len("client_files/"):]
+            else:
+                root, rel = self.config.server_root, k
+            tasks.append((k, TodoManifest.remote_source_path(sftp, root, rel)))
+        hashes = hash_remote_parallel(
+            sftp, self.config.host(), self.config.port(),
+            self.config.username(), self.config.password(),
+            tasks, on_progress)
+        for k, h in hashes.items():
+            files[k] = {**files[k], "hash": h}
+        return len(hashes)
 
     def _on_scan_progress(self, current, total, message):
         """快照扫描进度：实时更新状态文本，避免看起来像卡死（目录树扫描无总进度）。"""
