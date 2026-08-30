@@ -43,6 +43,7 @@ from app_common.logger import get_logger, set_log_context
 from app_common.notifications import notify
 from app_common.profile import PROFILE_FILTER, PROFILE_SUFFIX, parse_profile_content
 from app_common.settings_dialog import SettingsDialog
+from app_common.single_instance import _activate_msg_id
 from app_common.tasks import ACTION_LABELS, CATEGORY_LABELS, TodoManifest
 from app_common.updater import (
     DownloadThread,
@@ -114,6 +115,20 @@ class ClientMainWindow(QWidget):
         self._update_manual = False
         self._build()
         self._load_state()
+
+    def nativeEvent(self, eventType, message):
+        # 单实例「激活已运行窗口」：收到跨进程自定义消息 → 自行恢复显示并置前
+        try:
+            from ctypes import wintypes
+            msg = wintypes.MSG.from_address(int(message))
+        except (TypeError, ValueError):
+            return super().nativeEvent(eventType, message)
+        if msg.message == _activate_msg_id("client"):
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            return True, 0
+        return super().nativeEvent(eventType, message)
 
     # ---------- 界面 ----------
     def _build(self):

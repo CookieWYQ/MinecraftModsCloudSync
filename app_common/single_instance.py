@@ -88,13 +88,29 @@ def _read_pid(pid_key: str) -> int | None:
 
 
 # ---------- 激活已运行实例窗口 ----------
-def _activate_existing(pid: int) -> bool:
+# 跨进程恢复 Qt 窗口的机制：
+# Qt 6 隐藏（hide() 驻留托盘）的窗口不接受外部 ShowWindow 恢复（内部状态会拒绝），
+# 因此改为：向主窗口发送一条注册的 Windows 自定义消息，由程序自身在 nativeEvent
+# 中调用 showNormal()/raise_()/activateWindow() 恢复显示。
+_WIN_ACTIVATE_MSG_PREFIX = "MCSync.ActivateWindow."
+
+
+def _activate_msg_id(scope: str) -> int:
+    """注册（或取回）激活消息号。RegisterWindowMessage 同一会话内同名返回相同值。"""
+    import ctypes
+    user32 = ctypes.WinDLL("user32")
+    user32.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
+    user32.RegisterWindowMessageW.restype = ctypes.c_uint
+    return user32.RegisterWindowMessageW(_WIN_ACTIVATE_MSG_PREFIX + scope)
+
+
+def _activate_existing(pid: int, scope: str = "") -> bool:
     """把已运行实例（按 PID）的主窗口带到前台并还原显示，返回是否定位到窗口。
 
-    覆盖两种常见状态：
-    - 窗口最小化到任务栏 → ShowWindow(SW_RESTORE) 还原；
-    - 窗口关闭但驻留托盘（Qt 中 hide()，HWND 仍有效）→ 同样还原显示。
-    Windows 会阻止后台进程抢占前台，用一次 Alt 键模拟绕过该限制。
+    - 先 ShowWindow(SW_RESTORE)：兼容「最小化」窗口（对 Qt 隐藏窗口无效但无害）；
+    - 再发送注册的自定义消息：Qt 程序在 nativeEvent 中自行恢复显示与置前，
+      解决 ShowWindow 无法恢复 Qt 隐藏（托盘驻留）窗口的问题；
+    - Windows 会阻止后台进程抢占前台，程序侧 activateWindow 前可配合 Alt 键模拟。
     """
     if not pid or os.name != "nt":
         return False
@@ -113,10 +129,6 @@ def _activate_existing(pid: int) -> bool:
     user32.IsWindowVisible.restype = wintypes.BOOL
     user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     user32.ShowWindow.restype = wintypes.BOOL
-    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-    user32.SetForegroundWindow.restype = wintypes.BOOL
-    user32.keybd_event.argtypes = [
-        ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ulong, ctypes.c_ulong]
 
     found: list = []
 
@@ -134,12 +146,13 @@ def _activate_existing(pid: int) -> bool:
     # 优先取可见窗口（主窗口），否则取第一个顶层窗口（可能是托盘驻留的隐藏窗口）
     hwnd = next((h for h in found if user32.IsWindowVisible(h)), found[0])
     SW_RESTORE = 9
-    VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
     user32.ShowWindow(hwnd, SW_RESTORE)
-    user32.keybd_event(VK_MENU, 0, 0, 0)
-    user32.SetForegroundWindow(hwnd)
-    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
-    log.info("已激活已运行实例（pid=%s）到前台", pid)
+    if scope:
+        user32.PostMessageW.argtypes = [
+            wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+        user32.PostMessageW.restype = wintypes.BOOL
+        user32.PostMessageW(hwnd, _activate_msg_id(scope), 0, 0)
+    log.info("已向已运行实例（pid=%s）发送激活消息", pid)
     return True
 
 
@@ -172,6 +185,6 @@ def ensure_single_instance(scope: str, parent=None, silent: bool = False) -> boo
         return True
     old_pid = _read_pid(pid_key)
     if old_pid:
-        _activate_existing(old_pid)
+        _activate_existing(old_pid, scope)
     time.sleep(0.2)
     return False

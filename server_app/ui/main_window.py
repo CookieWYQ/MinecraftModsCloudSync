@@ -31,6 +31,7 @@ from app_common.constants import APP_DISPLAY_NAME, APP_VERSION
 from app_common.launcher import parse_and_store
 from app_common.logger import get_logger, set_log_context
 from app_common.settings_dialog import SettingsDialog
+from app_common.single_instance import _activate_msg_id
 from app_common.updater import (
     DownloadThread,
     TrayProgressDialog,
@@ -111,6 +112,20 @@ class ServerMainWindow(QMainWindow):
         self._update_manual = False
         self._build()
         self._restore_state()
+
+    def nativeEvent(self, eventType, message):
+        # 单实例「激活已运行窗口」：收到跨进程自定义消息 → 自行恢复显示并置前
+        try:
+            from ctypes import wintypes
+            msg = wintypes.MSG.from_address(int(message))
+        except (TypeError, ValueError):
+            return super().nativeEvent(eventType, message)
+        if msg.message == _activate_msg_id("server"):
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            return True, 0
+        return super().nativeEvent(eventType, message)
 
     def _build(self):
         self.setWindowTitle(f"{APP_DISPLAY_NAME} - 服务端工具")
