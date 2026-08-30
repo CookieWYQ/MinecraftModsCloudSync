@@ -952,7 +952,7 @@ class ClientMainWindow(QWidget):
         self._download_progress = None
         if not ok:
             winutil.error(self, "下载失败",
-                          f"安装程序下载失败（已尝试直连与多个加速镜像）：\n{err}\n\n"
+                          f"安装程序下载失败（已尝试 Gitee 与 GitHub 直连）：\n{err}\n\n"
                           f"可手动下载安装包：\n{release_page_url()}")
             return
         # 完整性兜底校验：下载文件大小与远程声明不一致 → 视为损坏，提示重新下载
@@ -971,12 +971,7 @@ class ClientMainWindow(QWidget):
             except OSError:
                 pass
             return
-        if not winutil.confirm(
-                self, "下载完成",
-                f"安装程序已下载：\n{path}\n\n"
-                f"即将启动安装程序并关闭本程序。\n"
-                f"请在弹出的安装向导中完成安装。"):
-            return
+        # 下载完成 → 直接关闭本程序并启动安装程序（不再弹出确认）
         try:
             launch_installer(path)
         except Exception as exc:

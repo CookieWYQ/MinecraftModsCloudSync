@@ -15,7 +15,7 @@ import time
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import markdown as _md  # 更新日志 Markdown → HTML（渲染成带样式的富文本）
 from PySide6.QtCore import QEvent, QThread, QTimer, Signal, Qt
@@ -32,21 +32,14 @@ SETUP_PREFIX = "MinecraftModsCloudSync_Setup_"
 _CHUNK = 64 * 1024
 # 下载断线后的自动重试次数（配合断点续传，重试无需重新下载已完成的字节）
 DOWNLOAD_MAX_RETRIES = 3
+# 下载时最多跟随的重定向次数（Gitee release 下载 302 → 对象存储）
+_MAX_REDIRECTS = 5
 
-# 常见 GitHub 下载加速镜像（按顺序尝试；仅用于安装包下载，版本查询仍走官方 API）。
-# 直连失败时自动降级到镜像，任一通道成功后即完成下载。
-DOWNLOAD_MIRRORS = (
-    "https://ghproxy.net/",
-    "https://gh-proxy.com/",
-    "https://ghfast.top/",
-)
-
-# 国内更新源（Gitee 发行版）：GitHub 不可达时自动切换。
-# 需在 Gitee 创建同名仓库并发布发行版（附件名同样为 MinecraftModsCloudSync_Setup_*.exe）。
+# 国内更新源（Gitee 发行版）优先：国内直连更快，GitHub 作为兜底。
+# 版本查询与下载共用同一顺序。
 GITEE_REPO = "CookieWYQ/MinecraftModsCloudSync"
 GITEE_LATEST_API_URL = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/releases/latest"
-# 每台服务器每轮自动检查前两次请求的最小间隔（秒），避免高频轮询 Gitee/GitHub API 触发限流
-UPDATE_SOURCE_ORDER = ("github", "gitee")
+UPDATE_SOURCE_ORDER = ("gitee", "github")
 
 
 def release_page_url() -> str:
@@ -222,17 +215,30 @@ def _fetch_releases_gitee(timeout: int = 15) -> list[dict]:
     } for r in data if isinstance(r, dict)]
 
 
+def _build_attempts(url: str) -> list[str]:
+    """构造下载尝试通道列表（仅 Gitee 直连 + GitHub 直连两个通道）。
+
+    - Gitee 直链：直接用；
+    - GitHub 直链：先构造同 tag/文件名的 Gitee 直链优先尝试（国内快），失败回退 GitHub。
+    """
+    if "github.com" in url:
+        m = re.match(r"https://github\.com/[^/]+/[^/]+/releases/download/"
+                     r"([^/]+)/(.+)", url)
+        if m:
+            return [f"https://gitee.com/{GITEE_REPO}/releases/download/"
+                    f"{m.group(1)}/{m.group(2)}", url]
+    return [url]
+
+
 def download_setup(url: str, dest: str, progress_cb=None,
                    cancelled_cb=None, timeout: int = 30) -> str:
     """下载安装程序到 dest（返回 dest）。progress_cb(已下载, 总字节, 消息)。
 
-    - Gitee 直链国内可直接下载，不走加速镜像；
-    - GitHub 直链依次尝试：直连 → 加速镜像列表；某一通道成功后即返回。
+    只有两个通道：Gitee 直连优先（国内快），GitHub 直连兜底，不再使用第三方镜像。
+    - 传入 Gitee 直链：直接下载；
+    - 传入 GitHub 直链：先按同 tag/文件名构造 Gitee 直链尝试，失败再回退 GitHub 直连。
     """
-    if "gitee.com" in url:
-        attempts = [url]
-    else:
-        attempts = [url] + [f"{m}{url}" for m in DOWNLOAD_MIRRORS]
+    attempts = _build_attempts(url)
     last_err: Exception | None = None
     for i, target in enumerate(attempts):
         if cancelled_cb and cancelled_cb():
@@ -255,19 +261,21 @@ def _download_one(url: str, dest: str, progress_cb=None,
 
     - 每次进入本通道前清除 dest 残留：防止与「不同来源/不同版本」的旧文件拼接导致安装包损坏；
     - 复用连接（Connection: keep-alive）；同一通道内断线重试时发送 Range 断点续传；
+    - 跟随重定向（Gitee release 下载 302 → 对象存储，最多 _MAX_REDIRECTS 次）；
     - 下载完成后按 Content-Length 校验字节数（http.client 读到 EOF 不会主动报不完整）；
     - 416（Range 无效）表示本地残留与服务器不符，清空后从头下载，不再误判「已完成」。
     """
-    parts = urlsplit(url)
-    path = parts.path + (("?" + parts.query) if parts.query else "")
     if os.path.exists(dest):
         try:
             os.remove(dest)  # 清残留：确保从头下载、内容正确
         except OSError:
             pass
     total = 0
+    redirects = 0
     for attempt in range(DOWNLOAD_MAX_RETRIES):
         have = os.path.getsize(dest) if os.path.exists(dest) else 0
+        parts = urlsplit(url)
+        path = parts.path + (("?" + parts.query) if parts.query else "")
         conn = None
         try:
             if parts.scheme == "https":
@@ -282,6 +290,18 @@ def _download_one(url: str, dest: str, progress_cb=None,
                 headers["Range"] = f"bytes={have}-"
             conn.request("GET", path, headers=headers)
             resp = conn.getresponse()
+            # 跟随重定向（3xx + Location）：重新解析 URL 后继续下载
+            if resp.status in (301, 302, 303, 307, 308):
+                loc = resp.getheader("Location")
+                conn.close()
+                conn = None
+                if not loc:
+                    raise RuntimeError(f"HTTP {resp.status} 缺少跳转地址")
+                if redirects >= _MAX_REDIRECTS:
+                    raise RuntimeError("重定向次数过多")
+                url = urljoin(url, loc)
+                redirects += 1
+                continue
             if resp.status == 416:
                 # Range 起点超过文件末尾：本地残留与服务器不符 → 清空从头下载
                 conn.close()
