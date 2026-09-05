@@ -27,7 +27,13 @@ from app_common import winutil
 from app_common.app_config import ServerConfig
 from app_common.license import save_ids
 from app_common.logger import get_logger
-from app_common.profile import PROFILE_FILTER, PROFILE_SUFFIX, build_profile_content, new_server_id
+from app_common.profile import (
+    PROFILE_FILTER,
+    PROFILE_SUFFIX,
+    build_profile_content,
+    new_client_id,
+    new_server_id,
+)
 from app_common.sftp import SFTPManager
 from app_common.worker import Worker, fmt_progress
 
@@ -61,26 +67,28 @@ class ExportPage(QWidget):
         form.addLayout(row_name)
 
         row_id = QHBoxLayout()
-        row_id.addWidget(QLabel("唯一编号"))
+        row_id.addWidget(QLabel("服务器编号"))
         self.ed_uid = QLineEdit()
         self.ed_uid.setReadOnly(True)
-        self.ed_uid.setPlaceholderText("自动生成（UUID，机器可读，用于授权校验）")
+        self.ed_uid.setPlaceholderText("自动生成（UUID，标识本服务器，固定不变）")
         row_id.addWidget(self.ed_uid, 1)
         form.addLayout(row_id)
 
-        hint = QLabel("说明：名称给人看、编号给程序读。客户端导入配置文件后，以「名称 + 唯一编号」识别本服务器；"
-                      "编号必须同步到服务器授权清单（license.json），客户端连接时才会通过校验。"
-                      "\n编号由系统自动生成且不可更改：客户端已按该编号授权，重新生成会使所有客户端失效。")
+        hint = QLabel("说明：名称给人看、编号给程序读。"
+                      "「服务器编号」用于标识本服务器（同一服务器固定不变，不可手动更改）；"
+                      "「客户端编号」标识每台接入的客户端——每次「导出客户端配置文件」都会自动生成一个全新的客户端编号"
+                      "并登记到授权清单，无需手动输入或维护。"
+                      "\n客户端导入配置文件后，用其「客户端编号」完成授权校验（旧版配置无客户端编号时沿用服务器编号，不受影响）。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form.addWidget(hint)
         layout.addWidget(box)
 
         # 授权编号
-        auth_box = QGroupBox("已授权客户端编号（同步到服务器 license.json）")
+        auth_box = QGroupBox("已授权客户端（同步到服务器 license.json）")
         av = QVBoxLayout(auth_box)
         self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["唯一编号", "服务器名称", "创建时间", "说明"])
+        self.table.setHorizontalHeaderLabels(["客户端编号", "所属服务器", "创建时间", "说明"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setAlternatingRowColors(True)
@@ -205,7 +213,7 @@ class ExportPage(QWidget):
             winutil.warn(self, "提示", "授权列表为空，无需同步。")
             return
         if not winutil.confirm(self, "确认同步",
-                               f"即将把 {len(ids)} 个授权编号同步到服务器 {host}（写入 license.json）。\n是否继续？"):
+                               f"即将把 {len(ids)} 个客户端编号同步到服务器 {host}（写入 license.json）。\n是否继续？"):
             return
         self.btn_sync.setEnabled(False)
         self.lbl_status.setText("正在同步编号…")
@@ -247,7 +255,7 @@ class ExportPage(QWidget):
             winutil.warn(self, "提示", "请填写服务器名称。")
             return
         if not server_id:
-            winutil.warn(self, "提示", "请先生成唯一编号。")
+            winutil.warn(self, "提示", "请先生成服务器编号。")
             return
         host = self.config.host()
         if not host:
@@ -264,19 +272,21 @@ class ExportPage(QWidget):
             path += PROFILE_SUFFIX
 
         detail = (f"服务器名称：{name}\n"
-                  f"唯一编号：{server_id}\n"
+                  f"服务器编号：{server_id}\n"
                   f"服务器地址：{host}:{self.config.port()}\n"
                   f"待办目录：{self.config.todo_dir}\n"
                   f"文件目录：{self.config.files_dir}\n"
                   f"导出路径：{path}\n\n"
-                  f"导出后该编号将登记并同步到服务器授权清单。")
+                  f"本次将自动生成一个全新的「客户端编号」并登记到授权清单"
+                  f"（该配置即代表一台客户端，多个客户端各自独立编号）。")
         if not winutil.confirm(self, "确认导出", f"即将导出客户端配置文件：\n\n{detail}\n是否继续？"):
             return
 
         self._save_state()
         self.btn_export.setEnabled(False)
         self.lbl_status.setText("正在导出…")
-        worker = Worker(self._export_worker, name, server_id, path)
+        client_id = new_client_id()
+        worker = Worker(self._export_worker, name, server_id, client_id, path)
         worker.progress.connect(self._on_export_progress)
         worker.done.connect(self._on_export_done)
         self._worker = worker
@@ -285,7 +295,8 @@ class ExportPage(QWidget):
     def _on_export_progress(self, current, total, message):
         self.lbl_status.setText(fmt_progress(current, total, message, "导出"))
 
-    def _export_worker(self, name, server_id, output_path, progress_cb=None):
+    def _export_worker(self, name, server_id, client_id, output_path,
+                       progress_cb=None):
         def step(cur: int, total: int, msg: str):
             if progress_cb:
                 progress_cb(cur, total, msg)
@@ -300,15 +311,15 @@ class ExportPage(QWidget):
             "files_dir": self.config.files_dir,
             "c2c_dir": self.config.c2c_dir,
         }
-        content = build_profile_content(name, server_id, info)
+        content = build_profile_content(name, server_id, info, client_id=client_id)
         with open(output_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        # 登记编号并同步授权清单
-        step(2, 3, "登记授权编号")
+        # 登记客户端编号并同步授权清单（每份配置对应一台客户端，编号各不相同）
+        step(2, 3, "登记客户端编号")
         ids = self.config.export_ids()
-        if server_id not in [i.get("id") for i in ids]:
-            ids.append({"id": server_id, "name": name,
+        if client_id not in [i.get("id") for i in ids]:
+            ids.append({"id": client_id, "name": name,
                         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "note": "由导出客户端配置生成"})
             self.config.export = {**self.config.export, "ids": ids}
@@ -316,7 +327,9 @@ class ExportPage(QWidget):
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
             save_ids(sftp, [i.get("id", "") for i in ids])
-        return f"客户端配置文件已导出：\n{output_path}\n\n服务器：{name}（{server_id}）\n授权编号已同步到服务器。"
+        return f"客户端配置文件已导出：\n{output_path}\n\n" \
+               f"服务器：{name}（服务器编号 {server_id}）\n" \
+               f"客户端编号：{client_id}\n授权编号已同步到服务器。"
 
     def _on_export_done(self, ok: bool, msg: str):
         self.btn_export.setEnabled(True)

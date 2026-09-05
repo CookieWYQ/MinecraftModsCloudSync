@@ -41,7 +41,12 @@ from app_common.launcher import KnownVersions, parse_and_store
 from app_common.log_manager import LogManagerDialog
 from app_common.logger import get_logger, set_log_context
 from app_common.notifications import notify
-from app_common.profile import PROFILE_FILTER, PROFILE_SUFFIX, parse_profile_content
+from app_common.profile import (
+    PROFILE_FILTER,
+    PROFILE_SUFFIX,
+    client_identity,
+    parse_profile_content,
+)
 from app_common.settings_dialog import SettingsDialog
 from app_common.single_instance import _activate_msg_id
 from app_common.tasks import ACTION_LABELS, CATEGORY_LABELS, TodoManifest
@@ -494,9 +499,10 @@ class ClientMainWindow(QWidget):
                     f"导入后将覆盖该服务器的现有配置，是否覆盖？",
                     default_yes=False):
                 return
-        self._apply_import(content, name, sid, data.get("created_at", ""))
+        self._apply_import(content, name, sid, data.get("created_at", ""),
+                           data.get("client_id", ""))
         winutil.info(self, "导入成功",
-                     f"已接入服务器：{name}\n唯一编号：{sid}\n\n点击「立即检查更新」验证连接。")
+                     f"已接入服务器：{name}\n客户端编号：{data.get('client_id') or sid}\n\n点击「立即检查更新」验证连接。")
         log.info("导入服务器档案: %s", name)
 
     def _confirm_import_dropped(self, paths: list[str]):
@@ -510,11 +516,12 @@ class ClientMainWindow(QWidget):
                 winutil.error(self, "导入失败", f"无法导入该配置文件：\n{exc}")
                 continue
             name, sid = data["name"], data["server_id"]
+            cid = data.get("client_id") or sid
             existing = self.config.profile_by_id(sid)
             if existing is not None:
                 if not winutil.confirm(
                         self, "确认覆盖",
-                        f"服务器「{existing.get('name')}」已存在（唯一编号 {sid}）。\n\n"
+                        f"服务器「{existing.get('name')}」已存在（服务器编号 {sid}）。\n\n"
                         f"拖入的配置文件：\n{path}\n\n"
                         f"导入后将覆盖该服务器的现有配置，是否覆盖？",
                         default_yes=False):
@@ -522,11 +529,11 @@ class ClientMainWindow(QWidget):
             elif not winutil.confirm(
                     self, "确认导入服务器",
                     f"检测到拖入的服务器配置文件：\n{path}\n\n"
-                    f"服务器名称：{name}\n唯一编号：{sid}\n\n是否导入并接入该服务器？"):
+                    f"服务器名称：{name}\n客户端编号：{cid}\n\n是否导入并接入该服务器？"):
                 continue
-            self._apply_import(content, name, sid, data.get("created_at", ""))
+            self._apply_import(content, name, sid, data.get("created_at", ""), cid)
             winutil.info(self, "导入成功",
-                         f"已接入服务器：{name}\n唯一编号：{sid}\n\n点击「立即检查更新」验证连接。")
+                         f"已接入服务器：{name}\n客户端编号：{cid}\n\n点击「立即检查更新」验证连接。")
             log.info("通过拖入导入服务器档案: %s", name)
 
     def _remove_profile(self):

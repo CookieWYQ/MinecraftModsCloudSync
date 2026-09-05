@@ -365,12 +365,13 @@ class ClientConfig:
         return None
 
     def add_profile(self, name: str, server_id: str, content: str,
-                    created_at: str = "") -> None:
+                    created_at: str = "", client_id: str = "") -> None:
         """导入/更新服务器档案（同 server_id 覆盖）。content 为配置文件原文。"""
         profiles = [p for p in self.profiles() if p.get("server_id") != server_id]
         profiles.append({
             "name": name,
             "server_id": server_id,
+            "client_id": client_id,
             "created_at": created_at,
             "content": content,
             "last_applied_version": "",

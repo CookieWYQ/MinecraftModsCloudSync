@@ -98,16 +98,17 @@ def check_all(config: ClientConfig, progress_cb=None) -> dict:
     results: dict = {}
     for i, profile in enumerate(profiles):
         sid = profile.get("server_id", "")
+        ident = client_identity(profile)  # 客户端身份：client_id，旧配置回退 server_id
         name = profile.get("name", "")
         try:
             info = profile_sftp_info(profile)
             with _connect(info) as sftp:
-                verify(sftp, sid)
+                verify(sftp, ident)
                 manifest = TodoManifest.load_from_sftp(sftp, info["todo_dir"])
                 c2c_manifest = None
                 try:
                     c2c_manifest = load_client_manifest(
-                        sftp, info["c2c_dir"], sid)
+                        sftp, info["c2c_dir"], ident)
                 except SFTPError as exc:
                     # C2C 为可选功能：读取失败（如未配置目录）不阻塞整体检查
                     log.warning("读取 C2C 清单失败: %s（%s）", name, exc)
@@ -194,7 +195,7 @@ def apply_update(config: ClientConfig, profile: dict, manifest: TodoManifest,
     total = len(s2c_tasks) + len(c2c_tasks)
     shared_root = upload_files_dir(info["c2c_dir"])
     with _connect(info) as sftp:
-        verify(sftp, sid)
+        verify(sftp, ident)
         with tempfile.TemporaryDirectory(prefix="mc_sync_") as tmp:
             count = [0]
 
@@ -259,7 +260,7 @@ def apply_update(config: ClientConfig, profile: dict, manifest: TodoManifest,
 
             apply_tasks(s2c_tasks, info["files_dir"])
             if c2c_tasks:
-                apply_tasks(c2c_tasks, c2c_files_root(info["c2c_dir"], sid))
+                apply_tasks(c2c_tasks, c2c_files_root(info["c2c_dir"], ident))
 
     # 应用客户端软件设置（随待办下发）
     for key, value in ((manifest.settings or {}) if manifest else {}).items():
