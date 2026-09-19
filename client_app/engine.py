@@ -22,7 +22,7 @@ from app_common.constants import (
 )
 from app_common.license import AuthError, verify
 from app_common.logger import get_logger
-from app_common.profile import parse_profile_content
+from app_common.profile import client_identity, parse_profile_content
 from app_common.sftp import SFTPError, SFTPManager
 from app_common.tasks import TodoManifest, safe_target
 from app_common.upload_files import upload_files_dir
@@ -182,7 +182,7 @@ def apply_update(config: ClientConfig, profile: dict, manifest: TodoManifest,
     - silent 任务：不影响执行，仅由界面层决定是否静默展示。
     """
     info = profile_sftp_info(profile)
-    sid = profile.get("server_id", "")
+    ident = client_identity(profile)  # 客户端身份：client_id，旧配置回退 server_id
     game_dir = config.local_mc_dir
     if not game_dir or not os.path.isdir(game_dir):
         raise RuntimeError("游戏目录无效，请先在主界面选择客户端根目录。")

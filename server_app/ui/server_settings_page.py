@@ -377,6 +377,8 @@ class ServerSettingsPage(QWidget):
             self.main_window.set_sftp_status(True)
 
     def _test_worker(self, data, progress_cb=None) -> str:
+        todo = data["remote"]["todo_dir"]
+        files = data["remote"]["files_dir"]
         with SFTPManager(**data["sftp"]) as sftp:
             sftp.mkdirs(todo)
             sftp.mkdirs(files)

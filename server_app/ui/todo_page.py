@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 from app_common import winutil
 from app_common.c2c import abs_c2c_dir
 from app_common.constants import config_dir
-from app_common.file_hash import hash_remote_parallel
+from app_common.file_hash import hash_remote_parallel, hash_remote_smart
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
 from app_common.sftp import SFTPManager
