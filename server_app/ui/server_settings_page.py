@@ -189,6 +189,13 @@ class ServerSettingsPage(QWidget):
         self.ed_client_mods.setPlaceholderText("每行一个，如：\n3dskinlayers\nxaeros")
         self.ed_client_mods.setMaximumHeight(80)
         mr.addWidget(self.ed_client_mods)
+        self.cb_env_online = QCheckBox(
+            "上传前联网查询 MC 百科，补齐模组运行环境（关闭则只用本地 jar 元数据，更快）")
+        self.cb_env_online.setToolTip(
+            "开启后，「更新服务端」页发送时会先分析模组运行环境，\n"
+            "判定为「仅客户端」的模组改发 client_files/mods，不会被误传到服务端 mods。\n"
+            "断网时会自动跳过（有整体超时，最多等约 45 秒）。")
+        mr.addWidget(self.cb_env_online)
         layout.addWidget(mod_box)
 
         # ---- 客户端软件设置（随待办下发） ----
@@ -264,6 +271,7 @@ class ServerSettingsPage(QWidget):
         self.ed_exclude.setPlainText(
             "\n".join(self.config.exclude_names or sorted(DEFAULT_EXCLUDE)))
         self.ed_client_mods.setPlainText("\n".join(self.config.client_mods))
+        self.cb_env_online.setChecked(self.config.env_online)
         ps = self.config.push_settings
         self.cb_push.setChecked(bool(ps.get("enabled", False)))
         self.sp_interval.setValue(int(ps.get("check_interval_min", 60)))
@@ -291,6 +299,7 @@ class ServerSettingsPage(QWidget):
         self.config.client_mods = [line.strip()
                                    for line in self.ed_client_mods.toPlainText().splitlines()
                                    if line.strip()]
+        self.config.env_online = self.cb_env_online.isChecked()
         self.config.push_settings = {
             "enabled": self.cb_push.isChecked(),
             "check_interval_min": self.sp_interval.value(),

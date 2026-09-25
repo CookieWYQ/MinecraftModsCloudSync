@@ -150,6 +150,7 @@ class TodoPage(QWidget):
         self._auto_mode = False
         self._last_auto_detect = 0.0
         self._rows: list[dict] = []
+        self._server_mods: list[str] = []  # 服务端 mods 下的模组（只读展示，不下发）
         self._state = _load_todo_state(self.config.current_id())
         self._shared_tasks: list[dict] = []  # 共享文件下载任务 [{rel, target, category}]
         self._build()
@@ -202,7 +203,8 @@ class TodoPage(QWidget):
 
         # 服务端改动检测：改动树即任务清单，全部默认发布，右键可禁用/批注
         detect_box = QGroupBox(
-            "服务端改动检测（新增/替换/删除，全部默认发布；右键可禁用 / 批注，"
+            "发布给客户端的内容（分两组：① 来自 client_files，会下发给客户端；"
+            "② 服务端独有，不下发。全部默认发布，右键可禁用 / 批注，"
             "Ctrl/Shift 多选、Ctrl+Shift+A 反选）")
         dv = QVBoxLayout(detect_box)
         dv.setSpacing(6)
@@ -211,10 +213,11 @@ class TodoPage(QWidget):
         self.lbl_pub_snap = QLabel("上次发布快照：无")
         self.lbl_pub_snap.setObjectName("muted")
         head_row.addWidget(self.lbl_pub_snap, 1)
-        self.btn_snapshots = QPushButton("快照历史…")
+        self.btn_snapshots = QPushButton("发布历史 / 回滚…")
         self.btn_snapshots.setToolTip(
-            "查看全部历史快照（时间戳 / 文件树）\n"
-            "可将任意历史快照设为发布基线，从而撤销 / 回滚客户端更新")
+            "查看每次发布给客户端的客户端内容历史时间点\n"
+            "选中一个时间点可预览「回滚后会怎样」，并可一键把客户端内容回滚到该时间点\n"
+            "（回滚后回到本页检测 → 发布，客户端即回到那个状态）")
         self.btn_snapshots.clicked.connect(self._open_snapshots)
         head_row.addWidget(self.btn_snapshots)
         self.ed_search = QLineEdit()
@@ -255,12 +258,12 @@ class TodoPage(QWidget):
         self.lbl_status.setObjectName("muted")
         self.lbl_status.setWordWrap(True)
         pub_row.addWidget(self.lbl_status, 1)
-        self.btn_ignore = QPushButton("忽略本次快照更新")
-        self.btn_ignore.setToolTip("跳过本次检测到的所有改动（本次不发布）\n"
-                                   "已忽略的改动可随时通过「重新发布已忽略」恢复")
+        self.btn_ignore = QPushButton("本次不发布（全部禁用）")
+        self.btn_ignore.setToolTip("把当前检测到的改动全部标记为「本次不发布」（变灰，不上传也不下发）\n"
+                                   "已禁用的改动可随时通过「恢复已禁用项」恢复")
         self.btn_ignore.clicked.connect(self._ignore_all)
-        self.btn_republish = QPushButton("重新发布已忽略")
-        self.btn_republish.setToolTip("把已忽略的改动恢复为可发布状态")
+        self.btn_republish = QPushButton("恢复已禁用项")
+        self.btn_republish.setToolTip("把已禁用的改动恢复为可发布（下次发布会一起下发给客户端）")
         self.btn_republish.clicked.connect(self._republish_all)
         self.btn_publish = QPushButton("发布到服务器")
         self.btn_publish.setObjectName("primary")
@@ -307,13 +310,18 @@ class TodoPage(QWidget):
         """显示上次发布时保存的基线时间（作为改动检测基线）。"""
         snap = load_snapshot(self.config.current_id(), "publish")
         self.lbl_pub_snap.setText(
-            f"上次发布快照：{snap.get('saved_at') or '无（首次检测将对比空基线）'}")
+            f"客户端当前内容基线（上次发布）：{snap.get('saved_at') or '无（首次检测将对比空基线）'}")
 
     def _open_snapshots(self):
-        """打开快照历史对话框（查看时间戳 / 文件树，可设为发布基线以撤销更新）。"""
+        """打开「发布历史 / 快照」：查看历史时间点，必要时把客户端内容回滚到某个时间点。"""
         dlg = SnapshotHistoryDialog(self, config=self.config)
         dlg.exec()
-        self._refresh_pub_snap()  # 可能被设为新基线，刷新显示
+        if dlg.rolled_back:
+            # 内容已回滚 → 立刻重新检测：会列出「删除 / 还原」任务，发布后客户端即回到该状态
+            self.lbl_status.setText("已回滚客户端内容，正在重新检测待发布任务…")
+            self._detect_changes()
+        else:
+            self._refresh_pub_snap()
 
     def _detect_changes(self, auto: bool = False):
         if self._detecting:
@@ -402,6 +410,17 @@ class TodoPage(QWidget):
                     new_cache.pop(rel, None)
             _save_hash_cache(self.config.current_id(), new_cache)
 
+            # 顺带看一眼服务端自己的 mods 目录（只读展示，不参与发布）：
+            # 这些是服务端模组，不下发给客户端；若里面混进了客户端模组，
+            # 提示腐竹到「更新服务端」页用「服务端模组归类…」把它搬到 client_files/mods。
+            mods_dir = SFTPManager.join(self.config.server_root, "mods")
+            try:
+                server_mods = sorted(
+                    n for n in sftp.list_dir(mods_dir) if n.lower().endswith(".jar"))
+            except Exception as exc:
+                log.debug("读取服务端 mods 目录失败: %s", exc)
+                server_mods = []
+
         rows = []
         for rel in sorted(current):
             rsize = current[rel]
@@ -460,7 +479,10 @@ class TodoPage(QWidget):
         rows = [r for r in rows if r["rel"] not in obsolete_rels]
         for rel in sorted(obsolete_rels):
             rows.append({"rel": rel, "status": "obsolete", "size": current[rel]})
-        return json.dumps(rows, ensure_ascii=False)
+        return json.dumps(
+            {"rows": rows, "server_mods": server_mods,
+             "files_dir": self.config.files_dir, "server_root": self.config.server_root},
+            ensure_ascii=False)
 
     @staticmethod
     def _match_rename_pairs(new_rows: list[dict], base: dict,
@@ -498,11 +520,16 @@ class TodoPage(QWidget):
                 self.status_cb(False)
             return
         try:
-            rows = json.loads(msg or "[]")
+            data = json.loads(msg or "{}")
         except Exception:
-            rows = []
+            data = {}
+        if isinstance(data, list):  # 兼容旧格式
+            data = {"rows": data}
+        rows = data.get("rows") or []
+        server_mods = data.get("server_mods") or []
         self._rows = rows
-        self._build_changes_tree(rows)
+        self._server_mods = server_mods
+        self._build_changes_tree(rows, server_mods)
         # 清理已不再出现的禁用项（保留批注）
         current_rels = {r["rel"] for r in rows}
         stale = self._state["disabled"] - current_rels
@@ -515,20 +542,39 @@ class TodoPage(QWidget):
         del_n = sum(1 for r in rows if r["status"] in ("deleted", "obsolete"))
         if not rows:
             self.lbl_status.setText(
-                "未检测到服务端改动：client_files 与上次发布基线一致。")
+                "未检测到需要下发给客户端的改动（client_files 与上次发布基线一致）。"
+                + (f"　服务端 mods 里另有 {len(server_mods)} 个模组（属于服务端，不下发）。"
+                   if server_mods else ""))
         else:
             self.lbl_status.setText(
-                f"服务端改动：新增 {new_n}、替换 {upd_n}"
+                f"将下发给客户端：新增 {new_n}、替换 {upd_n}"
                 f"{f'、改名 {rnm_n}' if rnm_n else ''}、删除 {del_n}，共 {len(rows)} 项 ✔"
-                "（全部默认发布，右键可禁用）")
+                "（全部默认发布，右键可禁用）"
+                + (f"　服务端 mods 里另有 {len(server_mods)} 个模组（不下发）。"
+                   if server_mods else ""))
         log.info("服务端改动检测完成: new=%d update=%d rename=%d delete=%d",
                  new_n, upd_n, rnm_n, del_n)
 
     # ---------- 改动树 ----------
-    def _build_changes_tree(self, rows):
-        """按检测结果重建改动树（无顶层根，目录层级、文件夹在前）。"""
+    def _build_changes_tree(self, rows, server_mods=None):
+        """按检测结果重建改动树：明确分成两组，一眼分清谁发给客户端。
+
+        ① 将发布给客户端（来自客户端文件目录 client_files）—— 参与发布，可禁用 / 批注；
+        ② 服务端独有，不下发（服务端 mods）—— 只读对照，客户端不会收到。
+        """
+        server_mods = server_mods or []
         self.changes_tree.blockSignals(True)
         self.changes_tree.clear()
+
+        group_client = QTreeWidgetItem(
+            [f"① 将发布给客户端（来自 {self.config.files_dir}）", "", ""])
+        group_client.setData(0, Qt.UserRole, {"kind": "group"})
+        group_client.setToolTip(
+            0, "这些文件来自客户端文件目录（客户端模组、资源包等）\n"
+               "发布后客户端会下载并安装到自己的游戏目录")
+        group_client.setExpanded(True)
+        self.changes_tree.addTopLevelItem(group_client)
+
         nodes: dict[str, QTreeWidgetItem] = {}
         for r in rows:
             parts = r["rel"].split("/")
@@ -541,7 +587,7 @@ class TodoPage(QWidget):
                     node = QTreeWidgetItem([part, "", ""])
                     node.setData(0, Qt.UserRole, {"rel": child_rel, "kind": "dir"})
                     if parent_item is None:
-                        self.changes_tree.addTopLevelItem(node)
+                        group_client.addChild(node)
                     else:
                         parent_item.addChild(node)
                     nodes[child_rel] = node
@@ -555,9 +601,39 @@ class TodoPage(QWidget):
                           "status": r["status"], "size": r.get("size", 0),
                           "old_rel": r.get("old_rel", "")})
             if parent_item is None:
-                self.changes_tree.addTopLevelItem(node)
+                group_client.addChild(node)
             else:
                 parent_item.addChild(node)
+
+        if not rows:
+            empty = QTreeWidgetItem(["（无改动）", "", "client_files 与上次发布基线一致"])
+            empty.setData(0, Qt.UserRole, {"kind": "group"})
+            empty.setFlags(empty.flags() & ~Qt.ItemIsSelectable)
+            gray = QBrush(QColor("#8a8a8a"))
+            for col in range(3):
+                empty.setForeground(col, gray)
+            group_client.addChild(empty)
+
+        if server_mods:
+            group_server = QTreeWidgetItem(
+                [f"② 服务端独有，不下发（{SFTPManager.join(self.config.server_root, 'mods')}）",
+                 f"{len(server_mods)} 个", "客户端不用装"])
+            group_server.setData(0, Qt.UserRole, {"kind": "group"})
+            group_server.setToolTip(
+                0, "这些是服务端自己的模组，只装在服务器上，发布时不会下发给客户端\n"
+                   "若其中混进了「仅客户端」模组，请到「更新服务端」页点「服务端模组归类…」\n"
+                   "把它搬到客户端文件目录的 mods 下，再回到本页发布给客户端")
+            group_server.setExpanded(False)
+            gray = QBrush(QColor("#8a8a8a"))
+            for name in server_mods:
+                item = QTreeWidgetItem([name, "服务端模组", "服务端自己装，不发布"])
+                item.setData(0, Qt.UserRole, {"kind": "server_info", "name": name})
+                item.setToolTip(0, "服务端独有：不下发给客户端")
+                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsSelectable)
+                for col in range(3):
+                    item.setForeground(col, gray)
+                group_server.addChild(item)
+            self.changes_tree.addTopLevelItem(group_server)
 
         self._apply_state_recursive_top()  # 恢复禁用状态与批注
         self._re_sort()                    # 排序 + 搜索过滤
@@ -714,7 +790,7 @@ class TodoPage(QWidget):
     def _sort_key(self, item):
         d = item.data(0, Qt.UserRole) or {}
         name = item.text(0).lower()
-        if d.get("kind") == "dir":
+        if d.get("kind") in ("dir", "group"):
             return (0, name)
         if self.cb_sort.currentData() == "status":
             return (1, _STATUS_ORDER.get(d.get("status"), 99), name)
@@ -738,7 +814,7 @@ class TodoPage(QWidget):
             if idx >= 0:
                 self.changes_tree.takeTopLevelItem(idx)
             self.changes_tree.addTopLevelItem(c)
-            if (c.data(0, Qt.UserRole) or {}).get("kind") == "dir":
+            if (c.data(0, Qt.UserRole) or {}).get("kind") in ("dir", "group"):
                 self._sort_children(c)
         self._apply_filter()  # 排序后保持搜索过滤结果一致
 

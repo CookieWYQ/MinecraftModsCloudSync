@@ -12,6 +12,7 @@
 """
 import json
 import os
+import tempfile
 from datetime import datetime
 
 from PySide6.QtCore import QUrl, Qt
@@ -36,11 +37,10 @@ from PySide6.QtWidgets import (
 )
 
 from app_common import winutil
-from app_common.file_hash import hash_file, hash_remote_parallel
+from app_common.file_hash import hash_file_cached, hash_remote_parallel
 from app_common.logger import get_logger
-from app_common.mcmod_db import wiki_id_for
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_display_name
-from app_common.mod_env import jar_environment, mcmod_env_online
+from app_common.mod_env import enrich_online, jar_environment
 from app_common.mod_identity import filename_base, jar_identifiers
 from app_common.sftp import SFTPManager
 from app_common.snapshot import (
@@ -140,9 +140,12 @@ class RemoteFilePage(QWidget):
         self._worker = None
         self._snapshot_busy = False
         self._rows: list[dict] = []  # {rel, status, size, remote_size, mtime, target, manual, checked}
+        self._server_dirs: set[str] = set()  # 服务端文件仓库根目录下实际存在的顶层目录（小写）
+        self._server_dirs_ok = False  # 上面的集合是否成功读到（区分「读到但为空」与「没读到」）
         self._excludes = set(DEFAULT_EXCLUDE)
         self._client_keywords: list[str] = []
         self._overrides: dict[str, str] = {}  # 手动标注（持久化）：rel/文件夹前缀 → target
+        self._auto_targets: dict[str, str] = {}  # 发送前环境检测自动纠正（持久化，可被覆盖）
         self._ignored: dict[str, bool] = {}   # 忽略列表（持久化）：rel/文件夹前缀 → True
         self._env_results: dict[str, str] = {}   # 本次「分析模组环境」结果：文件名 → client/server/both/unknown
         self._env_sources: dict[str, str] = {}   # 文件名 → 判断来源说明
@@ -177,6 +180,13 @@ class RemoteFilePage(QWidget):
                                     "（客户端 / 服务端 / 双端；依据 jar 元数据与 MC 百科标注，"
                                     "未标注的标为「未知」留给用户自行判断）\n"
                                     "结果显示在「分析结果」列，确认后点「全部应用」生效")
+        self.btn_tidy_mods = QPushButton("服务端模组归类…")
+        self.btn_tidy_mods.setToolTip(
+            "体检服务端 mods 目录：列出该目录下所有 .jar 模组，逐个分析运行环境\n"
+            "（jar 元数据 + MC 百科标注；与本地同名模组先按「大小 + 哈希」确认内容是否一致，\n"
+            "一致才用本地文件分析，否则从服务端下载到临时目录分析）\n"
+            "确认后把判定为「仅客户端」的模组搬到客户端文件目录的 mods 下，\n"
+            "并自动标注为「客户端」，避免下次发送又把它传回服务端 mods")
         self.btn_apply_env = QPushButton("全部应用")
         self.btn_apply_env.setObjectName("primary")
         self.btn_apply_env.setToolTip("把本次分析结果写入标注（已手动标注的不覆盖）；\n"
@@ -193,6 +203,7 @@ class RemoteFilePage(QWidget):
         btn_row.addWidget(self.btn_remove)
         btn_row.addWidget(self.btn_browse_remote)
         btn_row.addWidget(self.btn_analyze)
+        btn_row.addWidget(self.btn_tidy_mods)
         btn_row.addWidget(self.btn_apply_env)
         btn_row.addWidget(self.btn_cancel_env)
         btn_row.addStretch(1)
@@ -265,6 +276,7 @@ class RemoteFilePage(QWidget):
         self.btn_remove.clicked.connect(self._remove_rows)
         self.btn_browse_remote.clicked.connect(self._browse_remote)
         self.btn_analyze.clicked.connect(self._analyze_mods)
+        self.btn_tidy_mods.clicked.connect(self._tidy_server_mods)
         self.btn_apply_env.clicked.connect(self._apply_env_results)
         self.btn_cancel_env.clicked.connect(self._cancel_env_results)
         self.btn_send.clicked.connect(self._send)
@@ -277,8 +289,10 @@ class RemoteFilePage(QWidget):
     # ---------- 配置加载 ----------
     def _load_config(self):
         self._excludes = set(self.config.exclude_names) or set(DEFAULT_EXCLUDE)
-        self._client_keywords = [k.lower() for k in self.config.client_mods]
+        # 过滤空白关键词：空串会让 `"" in fname` 恒真，把所有模组都判成「仅客户端」
+        self._client_keywords = [k.strip().lower() for k in self.config.client_mods if k.strip()]
         self._overrides = dict(self.config.target_overrides)
+        self._auto_targets = dict(self.config.auto_targets)
         self._ignored = dict(self.config.ignore_overrides)
         host = self.config.host()
         if host:
@@ -298,6 +312,8 @@ class RemoteFilePage(QWidget):
     def reload(self):
         """切换服务器后刷新界面。"""
         self._rows.clear()
+        self._server_dirs = set()  # 换了服务器：等自动检测重新读取
+        self._server_dirs_ok = False
         self._env_results.clear()  # 分析结果针对当前审核列表，切换后作废
         self._env_sources.clear()
         self.btn_apply_env.hide()
@@ -308,9 +324,24 @@ class RemoteFilePage(QWidget):
 
     # ---------- 快照 + 差异检测 ----------
     def _auto_target_of(self, rel: str) -> str:
-        """默认发送目标：命中「客户端模组」关键词 → 客户端，否则 → 双端。"""
+        """默认发送目标：不猜类别，按服务端文件仓库的**实际目录结构**判定。
+
+        - mods 下的 .jar：命中「客户端模组」关键词 → 仅客户端，否则双端
+          （客户端/服务端模组靠发送前的环境分析进一步纠正）；
+        - 其它文件：顶层目录在服务端文件仓库里**实际存在** → 双端
+          （服务端在用这个目录，例如 resourcepacks、config）；
+          服务端**确实没有**这个目录 → 仅客户端，不要在服务端凭空建目录；
+        - 根目录下的散文件、以及目录列表**读取失败**时 → 双端（后者会在状态栏告警）。
+        """
         fname = rel.rsplit("/", 1)[-1].lower()
-        return "client" if any(k in fname for k in self._client_keywords) else "both"
+        if "/" not in rel:
+            return "both"
+        top = rel.split("/", 1)[0].lower()
+        if top == "mods" and fname.endswith(".jar"):
+            return "client" if any(k in fname for k in self._client_keywords) else "both"
+        if not self._server_dirs_ok:
+            return "both"  # 没读到目录列表（连接失败等）：保守按双端，并在状态栏告警
+        return "both" if top in self._server_dirs else "client"
 
     def _is_ignored(self, rel: str) -> bool:
         """是否被「忽略」：文件精确匹配优先，其次文件夹前缀（任一命中即忽略）。"""
@@ -332,15 +363,29 @@ class RemoteFilePage(QWidget):
                     best = key
         return self._overrides[best] if best else None
 
+    def _auto_record_of(self, rel: str) -> str | None:
+        """发送前环境检测自动纠正的目标：文件精确匹配优先，其次文件夹前缀（最长优先）。"""
+        if rel in self._auto_targets:
+            return self._auto_targets[rel]
+        best: str | None = None
+        for key in self._auto_targets:
+            if key and rel.startswith(key.rstrip("/") + "/"):
+                if best is None or len(key) > len(best):
+                    best = key
+        return self._auto_targets[best] if best else None
+
     def _effective_target(self, rel: str) -> tuple[str, bool]:
         """实际发送目标与是否手动标注：(target, manual)。
 
-        优先级：手动标注 > 关键词自动判断。
-        「分析模组环境」的结果只显示在「分析结果」列，点「全部应用」后才写入标注。
+        优先级：手动标注 > 发送前环境检测的自动纠正 > 自动判定。
+        「分析模组环境」的结果只显示在「分析结果」列，点「全部应用」后才写入手动标注。
         """
         ov = self._override_target_of(rel)
         if ov:
             return ov, True
+        au = self._auto_record_of(rel)
+        if au:
+            return au, False
         return self._auto_target_of(rel), False
 
     def _auto_detect(self):
@@ -393,14 +438,31 @@ class RemoteFilePage(QWidget):
             overlap = _overlap_prefix(files_dir, server_root)
             for rel, size in sftp.list_files_recursive_with_size(
                     server_root, excludes=excludes, skip_system=True,
-                    progress_cb=on_scan_progress):
+                    max_workers=4, progress_cb=on_scan_progress):
                 if overlap and (rel == overlap or rel.startswith(overlap + "/")):
                     continue  # 属于客户端文件目录，避免重复计入
                 files[rel] = {"size": size, "hash": None}
             for rel, size in sftp.list_files_recursive_with_size(
                     files_dir, excludes=excludes, skip_system=False,
-                    progress_cb=on_scan_progress):
+                    max_workers=4, progress_cb=on_scan_progress):
                 files[f"client_files/{rel}"] = {"size": size, "hash": None}
+            # 记录服务端文件仓库根目录下**实际存在**的顶层目录（含空目录，
+            # 用一次目录列举拿到），供默认发送目标判定：服务端没在用这个目录时，
+            # 该类别默认只发客户端文件仓库，不在服务端凭空建目录。
+            try:
+                self._server_dirs = {
+                    name.lower() for name, is_dir_, _s, _m
+                    in sftp.list_entries(server_root) if is_dir_}
+                self._server_dirs_ok = True
+            except Exception as exc:
+                log.warning("读取服务端根目录失败，默认目标暂按双端处理: %s", exc)
+                self._server_dirs = set()
+                self._server_dirs_ok = False
+            if overlap:
+                # 客户端文件目录若位于服务端仓库下，不算作「服务端在用的目录」
+                self._server_dirs.discard(overlap.split("/", 1)[0].lower())
+            log.info("服务端根目录 %s 下存在的顶层目录：%s",
+                     server_root, "、".join(sorted(self._server_dirs)) or "（无）")
             # 大小相同一律重新远程计算哈希确认内容（快速哈希，不下载文件），
             # 不再从旧快照继承哈希，防止服务端文件被外部改动且大小不变时漏检。
             self._fill_remote_hashes(sftp, files, local, progress_cb)
@@ -409,6 +471,7 @@ class RemoteFilePage(QWidget):
         return json.dumps({"saved_at": snap.get("saved_at", ""),
                            "changed": snap.get("changed", False),
                            "aged": snap.get("aged", False),
+                           "dirs_ok": self._server_dirs_ok,
                            "rows": rows, "repo_count": len(files)},
                           ensure_ascii=False)
 
@@ -426,7 +489,7 @@ class RemoteFilePage(QWidget):
                 rel = os.path.relpath(full, root).replace("\\", "/")
                 try:
                     # 忽略的文件不参与差异检测：跳过本地 MD5 计算（省 IO）
-                    local_hash = None if self._is_ignored(rel) else hash_file(full)
+                    local_hash = None if self._is_ignored(rel) else hash_file_cached(full)
                     info = {"size": os.path.getsize(full),
                             "mtime": os.path.getmtime(full),
                             "hash": local_hash}
@@ -679,6 +742,13 @@ class RemoteFilePage(QWidget):
                 f"{f'、改名 {rnm_n}' if rnm_n else ''}、"
                 f"旧版残留 {obs_n}、服务端独有 {srv_n} ✔"
                 f"（服务端仓库共 {repo_count} 个文件，{snap_note}）")
+        if not data.get("dirs_ok", True):
+            # 目录列表没读到 → 默认发送目标无法按目录结构判定，全部退化成「双端」
+            self.lbl_status.setText(
+                self.lbl_status.text() +
+                "\n警告：未能读取服务端根目录的目录列表，默认发送目标暂时全部按「双端」，"
+                "无法判断服务端在不在用某个目录。请检查连接后点「重新扫描」。")
+            log.warning("未能读取服务端根目录的目录列表，默认发送目标已退化为「双端」")
         log.info("更新服务端对比完成: new=%d update=%d rename=%d obsolete=%d server=%d repo=%d changed=%s aged=%s",
                  new_n, upd_n, rnm_n, obs_n, srv_n, repo_count, changed, aged)
 
@@ -914,7 +984,8 @@ class RemoteFilePage(QWidget):
             f"共 {len(self._rows)} 项：新增 {new_n}、更新 {upd_n}"
             f"{f'、旧版残留 {obs_n}（默认勾选删除）' if obs_n else ''}"
             f"、待发送 {checked_n}{tip}{ig_tip}"
-            "（目标：双端=服务端+客户端，客户端=仅 client_files）")
+            "（目标：双端=服务端+客户端；客户端=只进 "
+            f"{self.config.files_dir} 下的客户端目录。鼠标悬停「目标」列可看判定依据）")
 
     def _update_tree_targets(self):
         """标注后仅刷新目标列与文件夹目标，不重建树（保持展开/滚动状态）。"""
@@ -938,8 +1009,31 @@ class RemoteFilePage(QWidget):
         self._update_summary()
 
     def _target_tooltip(self, r: dict) -> str:
-        """目标列提示：手动标注 / 其他（无额外提示）。"""
-        return "手动标注" if r.get("manual") else ""
+        """目标列提示：手动标注 / 自动纠正，或说明自动判定的依据（按服务端实际目录）。"""
+        if r.get("manual"):
+            return "手动标注（右键可恢复自动判定）"
+        rel = r["rel"]
+        auto_rec = self._auto_record_of(rel)
+        if auto_rec:
+            return "自动判定（上传前环境检测纠正）：按模组运行环境改到该去的位置\n" \
+                   "（右键「恢复自动标注」可撤销）"
+        if "/" not in rel:
+            return "自动判定：客户端根目录下的散文件 → 双端"
+        fname = rel.rsplit("/", 1)[-1].lower()
+        top = rel.split("/", 1)[0]
+        if top.lower() == "mods" and fname.endswith(".jar"):
+            if any(k in fname for k in self._client_keywords):
+                return ("自动判定：文件名命中「客户端模组关键词」→ 仅客户端\n"
+                        "发送前还会自动分析运行环境并纠正目标")
+            return ("自动判定：未命中客户端模组关键词 → 双端\n"
+                    "发送前会自动分析运行环境：判定为「仅客户端」的模组会改发客户端目录")
+        if not self._server_dirs_ok:
+            return ("自动判定：未能读取服务端根目录列表（连接异常）→ 暂按双端\n"
+                    "请点「重新扫描」再试；本次不会按目录结构判定")
+        if top.lower() in self._server_dirs:
+            return f"自动判定：服务端文件仓库里有 {top}/ 目录（服务端在用）→ 双端"
+        return (f"自动判定：服务端文件仓库里没有 {top}/ 目录（服务端未在用）→ 仅客户端\n"
+                f"（不在服务端凭空建目录；要同时发到服务端请右键改为「双端」）")
 
     def _env_cell(self, rel: str) -> tuple[str, str]:
         """「分析结果」列单元格：(文本, tooltip)。未分析/非模组 → ("", "")。"""
@@ -1247,13 +1341,15 @@ class RemoteFilePage(QWidget):
                 "（已保存，下次检测默认生效）")
 
     def _restore_auto(self, keys: list[str]):
-        """移除手动标注并持久化，恢复按「客户端模组」关键词自动判定。
+        """移除手动标注与自动纠正记录并持久化，恢复按「客户端模组」关键词自动判定。
 
         只刷新目标列、不重建树，保持用户当前的展开状态。
         """
         for k in keys:
             self._overrides.pop(k, None)
+            self._auto_targets.pop(k, None)
         self.config.target_overrides = dict(self._overrides)
+        self.config.auto_targets = dict(self._auto_targets)
         changed = self._apply_overrides()
         self._update_tree_targets()
         if changed:
@@ -1448,24 +1544,32 @@ class RemoteFilePage(QWidget):
         self.lbl_status.setText(fmt_progress(current, total, message, "分析模组环境"))
 
     def _analyze_env_worker(self, files, progress_cb=None) -> str:
-        """分析给定 jar 列表：jar 元数据分析；Forge 模组（元数据无环境字段）再参考 MC 百科标注。"""
+        """分析给定 jar 列表：先读 jar 元数据，判不出的再（可选）查 MC 百科。"""
         results = []
         total = len(files)
         for i, path in enumerate(files):
             fname = os.path.basename(path)
             env, source = jar_environment(path)
-            name = mod_display_name(path, fname)
-            wid = wiki_id_for(name) if name else None
-            # 元数据无法判定（如 Forge）→ 参考 MC 百科「运行环境」标注补充
-            if wid and env == "unknown":
-                env2, source2 = mcmod_env_online(wid)
-                if env2 != "unknown":
-                    env, source = env2, source2
-            results.append({"file": fname, "name": name, "env": env,
-                            "source": source, "wiki_id": wid})
+            results.append({"file": fname, "name": mod_display_name(path, fname),
+                            "env": env, "source": source})
             if progress_cb:
                 progress_cb(i + 1, total, f"正在分析 {fname}…")
+        self._enrich_env(results)
         return json.dumps(results, ensure_ascii=False)
+
+    def _enrich_env(self, results: list[dict]) -> None:
+        """对本地判不出的模组批量查 MC 百科补齐 env/source（原地修改 results）。
+
+        走 enrich_online：有整体超时与条数上限，断网时提前放弃，不会卡住界面。
+        """
+        todo = [r["name"] for r in results if r.get("env") == "unknown" and r.get("name")]
+        if not todo:
+            return
+        got = enrich_online(todo, enabled=self.config.env_online)
+        for r in results:
+            hit = got.get(r.get("name"))
+            if hit and hit[0] != "unknown":
+                r["env"], r["source"] = hit
 
     def _on_analyze_done(self, ok: bool, msg: str):
         self.btn_analyze.setEnabled(True)
@@ -1532,9 +1636,371 @@ class RemoteFilePage(QWidget):
         self.btn_analyze.show()
         self.lbl_status.setText("已取消本次模组环境分析。")
 
+    # ---------- 服务端模组归类：把误传到服务端的客户端模组搬到客户端文件目录 ----------
+    def _tidy_server_mods(self):
+        """阶段 1：体检服务端 mods 目录（列出模组 → 分析运行环境 → 挑出「仅客户端」）。"""
+        if not self.config.host():
+            winutil.warn(self, "提示", "未配置 SFTP（请先在「服务器设置」页填写）。")
+            return
+        self.btn_tidy_mods.setEnabled(False)
+        self.btn_send.setEnabled(False)
+        self.lbl_status.setText("正在读取服务端 mods 目录…")
+        worker = Worker(self._tidy_analyze_worker)
+        worker.progress.connect(self._on_tidy_progress)
+        worker.done.connect(self._on_tidy_analyze_done)
+        self._worker = worker
+        worker.start()
+
+    def _on_tidy_progress(self, current, total, message):
+        self.lbl_status.setText(fmt_progress(current, total, message, "服务端模组归类"))
+
+    def _tidy_analyze_worker(self, progress_cb=None) -> str:
+        """列出服务端 mods 下所有 .jar 并逐个判定运行环境，返回 JSON（只挑「仅客户端」）。
+
+        远端模组与本地同名模组先做「大小 + 哈希」比对：内容一致才用本地文件分析
+        （同名同大小不代表内容相同），否则从服务端下载到临时目录分析，用完即删。
+        """
+        mods_dir = SFTPManager.join(self.config.server_root, "mods")
+        dst_dir = SFTPManager.join(self.config.files_dir, "mods")
+        local_mods = (os.path.join(self.config.local_mc_dir, "mods")
+                      if self.config.local_mc_dir else "")
+        with tempfile.TemporaryDirectory(prefix="mc_sync_mods_") as tmp:
+            with SFTPManager(self.config.host(), self.config.port(),
+                             self.config.username(), self.config.password()) as sftp:
+                if not sftp.is_dir(mods_dir):
+                    return json.dumps({"error": f"服务端没有 mods 目录：{mods_dir}"},
+                                      ensure_ascii=False)
+                jars = [rel for rel in sftp.list_files_recursive(mods_dir)
+                        if rel.lower().endswith(".jar")]
+                if not jars:
+                    return json.dumps({"error": f"服务端 {mods_dir} 下没有 .jar 模组。"},
+                                      ensure_ascii=False)
+                if progress_cb:
+                    progress_cb(0, len(jars), f"共 {len(jars)} 个模组，正在与本地比对…")
+
+                # ① 本地存在同名文件的，批量流水线取远程哈希做「大小 + 哈希」比对；
+                #    内容一致才用本地文件分析，省下下载整个模组的流量
+                candidates = []
+                for rel in jars:
+                    if not local_mods:
+                        break
+                    lp = os.path.join(local_mods, *rel.split("/"))
+                    try:
+                        if os.path.isfile(lp) and os.path.getsize(lp) > 0:
+                            candidates.append((rel, lp))
+                    except OSError:
+                        continue
+                same_local: dict[str, str] = {}
+                if candidates:
+                    hashes = hash_remote_parallel(
+                        sftp, self.config.host(), self.config.port(),
+                        self.config.username(), self.config.password(),
+                        [(rel, SFTPManager.join(mods_dir, rel)) for rel, _ in candidates])
+                    for rel, lp in candidates:
+                        try:
+                            if hashes.get(rel) and hashes[rel] == hash_file_cached(lp):
+                                same_local[rel] = lp
+                        except OSError:
+                            continue
+                log.info("服务端模组归类：模组 %d 个，本地同名 %d 个，"
+                         "其中内容一致（哈希相同）%d 个",
+                         len(jars), len(candidates), len(same_local))
+
+                # ② 逐个读 jar 元数据判定运行环境（本地一致的读本地，否则下载到临时目录）
+                metas: list[dict] = []
+                for i, rel in enumerate(jars):
+                    if progress_cb:
+                        progress_cb(i, len(jars), f"分析 {rel}")
+                    fname = rel.rsplit("/", 1)[-1]
+                    path = same_local.get(rel)
+                    origin = "本地一致"
+                    if path is None:
+                        path = os.path.join(tmp, *rel.split("/"))
+                        origin = "下载分析"
+                        try:
+                            sftp.download(SFTPManager.join(mods_dir, rel), path)
+                        except Exception as exc:
+                            log.warning("下载服务端模组失败 %s: %s", rel, exc)
+                            continue
+                    env, source = jar_environment(path)
+                    metas.append({"rel": rel, "env": env, "source": source,
+                                  "origin": origin,
+                                  "name": mod_display_name(path, fname)})
+                    if origin == "下载分析":
+                        try:
+                            os.remove(path)  # 元数据已读出，临时文件不再需要
+                        except OSError:
+                            pass
+
+                # ③ Forge 等元数据不含环境字段的 → 查 MC 百科补齐标注（有超时保护）
+                self._enrich_env(metas)
+
+                # ④ 汇总：只挑「仅客户端」，并标明客户端目录里是否已有同名文件
+                counts = {"client": 0, "server": 0, "both": 0, "unknown": 0}
+                for m in metas:
+                    counts[m["env"]] = counts.get(m["env"], 0) + 1
+                existing = set(sftp.list_files_recursive(dst_dir)) if sftp.is_dir(dst_dir) else set()
+                client_items = []
+                for m in metas:
+                    if m["env"] != "client":
+                        continue
+                    m["exists"] = m["rel"] in existing
+                    client_items.append(m)
+                payload = {"total": len(jars), "scanned": len(metas),
+                           "counts": counts, "client": client_items,
+                           "mods_dir": mods_dir, "dst_dir": dst_dir}
+        return json.dumps(payload, ensure_ascii=False)
+
+    def _on_tidy_analyze_done(self, ok: bool, msg: str):
+        self.btn_tidy_mods.setEnabled(True)
+        self.btn_send.setEnabled(True)
+        if not ok:
+            self.lbl_status.setText("服务端模组归类失败 ✘")
+            winutil.error(self, "读取失败", str(msg))
+            return
+        try:
+            data = json.loads(msg or "{}")
+        except Exception:
+            data = {}
+        if data.get("error"):
+            self.lbl_status.setText(str(data["error"]))
+            winutil.warn(self, "服务端模组归类", str(data["error"]))
+            return
+        c = data.get("counts", {})
+        summary = (f"服务端 mods 共 {data.get('total', 0)} 个模组，已分析 "
+                   f"{data.get('scanned', 0)} 个：仅客户端 {c.get('client', 0)} 个、"
+                   f"服务端 {c.get('server', 0)} 个、双端 {c.get('both', 0)} 个、"
+                   f"未标注 {c.get('unknown', 0)} 个。")
+        items = data.get("client") or []
+        if not items:
+            self.lbl_status.setText(summary + "没有需要搬移的客户端模组。")
+            winutil.info(self, "服务端模组归类",
+                         summary + "\n\n没有判定为「仅客户端」的模组，无需搬移。")
+            return
+        lines = [f"{it['rel']}（{it['source']}）"
+                 + ("［客户端目录已有，将覆盖］" if it.get("exists") else "")
+                 for it in items]
+        text = (f"{summary}\n\n以下 {len(items)} 个模组判定为「仅客户端」，将从\n"
+                f"{data.get('mods_dir')}\n搬到\n{data.get('dst_dir')}/：")
+        if not winutil.confirm_list(self, "确认搬移客户端模组", text, lines,
+                                    ok_label="开始搬移"):
+            self.lbl_status.setText("已取消服务端模组归类（未搬移任何文件）。")
+            return
+        self.btn_tidy_mods.setEnabled(False)
+        self.btn_send.setEnabled(False)
+        worker = Worker(self._tidy_move_worker, items)
+        worker.progress.connect(self._on_tidy_progress)
+        worker.done.connect(self._on_tidy_move_done)
+        self._worker = worker
+        worker.start()
+
+    def _tidy_move_worker(self, items, progress_cb=None) -> str:
+        """阶段 2：把确认的「仅客户端」模组从服务端 mods 搬到客户端文件目录（服务端内移动）。"""
+        mods_dir = SFTPManager.join(self.config.server_root, "mods")
+        dst_dir = SFTPManager.join(self.config.files_dir, "mods")
+        moved: list[str] = []
+        failed: list[str] = []
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            sftp.mkdirs(dst_dir)
+            for i, it in enumerate(items):
+                rel = it["rel"]
+                if progress_cb:
+                    progress_cb(i, len(items), f"搬移 {rel}")
+                dst = SFTPManager.join(dst_dir, rel)
+                try:
+                    parent = dst.rsplit("/", 1)[0]
+                    if parent:
+                        sftp.mkdirs(parent)  # 模组子目录（mods/子目录/xx.jar）保持原结构
+                    sftp.move(SFTPManager.join(mods_dir, rel), dst)
+                    moved.append(rel)
+                except Exception as exc:
+                    log.warning("搬移失败 %s: %s", rel, exc)
+                    failed.append(f"{rel}：{exc}")
+        return json.dumps({"moved": moved, "failed": failed}, ensure_ascii=False)
+
+    def _on_tidy_move_done(self, ok: bool, msg: str):
+        self.btn_tidy_mods.setEnabled(True)
+        self.btn_send.setEnabled(True)
+        if not ok:
+            self.lbl_status.setText("服务端模组归类失败 ✘")
+            winutil.error(self, "搬移失败", str(msg))
+            return
+        try:
+            data = json.loads(msg or "{}")
+        except Exception:
+            data = {}
+        moved = data.get("moved") or []
+        failed = data.get("failed") or []
+        # 搬走的模组标注为「客户端」：下次发送只发客户端目录，不会再传回服务端 mods
+        for rel in moved:
+            self._overrides[f"mods/{rel}"] = "client"
+        if moved:
+            self.config.target_overrides = dict(self._overrides)
+        log.info("服务端模组归类完成：搬移 %d 个，失败 %d 个", len(moved), len(failed))
+        text = f"已把 {len(moved)} 个客户端模组搬到客户端文件目录的 mods 下，并标注为「客户端」。"
+        if failed:
+            text += f"\n\n失败 {len(failed)} 个：\n" + "\n".join(failed[:20])
+            if len(failed) > 20:
+                text += f"\n…另有 {len(failed) - 20} 个，详见日志。"
+        self.lbl_status.setText(text.splitlines()[0])
+        if failed:
+            winutil.warn(self, "服务端模组归类", text)
+        else:
+            winutil.info(self, "服务端模组归类", text)
+        if moved:
+            self._auto_detect()  # 重新读取服务端目录树，刷新差异
+
     # ---------- 发送 ----------
+    @staticmethod
+    def _is_mod_jar(rel: str) -> bool:
+        """是否 mods 目录下的模组 jar（上传前需要检测运行环境的对象）。"""
+        return rel.split("/", 1)[0].lower() == "mods" and rel.lower().endswith(".jar")
+
     def _send(self):
-        root_dir = self.config.local_mc_dir
+        """发送入口：先对本次要上传的模组做一遍运行环境检测，再确认发送。
+
+        检测的目的：确保客户端模组只进客户端文件目录（client_files/mods），
+        服务端模组只进服务端 mods，不让客户端模组被误传进服务端 mods。
+        """
+        uploads, deletes, deletes_client, _obsolete = self._collect_actions()
+        if not uploads and not deletes and not deletes_client:
+            winutil.warn(self, "提示",
+                         "没有勾选任何操作。\n\n勾选「新增/更新/改名」= 上传（按目标，改名同时删除旧文件）；\n"
+                         "勾选「旧版残留/服务端独有」= 从服务端删除。")
+            return
+        mods = [rel for rel, _ in uploads if self._is_mod_jar(rel)]
+        if not mods:
+            self._confirm_and_send()
+            return
+        self.btn_send.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.lbl_status.setText(f"上传前检测：正在分析 {len(mods)} 个模组的运行环境…")
+        worker = Worker(self._presend_env_worker, mods)
+        worker.progress.connect(self._on_analyze_progress)
+        worker.done.connect(self._on_presend_env_done)
+        self._worker = worker
+        worker.start()
+
+    def _presend_env_worker(self, rels, progress_cb=None) -> str:
+        """上传前检测：对本次要上传的 mods 下 .jar 逐个判定运行环境。
+
+        先用本地 jar 元数据判定；元数据判不出的（Forge / NeoForge 等）再查 MC 百科
+        （走 enrich_online，有整体超时，断网时不会卡住发送）。
+        返回 JSON：[{"rel", "env": client|server|both|unknown, "source"}]
+        """
+        root = self.config.local_mc_dir
+        total = len(rels)
+        results: list[dict] = []
+        for i, rel in enumerate(rels):
+            path = os.path.join(root, *rel.split("/"))
+            fname = rel.rsplit("/", 1)[-1]
+            if progress_cb:
+                progress_cb(i, total, f"检测 {fname}")
+            try:
+                env, source = jar_environment(path)
+            except Exception as exc:
+                env, source = "unknown", f"读取失败：{exc}"
+            results.append({"rel": rel, "env": env, "source": source,
+                            "name": mod_display_name(path, fname)})
+
+        if any(r["env"] == "unknown" for r in results):
+            if progress_cb:
+                progress_cb(total, total, "正在结合 MC 百科标注…")
+            self._enrich_env(results)
+
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r["env"]] = counts.get(r["env"], 0) + 1
+        log.info("上传前模组环境检测：共 %d 个（客户端 %d / 服务端 %d / 双端 %d / 未判定 %d）",
+                 total, counts.get("client", 0), counts.get("server", 0),
+                 counts.get("both", 0), counts.get("unknown", 0))
+        return json.dumps([{k: r[k] for k in ("rel", "env", "source")} for r in results],
+                          ensure_ascii=False)
+
+    def _apply_env_corrections(self, results: list[dict]) -> tuple[list[dict], list[dict]]:
+        """按运行环境结果纠正模组目标，返回 (changes, unsure)。
+
+        - 未手动标注：自动纠正并写进「自动纠正」记录（「仅客户端」→ 只发客户端目录；
+          「仅服务端」→ 只发服务端），右键「恢复自动标注」可撤销；
+          记录与手动标注分开存，下次检测仍可覆盖（不会把自动结果锁成手动标注）；
+        - 已手动标注但与环境不符：不自动改，仅在返回里标出提醒（manual=True）；
+        - unsure：运行环境没判定出来、却会被发到服务端 mods 的模组——正是「客户端模组
+          可能被误传到服务端」的风险点，必须让用户在确认框里看到，不能静默放过。
+        """
+        want_of = {"client": "client", "server": "server", "both": "both"}
+        by_rel = {r["rel"]: r for r in results}
+        changes: list[dict] = []
+        unsure: list[dict] = []
+        for row in self._rows:
+            info = by_rel.get(row["rel"])
+            if not info:
+                continue
+            fname = row["rel"].rsplit("/", 1)[-1].lower()
+            self._env_results[fname] = info["env"]
+            self._env_sources[fname] = info["source"]
+            if row.get("manual"):
+                want = want_of.get(info["env"])
+                if want and want != row.get("target"):
+                    changes.append({"rel": row["rel"], "old": row.get("target", "both"),
+                                    "new": want, "env": info["env"],
+                                    "source": info["source"], "manual": True})
+                continue
+            want = want_of.get(info["env"])
+            if want is None:
+                # 未判定：只有「即将发到服务端 mods」才有风险，需要提醒用户确认
+                if row.get("target") in ("both", "server"):
+                    unsure.append({"rel": row["rel"], "target": row.get("target", "both"),
+                                   "source": info["source"]})
+                continue
+            if want == row.get("target"):
+                continue
+            changes.append({"rel": row["rel"], "old": row.get("target", "both"),
+                            "new": want, "env": info["env"],
+                            "source": info["source"], "manual": False})
+            self._auto_targets[row["rel"]] = want
+        if any(not c["manual"] for c in changes):
+            self.config.auto_targets = dict(self._auto_targets)
+            for row in self._rows:
+                target, manual = self._effective_target(row["rel"])
+                row["target"], row["manual"] = target, manual
+        return changes, unsure
+
+    def _on_presend_env_done(self, ok: bool, msg: str):
+        """检测完成：先按结果纠正目标，再把检查结论并入发送确认。"""
+        self.btn_send.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        if not ok:
+            self.lbl_status.setText("上传前模组环境检测失败 ✘")
+            winutil.error(self, "检测失败", str(msg))
+            return
+        try:
+            results = json.loads(msg or "[]")
+        except Exception:
+            results = []
+        changes, unsure = self._apply_env_corrections(results)
+        self._refresh_tree()  # 目标列 / 分析结果列按纠正后的结果刷新
+        corrected = [c for c in changes if not c["manual"]]
+        conflicts = [c for c in changes if c["manual"]]
+        if corrected:
+            log.info("上传前已按运行环境纠正 %d 个模组目标：%s", len(corrected),
+                     "；".join(f"{c['rel']} {c['old']}→{c['new']}" for c in corrected))
+        if unsure:
+            log.warning("上传前有 %d 个模组运行环境未判定，且目标含服务端：%s",
+                        len(unsure), "；".join(u["rel"] for u in unsure))
+        if not changes and not unsure:
+            self.lbl_status.setText("上传前检查：模组运行环境与目标一致 ✔")
+        elif not changes:
+            self.lbl_status.setText(
+                f"上传前检查：{len(unsure)} 个模组的运行环境未判定，"
+                "将在确认框里列出（目标含服务端，请确认）")
+        self._confirm_and_send(corrected, conflicts, unsure)
+
+    def _confirm_and_send(self, corrected=None, conflicts=None, unsure=None):
+        """收集勾选的操作 → 二次确认（含上传前检查结论）→ 开始发送。"""
+        corrected = corrected or []
+        conflicts = conflicts or []
+        unsure = unsure or []
         uploads, deletes, deletes_client, obsolete_n = self._collect_actions()
         if not uploads and not deletes and not deletes_client:
             winutil.warn(self, "提示",
@@ -1545,16 +2011,46 @@ class RemoteFilePage(QWidget):
         if uploads:
             server_n = sum(1 for _, t in uploads if t in ("server", "both"))
             client_n = sum(1 for _, t in uploads if t in ("client", "both"))
-            lines.append(f"【上传】{len(uploads)} 个文件（服务端 {server_n}、客户端 {client_n}）")
+            lines.append(f"【上传】共 {len(uploads)} 个文件")
+            lines.append(f"· 服务端 {self.config.server_root}：{server_n} 个")
+            lines.append(f"· 客户端 {self.config.files_dir}：{client_n} 个（双端会两边都放）")
         del_n = len(deletes) + len(deletes_client)
         if del_n:
             if obsolete_n:
                 lines.append(f"【删除】{del_n} 个文件（其中旧版残留 {obsolete_n} 个）")
             else:
                 lines.append(f"【删除】{del_n} 个服务端独有 / 改名旧文件")
-        detail = "\n".join(lines)
-        if not winutil.confirm(self, "确认发送",
-                               f"即将把勾选的操作发送到服务器：\n\n{detail}\n\n是否继续？"):
+        head = ""
+        if corrected:
+            head += (f"上传前检查：{len(corrected)} 个模组的目标与运行环境不符，"
+                     f"已自动纠正为「该去的位置」：\n\n")
+        if conflicts:
+            head += (f"注意：{len(conflicts)} 个模组有手动标注，与运行环境不符，"
+                     f"未自动修改（按手动标注发送）：\n\n")
+        if unsure:
+            head += (f"注意：{len(unsure)} 个模组没能判定运行环境（元数据未标注、"
+                     f"MC 百科也查不到），当前目标会让它们进服务端 mods。\n"
+                     f"如果其中有「仅客户端」的模组，请点「取消上传」，"
+                     f"在列表里右键改成「仅客户端」后再发：\n\n")
+        text = f"{head}即将把勾选的操作发送到服务器：\n\n" + "\n".join(lines) + "\n\n是否继续？"
+        items = [
+            f"{c['rel']}　{TARGET_LABELS.get(c['old'], c['old'])} → "
+            f"{TARGET_LABELS.get(c['new'], c['new'])}　（{c['source']}）"
+            + ("　[手动标注，未改动]" if c["manual"] else "")
+            for c in (corrected + conflicts)
+        ]
+        items += [
+            f"{u['rel']}　按「{TARGET_LABELS.get(u['target'], u['target'])}」发送"
+            f"　（未判定：{u['source']}）"
+            for u in unsure
+        ]
+        if items:
+            ok = winutil.confirm_list(self, "上传前检查：模组该去的位置", text, items,
+                                      ok_label="按检查结果继续发送", cancel_label="取消上传")
+        else:
+            ok = winutil.confirm(self, "确认发送", text)
+        if not ok:
+            self.lbl_status.setText("已取消发送（未做任何改动）。")
             return
         self.btn_send.setEnabled(False)
         self.btn_scan.setEnabled(False)

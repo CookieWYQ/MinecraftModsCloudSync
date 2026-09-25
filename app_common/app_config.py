@@ -285,6 +285,29 @@ class ServerConfig:
         self.remote = {**self.remote, "client_mods": list(value or [])}
 
     @property
+    def auto_targets(self) -> dict:
+        """发送前环境检测自动纠正的发送目标（rel → target）。
+
+        与手动标注（target_overrides）分开存放：自动结果之后还能被新的检测覆盖，
+        手动标注则永久优先。右键「恢复自动标注」会清掉对应的自动结果。
+        """
+        v = self.remote.get("auto_targets", {})
+        return dict(v) if isinstance(v, dict) else {}
+
+    @auto_targets.setter
+    def auto_targets(self, value) -> None:
+        self.remote = {**self.remote, "auto_targets": dict(value or {})}
+
+    @property
+    def env_online(self) -> bool:
+        """上传前是否联网查询 MC 百科补齐模组运行环境（关闭则只用本地 jar 元数据）。"""
+        return bool(self.remote.get("env_online", True))
+
+    @env_online.setter
+    def env_online(self, value) -> None:
+        self.remote = {**self.remote, "env_online": bool(value)}
+
+    @property
     def push_settings(self) -> dict:
         """随发布待办下发的客户端软件默认设置（每台服务器独立）。"""
         return dict(self.remote.get("push_settings", {}))

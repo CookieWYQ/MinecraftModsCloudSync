@@ -29,6 +29,10 @@ _conn_sem = threading.BoundedSemaphore(_CONN_MAX)
 _scan_cache: dict[tuple, tuple] = {}
 _SCAN_CACHE_TTL = 60.0  # 秒；写入型操作会主动清空缓存
 
+# 批量远程哈希：一批内连续这么多条失败就放弃流水线（改逐文件回退），
+# 避免响应乱序时每条都干等一个 socket 超时
+_PIPELINE_MAX_FAILS = 3
+
 
 def _invalidate_scan_cache() -> None:
     """任何修改服务端文件的操作后调用，保证缓存不返回过期数据。"""
@@ -244,6 +248,73 @@ class SFTPManager:
         except Exception as exc:
             log.info("远程哈希计算不可用（回退下载）: %s（%s）", path, exc)
             return None
+
+    def remote_hash_many(self, paths: list[str], algo: str = "md5",
+                         batch: int = 32, progress_cb=None) -> dict[str, str]:
+        """在同一连接上「流水线」批量计算远程哈希（SFTP check-file 扩展）。
+
+        逐条请求时每个文件都要等一个网络往返，模组包动辄上千个文件，时间几乎全花在
+        等 RTT 上；这里把 batch 个请求一次发出、再按序收响应，把往返次数从
+        「文件数」降到「文件数/batch」。返回 {远程路径: 哈希}；
+        服务器不支持 check-file 或响应异常时返回已拿到的部分，其余由调用方逐文件回退。
+
+        progress_cb(done, total, path) 可选。
+        """
+        if not paths:
+            return {}
+        sftp = self._sftp
+        if not hasattr(sftp, "_async_request") or not hasattr(sftp, "_read_response"):
+            return {}
+        from paramiko.sftp import CMD_EXTENDED, CMD_EXTENDED_REPLY
+
+        step = max(1, int(batch))
+        total = len(paths)
+        result: dict[str, str] = {}
+        done = 0
+        for start in range(0, total, step):
+            chunk = paths[start:start + step]
+            sent: list[tuple[int, str]] = []
+            consecutive = 0
+            try:
+                for remote in chunk:
+                    num = sftp._async_request(
+                        type(None), CMD_EXTENDED,
+                        b"check-file@openssh.com",
+                        self._posix(remote).encode("utf-8"),
+                        algo.encode("ascii"),
+                        b"0", b"0")
+                    sent.append((num, remote))
+            except Exception as exc:
+                log.info("批量远程哈希不可用（回退逐文件）: %s", exc)
+                return result
+            for num, remote in sent:
+                try:
+                    t, resp = sftp._read_response(num)
+                except Exception as exc:
+                    # 单个文件失败（如已被删除）不影响其余；连续失败说明响应乱序或
+                    # 服务器不支持，立刻放弃流水线，避免每条都干等一个 socket 超时
+                    consecutive += 1
+                    log.debug("批量哈希单条失败 %s: %s", remote, exc)
+                    if consecutive >= _PIPELINE_MAX_FAILS:
+                        log.info("批量远程哈希连续失败 %d 次，改用逐文件回退", consecutive)
+                        return result
+                    continue
+                consecutive = 0
+                if t == CMD_EXTENDED_REPLY:
+                    count = resp.get_int()
+                    hval = None
+                    for _ in range(count):
+                        resp.get_string()
+                        hval = resp.get_string().decode("ascii", "ignore").strip().lower()
+                    if hval:
+                        result[remote] = hval
+                done += 1
+                if progress_cb:
+                    try:
+                        progress_cb(done, total, remote)
+                    except Exception:
+                        pass
+        return result
 
     def mkdirs(self, path: str) -> None:
         """递归创建远程目录。"""
@@ -544,6 +615,25 @@ class SFTPManager:
             pass
         except Exception as exc:
             raise SFTPError(f"删除远程文件失败: {remote_path} ({exc})") from exc
+
+    def move(self, src: str, dst: str) -> None:
+        """在同一服务器内移动/重命名远程文件（不传输文件内容）。
+
+        优先用 posix-rename 扩展（目标已存在时直接覆盖，符合预期地替换旧文件）；
+        服务器不支持该扩展时退化为标准 rename（目标已存在时可能失败）。
+        """
+        _invalidate_scan_cache()
+        old, new = self._posix(src), self._posix(dst)
+        try:
+            self._sftp.posix_rename(old, new)
+            return
+        except Exception as exc:
+            first = exc
+        try:
+            self._sftp.rename(old, new)
+        except Exception as exc:
+            raise SFTPError(f"移动远程文件失败: {src} → {dst}（{exc}）") from exc
+        log.info("服务器不支持 posix-rename，已用 rename 移动: %s → %s（%s）", src, dst, first)
 
     def delete_dir(self, remote_path: str) -> None:
         """递归删除远程目录。"""

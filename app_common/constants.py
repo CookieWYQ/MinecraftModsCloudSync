@@ -7,7 +7,7 @@ from .hide import set_hidden
 
 APP_NAME = "MinecraftModsCloudSync"
 APP_DISPLAY_NAME = "Minecraft 模组云端同步"
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 
 # 客户端加密密钥派生盐值（构建时可通过环境变量 MC_SYNC_SECRET 覆盖密钥本体）
 CRYPTO_SALT = "mc-mods-cloud-sync-7f3a9c2e5b1d"
