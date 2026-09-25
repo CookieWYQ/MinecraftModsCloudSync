@@ -202,7 +202,6 @@ def _request(method: str, path: str, token: str,
     params["access_token"] = token
     query = urllib.parse.urlencode(params)
     parsed = urllib.parse.urlsplit(API + path)
-    path_and_query = parsed.path + ("?" + query if query else "")
 
     headers = {"User-Agent": "MinecraftModsCloudSync/gitee-sync",
                "Accept": "application/json"}
@@ -211,12 +210,17 @@ def _request(method: str, path: str, token: str,
         boundary = "----gitee-sync-%08x" % int(time.time() * 1000)
         headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
         body = _FileBody(params, files, boundary)
+        query_in_url = query          # 上传接口：参数走 query（Gitee 要求），同时进 form
     elif method in ("POST", "PATCH", "PUT", "DELETE"):
+        # 参数只放 body：放进 URL 时，长文本（如版本介绍正文）会撑爆 URL 报 HTTP 414
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         body = query.encode()
+        query_in_url = ""
     else:
         body = None
+        query_in_url = query
 
+    path_and_query = parsed.path + ("?" + query_in_url if query_in_url else "")
     conn = http.client.HTTPSConnection(parsed.netloc, timeout=timeout)
     try:
         conn.request(method, path_and_query, body=body, headers=headers)
