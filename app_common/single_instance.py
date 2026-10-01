@@ -107,10 +107,14 @@ def _activate_msg_id(scope: str) -> int:
 def _activate_existing(pid: int, scope: str = "") -> bool:
     """把已运行实例（按 PID）的主窗口带到前台并还原显示，返回是否定位到窗口。
 
-    - 先 ShowWindow(SW_RESTORE)：兼容「最小化」窗口（对 Qt 隐藏窗口无效但无害）；
-    - 再发送注册的自定义消息：Qt 程序在 nativeEvent 中自行恢复显示与置前，
-      解决 ShowWindow 无法恢复 Qt 隐藏（托盘驻留）窗口的问题；
-    - Windows 会阻止后台进程抢占前台，程序侧 activateWindow 前可配合 Alt 键模拟。
+    只发送注册的自定义消息：Qt 程序在 nativeEvent 中自行
+    showNormal()/raise_()/activateWindow()，隐藏（托盘驻留）与最小化都能正确还原。
+
+    **刻意不调用 ShowWindow**：EnumWindows 返回的是 Z 序（且会变化），进程的顶层窗口里
+    除主窗口外还有 Qt 的内部辅助窗口（Qt6xxScreenChangeObserverWindow /
+    TrayIconMessageWindowClass、输入法窗口）——对它们（或对 Qt 状态是「隐藏」的主窗口）
+    强行 ShowWindow，会冒出一个没有标题、没有任何内容、Qt 也不认的空白窗口，
+    关掉它什么都不会发生。消息方式由窗口自己按 Qt 的状态机恢复，没有这个问题。
     """
     if not pid or os.name != "nt":
         return False
@@ -125,11 +129,6 @@ def _activate_existing(pid: int, scope: str = "") -> bool:
     user32.GetWindowThreadProcessId.argtypes = [
         wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
     user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-    user32.IsWindowVisible.argtypes = [wintypes.HWND]
-    user32.IsWindowVisible.restype = wintypes.BOOL
-    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-    user32.ShowWindow.restype = wintypes.BOOL
-
     found: list = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -143,16 +142,18 @@ def _activate_existing(pid: int, scope: str = "") -> bool:
     user32.EnumWindows(_enum_cb, 0)
     if not found:
         return False
-    # 优先取可见窗口（主窗口），否则取第一个顶层窗口（可能是托盘驻留的隐藏窗口）
-    hwnd = next((h for h in found if user32.IsWindowVisible(h)), found[0])
-    SW_RESTORE = 9
-    user32.ShowWindow(hwnd, SW_RESTORE)
-    if scope:
-        user32.PostMessageW.argtypes = [
-            wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
-        user32.PostMessageW.restype = wintypes.BOOL
-        user32.PostMessageW(hwnd, _activate_msg_id(scope), 0, 0)
-    log.info("已向已运行实例（pid=%s）发送激活消息", pid)
+    if not scope:
+        return True
+    # 投递给该进程的每个顶层窗口：主窗口自己会在 nativeEvent 里 showNormal()/raise_()/
+    # activateWindow() 恢复显示，其余是 Qt 的内部窗口，没有对应处理、无副作用。
+    # 这样就不必猜哪个是主窗口——猜错正是之前冒出空白窗口的原因。
+    user32.PostMessageW.argtypes = [
+        wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
+    msg_id = _activate_msg_id(scope)
+    for hwnd in found:
+        user32.PostMessageW(hwnd, msg_id, 0, 0)
+    log.info("已向已运行实例（pid=%s）的 %d 个顶层窗口发送激活消息", pid, len(found))
     return True
 
 

@@ -61,6 +61,7 @@ from app_common.updater import (
     set_last_prompted_version,
     show_check_failed,
     show_update_result,
+    track_thread,
     update_dir,
 )
 from app_common.version_dialog import VersionPickerDialog
@@ -965,8 +966,8 @@ class ClientMainWindow(QWidget):
         ))
         thread.done.connect(lambda ok, path, err: self._on_update_downloaded(
             ok, path, err, progress, latest))
+        track_thread(self, "_download_thread", thread)
         thread.finished.connect(thread.deleteLater)
-        self._download_thread = thread
         thread.start()
 
     def _on_update_downloaded(self, ok: bool, path: str, err: str, progress, latest):

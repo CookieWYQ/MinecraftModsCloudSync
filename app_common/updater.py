@@ -570,6 +570,24 @@ def show_check_failed(parent, error: str) -> bool:
 
 
 # ---------- 后台线程（避免网络/大文件下载阻塞界面） ----------
+def track_thread(owner, attr: str, thread) -> None:
+    """把后台线程挂到 owner.attr，并在线程结束时先清空引用（再销毁）。
+
+    QThread 用 deleteLater() 释放后，属性里残留的 Python 包装对象已经失效
+    （C++ 对象被销毁），之后任何 isRunning() 之类访问都会抛
+    RuntimeError: Internal C++ object (...) already deleted ——
+    表现为「再点一次检查更新就崩掉」。所以结束时必须把引用清成 None。
+
+    清理带身份校验：若期间已经起了新线程，不会被旧线程的清空动作误伤。
+    """
+    def _clear():
+        if getattr(owner, attr, None) is thread:
+            setattr(owner, attr, None)
+
+    setattr(owner, attr, thread)
+    thread.finished.connect(_clear)
+
+
 class UpdateCheckThread(QThread):
     """后台查询最新版本 + 版本历史列表（并记录本次检查时间）。"""
 
