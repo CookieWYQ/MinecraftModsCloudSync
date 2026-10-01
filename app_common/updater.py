@@ -172,14 +172,32 @@ def _fetch_gitee(timeout: int = 15) -> ReleaseInfo | None:
     )
 
 
+def sort_releases_desc(items: list[dict]) -> list[dict]:
+    """版本历史列表按版本号倒序（新 → 旧）。
+
+    两个源的返回顺序并不一致：GitHub 是「新 → 旧」，Gitee 是「旧 → 新」。
+    而更新源顺序是 Gitee 优先，界面又按「第 0 项即最新」标注，
+    不排序就会把最旧的版本标成「（最新）」。
+    版本号解析不出的条目排在最后，再按发布时间兜底。
+    """
+    def key(item: dict):
+        ver = parse_version(item.get("tag", ""))
+        return (1 if ver else 0, ver or (), str(item.get("published_at") or ""))
+
+    return sorted(items, key=key, reverse=True)
+
+
 def fetch_releases(timeout: int = 15) -> list[dict]:
-    """获取版本历史列表 [{tag, published_at}]（按时间倒序）。多源依次尝试，全部失败返回空列表。"""
+    """获取版本历史列表 [{tag, published_at}]（统一按版本号倒序）。
+
+    多源依次尝试，全部失败返回空列表。
+    """
     for source in UPDATE_SOURCE_ORDER:
         try:
             items = (_fetch_releases_github(timeout) if source == "github"
                      else _fetch_releases_gitee(timeout))
             if items:
-                return items
+                return sort_releases_desc(items)
         except Exception as exc:
             log.warning("版本列表源 %s 不可用: %s", source, exc)
     return []
@@ -499,9 +517,12 @@ def show_update_result(parent, latest, releases: list[dict],
     layout.addWidget(QLabel("版本历史："))
     lst = QListWidget()
     cur_tag = f"v{APP_VERSION}" if not APP_VERSION.startswith("v") else APP_VERSION
-    for i, r in enumerate(releases):
+    # 按版本号认定「最新」，不依赖列表原有顺序（Gitee 返回的是旧 → 新）
+    ordered = sort_releases_desc(releases)
+    newest_tag = ordered[0].get("tag", "") if ordered else ""
+    for r in ordered:
         tag = r.get("tag", "")
-        mark = "  （当前版本）" if tag == cur_tag else ("  （最新）" if i == 0 else "")
+        mark = "  （当前版本）" if tag == cur_tag else ("  （最新）" if tag == newest_tag else "")
         lst.addItem(f"{tag}  ·  {r.get('published_at', '')}{mark}")
     if not releases:
         lst.addItem("（无法获取版本历史列表）")
