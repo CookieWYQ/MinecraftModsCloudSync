@@ -40,8 +40,25 @@ from app_common import winutil
 from app_common.file_hash import hash_file_cached, hash_remote_parallel
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_display_name
-from app_common.mod_env import enrich_online, jar_environment
+from app_common.mod_env import (
+    SIDE_UNKNOWN,
+    enrich_online,
+    env_target,
+    jar_environment,
+    side_label,
+    side_summary,
+)
 from app_common.mod_identity import filename_base, jar_identifiers
+from app_common.mod_version import (
+    VER_AHEAD,
+    VER_LATEST,
+    VER_OUTDATED,
+    VER_UNKNOWN,
+    check_versions,
+    jar_meta,
+    status_text,
+    tooltip_text,
+)
 from app_common.sftp import SFTPManager
 from app_common.snapshot import (
     load_snapshot,
@@ -56,7 +73,24 @@ log = get_logger("server.remote_page")
 
 STATUS_LABELS = {"new": "新增", "update": "更新", "server": "仅服务器",
                  "obsolete": "旧版残留", "same": "已一致", "rename": "改名"}
+
+# 「最新版本」列的状态配色：有新版本最需要引起注意，未查到保持灰色不喧宾夺主
+_VERSION_COLORS = {
+    VER_LATEST: "#4caf50",
+    VER_OUTDATED: "#e08c3a",
+    VER_AHEAD: "#5b9bd5",
+    VER_UNKNOWN: "#888888",
+}
 TARGET_LABELS = {"both": "双端", "client": "客户端", "server": "服务端", "skip": "跳过"}
+
+# 运行环境判定出来的发送目标 → 提示里的说明文字（unknown / none 也要讲清楚）
+_TARGET_ENV_LABELS = {
+    "both": "双端（服务端 mods 与 client_files/mods 各一份）",
+    "client": "仅客户端（只发 client_files/mods）",
+    "server": "仅服务端（只发服务端 mods）",
+    "none": "两侧都不必装（不发送）",
+    "unknown": "未判定（不确定，请自行确认）",
+}
 # 默认排除的顶层文件夹（非分发内容，可在「规则…」中修改）
 DEFAULT_EXCLUDE = {"logs", "cache", "crash-reports", "backups"}
 
@@ -147,8 +181,10 @@ class RemoteFilePage(QWidget):
         self._overrides: dict[str, str] = {}  # 手动标注（持久化）：rel/文件夹前缀 → target
         self._auto_targets: dict[str, str] = {}  # 发送前环境检测自动纠正（持久化，可被覆盖）
         self._ignored: dict[str, bool] = {}   # 忽略列表（持久化）：rel/文件夹前缀 → True
-        self._env_results: dict[str, str] = {}   # 本次「分析模组环境」结果：文件名 → client/server/both/unknown
+        self._env_results: dict[str, str] = {}   # 本次「分析模组环境」结果：文件名 → 发送目标
         self._env_sources: dict[str, str] = {}   # 文件名 → 判断来源说明
+        self._env_summaries: dict[str, str] = {}  # 文件名 → 两侧状态摘要（客户端/服务端各自的要求）
+        self._version_results: dict[str, dict] = {}  # 文件名 → 版本检查结果（本地是否为旧版）
         self._build()
         self._load_config()
 
@@ -176,10 +212,14 @@ class RemoteFilePage(QWidget):
         self.btn_remove = QPushButton("移除选中")
         self.btn_browse_remote = QPushButton("浏览服务端文件仓库…")
         self.btn_analyze = QPushButton("分析模组环境…")
-        self.btn_analyze.setToolTip("分析差异审核列表中本地 mods 下的各模组运行环境\n"
-                                    "（客户端 / 服务端 / 双端；依据 jar 元数据与 MC 百科标注，"
-                                    "未标注的标为「未知」留给用户自行判断）\n"
-                                    "结果显示在「分析结果」列，确认后点「全部应用」生效")
+        self.btn_analyze.setToolTip("分析差异审核列表中本地 mods 下的各模组：\n"
+                                    "· 运行环境（客户端需装 / 可选 / 无需，两侧各自独立；"
+                                    "依据 jar 元数据与 MC 百科标注）\n"
+                                    "· 最新版本（到 Modrinth / CurseForge 查最新版，"
+                                    "标出「已是最新 / 有新版本」，避免更新时删错模组；\n"
+                                    "  可在「服务器设置」页关闭联网版本检查）\n"
+                                    "结果显示在「分析结果」「最新版本」列，"
+                                    "确认后点「全部应用」生效（版本检查只作提示，不影响发送目标）")
         self.btn_tidy_mods = QPushButton("服务端模组归类…")
         self.btn_tidy_mods.setToolTip(
             "体检服务端 mods 目录：列出该目录下所有 .jar 模组，逐个分析运行环境\n"
@@ -236,9 +276,9 @@ class RemoteFilePage(QWidget):
         rv.addLayout(toolbar)
 
         self.review_tree = SelectTreeWidget()
-        self.review_tree.setColumnCount(7)
+        self.review_tree.setColumnCount(8)
         self.review_tree.setHeaderLabels(
-            ["文件 / 文件夹", "状态", "目标", "大小", "类型", "时间", "分析结果"])
+            ["文件 / 文件夹", "状态", "目标", "大小", "类型", "时间", "分析结果", "最新版本"])
         self.review_tree.setRootIsDecorated(True)  # 保留展开三角标注
         self.review_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.review_tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -246,7 +286,7 @@ class RemoteFilePage(QWidget):
         rh = self.review_tree.header()
         rh.setSectionsMovable(True)
         rh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in (1, 2, 3, 4, 5, 6):
+        for col in (1, 2, 3, 4, 5, 6, 7):
             rh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.review_tree.setMinimumHeight(260)
         self.review_tree.itemChanged.connect(self._on_item_changed)
@@ -316,6 +356,8 @@ class RemoteFilePage(QWidget):
         self._server_dirs_ok = False
         self._env_results.clear()  # 分析结果针对当前审核列表，切换后作废
         self._env_sources.clear()
+        self._env_summaries.clear()
+        self._version_results.clear()
         self.btn_apply_env.hide()
         self.btn_cancel_env.hide()
         self.btn_analyze.show()
@@ -887,7 +929,7 @@ class RemoteFilePage(QWidget):
         self.review_tree.blockSignals(True)
         self.review_tree.clear()
         root_name = os.path.basename(self.config.local_mc_dir.rstrip("/\\")) or "客户端根目录"
-        root_item = QTreeWidgetItem([root_name, "", "", "", "", "", ""])
+        root_item = QTreeWidgetItem([root_name, "", "", "", "", "", "", ""])
         root_item.setData(0, Qt.UserRole, {"rel": "", "kind": "dir"})
         root_item.setExpanded(True)
         self.review_tree.addTopLevelItem(root_item)
@@ -907,7 +949,7 @@ class RemoteFilePage(QWidget):
                 child_rel = f"{parent_rel}/{part}" if parent_rel else part
                 node = nodes.get(child_rel)
                 if node is None:
-                    node = QTreeWidgetItem([part, "", "", "", "", "", ""])
+                    node = QTreeWidgetItem([part, "", "", "", "", "", "", ""])
                     node.setData(0, Qt.UserRole, {"rel": child_rel, "kind": "dir"})
                     parent_item.addChild(node)
                     nodes[child_rel] = node
@@ -920,15 +962,16 @@ class RemoteFilePage(QWidget):
                           if r.get("mtime") else "—")
             env_text, env_tip = self._env_cell(r["rel"])
             ignored = bool(r.get("ignored"))
-            status_text = "已忽略" if ignored else STATUS_LABELS.get(r["status"], r["status"])
+            status_label = "已忽略" if ignored else STATUS_LABELS.get(r["status"], r["status"])
             node = QTreeWidgetItem([
                 fname,
-                status_text,
+                status_label,
                 TARGET_LABELS.get(r["target"], r["target"]),
                 fmt_size(size) if size else "—",
                 ftype,
                 mtime_text,
                 env_text,
+                "",
             ])
             node.setData(0, Qt.UserRole, {
                 "rel": r["rel"], "kind": "file", "status": r["status"],
@@ -936,6 +979,7 @@ class RemoteFilePage(QWidget):
                 "size": r.get("size", 0), "mtime": r.get("mtime", 0), "ftype": ftype})
             node.setToolTip(2, self._target_tooltip(r))  # 目标判断依据（手动标注）
             node.setToolTip(6, env_tip)  # 分析结果列：判断依据/未检测到提示
+            self._paint_version(node, r["rel"])  # 最新版本列（文本 / 提示 / 配色）
             if r.get("old_rel"):
                 node.setToolTip(1, f"原名：{r['old_rel']}")
             if ignored:
@@ -1036,20 +1080,40 @@ class RemoteFilePage(QWidget):
                 f"（不在服务端凭空建目录；要同时发到服务端请右键改为「双端」）")
 
     def _env_cell(self, rel: str) -> tuple[str, str]:
-        """「分析结果」列单元格：(文本, tooltip)。未分析/非模组 → ("", "")。"""
-        env_labels = {"client": "客户端", "server": "服务端",
-                      "both": "双端", "unknown": "未知（未检测到）"}
-        env = self._env_results.get(rel.rsplit("/", 1)[-1].lower())
-        if not env:
+        """「分析结果」列单元格：(文本, tooltip)。未分析/非模组 → ("", "")。
+
+        文本给出「两侧各自的要求」（客户端需装/可选/无需/未判定 ｜ 服务端…），
+        因为「运行环境」是模组固有属性、两侧独立，只报一个总结果会丢掉
+        「客户端可选 + 服务端需装」这类信息。
+        """
+        key = rel.rsplit("/", 1)[-1].lower()
+        summary = self._env_summaries.get(key)
+        if not summary:
             return "", ""
-        text = env_labels.get(env, env)
-        if env == "unknown":
-            return text, "jar 元数据与 MC 百科均未标注运行环境，请自行判断"
-        src = self._env_sources.get(rel.rsplit("/", 1)[-1].lower(), "")
-        return text, f"本次分析：{src}" if src else text
+        src = self._env_sources.get(key, "")
+        target = self._env_results.get(key, "")
+        tip = f"运行环境\n{summary}\n按当前设置发送到：{_TARGET_ENV_LABELS.get(target, target)}"
+        if src:
+            tip += f"\n判断依据：{src}"
+        return summary, tip
+
+    def _paint_version(self, item: QTreeWidgetItem, rel: str) -> None:
+        """把版本检查结果写进「最新版本」列：文本 + 悬停说明 + 状态配色。
+
+        版本检查只是提示（帮用户在更新时确认哪个文件才是旧版），不参与发送目标判定，
+        所以这里不碰「目标」「状态」列。
+        """
+        info = self._version_results.get(rel.rsplit("/", 1)[-1].lower())
+        if not info:
+            return
+        item.setText(7, status_text(info))
+        item.setToolTip(7, tooltip_text(info))
+        color = _VERSION_COLORS.get(info.get("status", VER_UNKNOWN))
+        if color:
+            item.setForeground(7, QBrush(QColor(color)))
 
     def _update_env_column(self):
-        """仅刷新「分析结果」列，不重建树（保持展开/滚动状态）。"""
+        """仅刷新「分析结果」「最新版本」列，不重建树（保持展开/滚动状态）。"""
         root = self.review_tree.topLevelItem(0)
         if root is None:
             return
@@ -1058,9 +1122,13 @@ class RemoteFilePage(QWidget):
             item = stack.pop()
             d = item.data(0, Qt.UserRole) or {}
             if d.get("kind") == "file":
-                env_text, env_tip = self._env_cell(d.get("rel", ""))
+                rel = d.get("rel", "")
+                env_text, env_tip = self._env_cell(rel)
                 item.setText(6, env_text)
                 item.setToolTip(6, env_tip)
+                item.setText(7, "")
+                item.setToolTip(7, "")
+                self._paint_version(item, rel)
             for i in range(item.childCount()):
                 stack.append(item.child(i))
 
@@ -1544,32 +1612,82 @@ class RemoteFilePage(QWidget):
         self.lbl_status.setText(fmt_progress(current, total, message, "分析模组环境"))
 
     def _analyze_env_worker(self, files, progress_cb=None) -> str:
-        """分析给定 jar 列表：先读 jar 元数据，判不出的再（可选）查 MC 百科。"""
+        """分析给定 jar 列表：读 jar 元数据判运行环境 + （可选）查发布渠道最新版本。
+
+        运行环境判不出的（Forge / NeoForge 等）再查 MC 百科；
+        最新版本按设置页开关决定是否联网查 Modrinth / CurseForge。
+        """
         results = []
+        version_items = []
         total = len(files)
         for i, path in enumerate(files):
             fname = os.path.basename(path)
-            env, source = jar_environment(path)
-            results.append({"file": fname, "name": mod_display_name(path, fname),
-                            "env": env, "source": source})
+            c_state, s_state, source = jar_environment(path)
+            local_version, loader = jar_meta(path)
+            item = {"file": fname, "name": mod_display_name(path, fname),
+                    "local_ver": local_version, "loader": loader}
+            item.update(self._env_fields(c_state, s_state, source))
+            results.append(item)
+            version_items.append({"key": fname.lower(), "name": item["name"],
+                                  "version": local_version, "loader": loader})
             if progress_cb:
                 progress_cb(i + 1, total, f"正在分析 {fname}…")
         self._enrich_env(results)
+        self._enrich_versions(results, version_items, progress_cb, total)
         return json.dumps(results, ensure_ascii=False)
 
+    def _enrich_versions(self, results: list[dict], items: list[dict],
+                         progress_cb=None, total: int = 0) -> None:
+        """查发布渠道最新版本，判断本地是否为旧版（原地写 results 的 ver 字段）。
+
+        走 mod_version.check_versions：条数上限 + 整体超时 + 连续失败提前放弃，
+        断网时不会卡住界面。开关关掉时直接不查。
+        """
+        if not self.config.env_version_check or not items:
+            return
+        if progress_cb:
+            progress_cb(total, total, "正在查询模组最新版本…")
+        got = check_versions(items, enabled=True)
+        hit = outdated = 0
+        for r in results:
+            info = got.get(r["file"].lower())
+            if not info:
+                continue
+            r["ver"] = info
+            if info.get("status") == VER_OUTDATED:
+                outdated += 1
+            elif info.get("status") != VER_UNKNOWN:
+                hit += 1
+        log.info("模组版本检查：共 %d 个（已是最新/本地更新 %d，有新版本 %d，未查到 %d）",
+                 len(items), hit, outdated, len(items) - hit - outdated)
+
+    def _env_switches(self) -> dict:
+        """两个「可选也发」开关（设置页配置），供 env_target() 使用。"""
+        return {"client_optional": self.config.env_client_optional,
+                "server_optional": self.config.env_server_optional}
+
+    def _env_fields(self, c_state: str, s_state: str, source: str) -> dict:
+        """由两侧状态 + 开关算出结果项里的环境字段（env 为发送目标）。"""
+        return {"c": c_state, "s": s_state, "source": source,
+                "env": env_target(c_state, s_state, **self._env_switches())}
+
     def _enrich_env(self, results: list[dict]) -> None:
-        """对本地判不出的模组批量查 MC 百科补齐 env/source（原地修改 results）。
+        """对本地判不出的模组批量查 MC 百科补齐两侧状态（原地修改 results）。
 
         走 enrich_online：有整体超时与条数上限，断网时提前放弃，不会卡住界面。
         """
-        todo = [r["name"] for r in results if r.get("env") == "unknown" and r.get("name")]
+        todo = [r["name"] for r in results
+                if r.get("c") == SIDE_UNKNOWN and r.get("s") == SIDE_UNKNOWN and r.get("name")]
         if not todo:
             return
         got = enrich_online(todo, enabled=self.config.env_online)
+        switches = self._env_switches()
         for r in results:
             hit = got.get(r.get("name"))
-            if hit and hit[0] != "unknown":
-                r["env"], r["source"] = hit
+            if not hit or (hit[0] == SIDE_UNKNOWN and hit[1] == SIDE_UNKNOWN):
+                continue  # 百科也没标注 → 保持未判定
+            r["c"], r["s"], r["source"] = hit
+            r["env"] = env_target(hit[0], hit[1], **switches)
 
     def _on_analyze_done(self, ok: bool, msg: str):
         self.btn_analyze.setEnabled(True)
@@ -1584,34 +1702,41 @@ class RemoteFilePage(QWidget):
         # 保存本次分析结果，显示到「分析结果」列（不影响目标列，点「全部应用」才写入标注）
         self._env_results = {r["file"].lower(): r["env"] for r in results}
         self._env_sources = {r["file"].lower(): r["source"] for r in results}
+        self._env_summaries = {r["file"].lower(): side_summary(r["c"], r["s"])
+                               for r in results}
+        self._version_results = {r["file"].lower(): r["ver"] for r in results if r.get("ver")}
         self._update_env_column()
         # 按钮切换为「全部应用 / 取消」，由用户确认是否采纳本次分析结果
         self.btn_analyze.hide()
         self.btn_apply_env.show()
         self.btn_cancel_env.show()
-        unknown = sum(1 for r in results if r.get("env") == "unknown")
-        known = len(results) - unknown
+        unsure = sum(1 for r in results if r.get("env") == "unknown")
+        known = len(results) - unsure
+        outdated = sum(1 for info in self._version_results.values()
+                       if info.get("status") == VER_OUTDATED)
+        ver_note = (f"；版本检查：{len(self._version_results)} 个查到"
+                    + (f"，其中 {outdated} 个有新版本（见「最新版本」列）" if outdated else "")
+                    if self._version_results else "；版本检查已关闭")
         self.lbl_status.setText(
-            f"分析完成：{known} 个已判定、{unknown} 个未标注（在「分析结果」列标出，请自行判断）。"
-            "确认后点击「全部应用」，或点「取消」放弃。")
+            f"分析完成：{known} 个已判定、{unsure} 个未标注（在「分析结果」列标出，"
+            f"请自行判断）{ver_note}。确认后点击「全部应用」，或点「取消」放弃。")
 
     def _apply_env_results(self):
         """全部应用本次分析结果：写入持久化手动标注（右键「恢复自动标注」可撤销）。
 
         分析结果列保留显示，便于区分「真双端」与「未检测到」。
         """
-        env_target = {"client": "client", "server": "server", "both": "both"}
         applied = 0
         for r in self._rows:
             rel = r["rel"]
             if rel.split("/", 1)[0] != "mods" or not rel.rsplit("/", 1)[-1].lower().endswith(".jar"):
                 continue
-            env = self._env_results.get(rel.rsplit("/", 1)[-1].lower())
-            if env not in env_target:
-                continue
+            want = self._env_results.get(rel.rsplit("/", 1)[-1].lower())
+            if want not in ("client", "server", "both"):
+                continue  # 未判定 / 两侧都不必装的，不写入标注
             if self._override_target_of(rel):
                 continue  # 已有手动标注不覆盖
-            self._overrides[rel] = env_target[env]
+            self._overrides[rel] = want
             applied += 1
         self.config.target_overrides = dict(self._overrides)
         # 标注写入后重算目标列（分析结果列保留显示）
@@ -1627,9 +1752,11 @@ class RemoteFilePage(QWidget):
             f"已应用 {applied} 个模组的运行环境标注（右键可恢复自动标注）✔")
 
     def _cancel_env_results(self):
-        """放弃本次分析结果：清空「分析结果」列，恢复原目标。"""
+        """放弃本次分析结果：清空「分析结果」「最新版本」列，恢复原目标。"""
         self._env_results.clear()
         self._env_sources.clear()
+        self._env_summaries.clear()
+        self._version_results.clear()
         self._update_env_column()
         self.btn_apply_env.hide()
         self.btn_cancel_env.hide()
@@ -1722,10 +1849,11 @@ class RemoteFilePage(QWidget):
                         except Exception as exc:
                             log.warning("下载服务端模组失败 %s: %s", rel, exc)
                             continue
-                    env, source = jar_environment(path)
-                    metas.append({"rel": rel, "env": env, "source": source,
-                                  "origin": origin,
-                                  "name": mod_display_name(path, fname)})
+                    c_state, s_state, source = jar_environment(path)
+                    meta = {"rel": rel, "source": source, "origin": origin,
+                            "name": mod_display_name(path, fname)}
+                    meta.update(self._env_fields(c_state, s_state, source))
+                    metas.append(meta)
                     if origin == "下载分析":
                         try:
                             os.remove(path)  # 元数据已读出，临时文件不再需要
@@ -1736,7 +1864,7 @@ class RemoteFilePage(QWidget):
                 self._enrich_env(metas)
 
                 # ④ 汇总：只挑「仅客户端」，并标明客户端目录里是否已有同名文件
-                counts = {"client": 0, "server": 0, "both": 0, "unknown": 0}
+                counts: dict[str, int] = {}
                 for m in metas:
                     counts[m["env"]] = counts.get(m["env"], 0) + 1
                 existing = set(sftp.list_files_recursive(dst_dir)) if sftp.is_dir(dst_dir) else set()
@@ -1770,7 +1898,8 @@ class RemoteFilePage(QWidget):
         summary = (f"服务端 mods 共 {data.get('total', 0)} 个模组，已分析 "
                    f"{data.get('scanned', 0)} 个：仅客户端 {c.get('client', 0)} 个、"
                    f"服务端 {c.get('server', 0)} 个、双端 {c.get('both', 0)} 个、"
-                   f"未标注 {c.get('unknown', 0)} 个。")
+                   f"两侧都不必装 {c.get('none', 0)} 个、"
+                   f"未判定 {c.get('unknown', 0)} 个。")
         items = data.get("client") or []
         if not items:
             self.lbl_status.setText(summary + "没有需要搬移的客户端模组。")
@@ -1887,7 +2016,7 @@ class RemoteFilePage(QWidget):
 
         先用本地 jar 元数据判定；元数据判不出的（Forge / NeoForge 等）再查 MC 百科
         （走 enrich_online，有整体超时，断网时不会卡住发送）。
-        返回 JSON：[{"rel", "env": client|server|both|unknown, "source"}]
+        返回 JSON：[{"rel", "c", "s", "env", "source"}]，env 为按开关算出的发送目标。
         """
         root = self.config.local_mc_dir
         total = len(rels)
@@ -1898,13 +2027,14 @@ class RemoteFilePage(QWidget):
             if progress_cb:
                 progress_cb(i, total, f"检测 {fname}")
             try:
-                env, source = jar_environment(path)
+                c_state, s_state, source = jar_environment(path)
             except Exception as exc:
-                env, source = "unknown", f"读取失败：{exc}"
-            results.append({"rel": rel, "env": env, "source": source,
-                            "name": mod_display_name(path, fname)})
+                c_state, s_state, source = SIDE_UNKNOWN, SIDE_UNKNOWN, f"读取失败：{exc}"
+            item = {"rel": rel, "name": mod_display_name(path, fname)}
+            item.update(self._env_fields(c_state, s_state, source))
+            results.append(item)
 
-        if any(r["env"] == "unknown" for r in results):
+        if any(r["c"] == SIDE_UNKNOWN and r["s"] == SIDE_UNKNOWN for r in results):
             if progress_cb:
                 progress_cb(total, total, "正在结合 MC 百科标注…")
             self._enrich_env(results)
@@ -1912,11 +2042,12 @@ class RemoteFilePage(QWidget):
         counts: dict[str, int] = {}
         for r in results:
             counts[r["env"]] = counts.get(r["env"], 0) + 1
-        log.info("上传前模组环境检测：共 %d 个（客户端 %d / 服务端 %d / 双端 %d / 未判定 %d）",
+        log.info("上传前模组环境检测：共 %d 个（仅客户端 %d / 仅服务端 %d / 双端 %d / "
+                 "两侧都不必装 %d / 未判定 %d）",
                  total, counts.get("client", 0), counts.get("server", 0),
-                 counts.get("both", 0), counts.get("unknown", 0))
-        return json.dumps([{k: r[k] for k in ("rel", "env", "source")} for r in results],
-                          ensure_ascii=False)
+                 counts.get("both", 0), counts.get("none", 0), counts.get("unknown", 0))
+        return json.dumps([{k: r[k] for k in ("rel", "c", "s", "env", "source")}
+                           for r in results], ensure_ascii=False)
 
     def _apply_env_corrections(self, results: list[dict]) -> tuple[list[dict], list[dict]]:
         """按运行环境结果纠正模组目标，返回 (changes, unsure)。
@@ -1925,10 +2056,10 @@ class RemoteFilePage(QWidget):
           「仅服务端」→ 只发服务端），右键「恢复自动标注」可撤销；
           记录与手动标注分开存，下次检测仍可覆盖（不会把自动结果锁成手动标注）；
         - 已手动标注但与环境不符：不自动改，仅在返回里标出提醒（manual=True）；
-        - unsure：运行环境没判定出来、却会被发到服务端 mods 的模组——正是「客户端模组
-          可能被误传到服务端」的风险点，必须让用户在确认框里看到，不能静默放过。
+        - unsure：运行环境没判定出来（或两侧都不必装）、却会被发到服务端 mods 的模组——
+          正是「客户端模组可能被误传到服务端」的风险点，必须让用户在确认框里看到，
+          不能静默放过。
         """
-        want_of = {"client": "client", "server": "server", "both": "both"}
         by_rel = {r["rel"]: r for r in results}
         changes: list[dict] = []
         unsure: list[dict] = []
@@ -1939,24 +2070,25 @@ class RemoteFilePage(QWidget):
             fname = row["rel"].rsplit("/", 1)[-1].lower()
             self._env_results[fname] = info["env"]
             self._env_sources[fname] = info["source"]
+            self._env_summaries[fname] = side_summary(info["c"], info["s"])
+            want = info["env"]
             if row.get("manual"):
-                want = want_of.get(info["env"])
-                if want and want != row.get("target"):
+                if want in ("client", "server", "both") and want != row.get("target"):
                     changes.append({"rel": row["rel"], "old": row.get("target", "both"),
-                                    "new": want, "env": info["env"],
+                                    "new": want, "summary": side_summary(info["c"], info["s"]),
                                     "source": info["source"], "manual": True})
                 continue
-            want = want_of.get(info["env"])
-            if want is None:
-                # 未判定：只有「即将发到服务端 mods」才有风险，需要提醒用户确认
+            if want not in ("client", "server", "both"):
+                # 未判定 / 两侧都不必装：只有「即将发到服务端 mods」才有风险，需用户确认
                 if row.get("target") in ("both", "server"):
                     unsure.append({"rel": row["rel"], "target": row.get("target", "both"),
+                                   "summary": side_summary(info["c"], info["s"]),
                                    "source": info["source"]})
                 continue
             if want == row.get("target"):
                 continue
             changes.append({"rel": row["rel"], "old": row.get("target", "both"),
-                            "new": want, "env": info["env"],
+                            "new": want, "summary": side_summary(info["c"], info["s"]),
                             "source": info["source"], "manual": False})
             self._auto_targets[row["rel"]] = want
         if any(not c["manual"] for c in changes):
@@ -2028,20 +2160,20 @@ class RemoteFilePage(QWidget):
             head += (f"注意：{len(conflicts)} 个模组有手动标注，与运行环境不符，"
                      f"未自动修改（按手动标注发送）：\n\n")
         if unsure:
-            head += (f"注意：{len(unsure)} 个模组没能判定运行环境（元数据未标注、"
+            head += (f"注意：{len(unsure)} 个模组的运行环境没能判定（元数据未标注、"
                      f"MC 百科也查不到），当前目标会让它们进服务端 mods。\n"
                      f"如果其中有「仅客户端」的模组，请点「取消上传」，"
                      f"在列表里右键改成「仅客户端」后再发：\n\n")
         text = f"{head}即将把勾选的操作发送到服务器：\n\n" + "\n".join(lines) + "\n\n是否继续？"
         items = [
-            f"{c['rel']}　{TARGET_LABELS.get(c['old'], c['old'])} → "
-            f"{TARGET_LABELS.get(c['new'], c['new'])}　（{c['source']}）"
+            f"{c['rel']}　{c['summary']}　→ {TARGET_LABELS.get(c['new'], c['new'])}"
+            f"（原：{TARGET_LABELS.get(c['old'], c['old'])}；{c['source']}）"
             + ("　[手动标注，未改动]" if c["manual"] else "")
             for c in (corrected + conflicts)
         ]
         items += [
-            f"{u['rel']}　按「{TARGET_LABELS.get(u['target'], u['target'])}」发送"
-            f"　（未判定：{u['source']}）"
+            f"{u['rel']}　{u['summary']}　按「{TARGET_LABELS.get(u['target'], u['target'])}」发送"
+            f"（未判定：{u['source']}）"
             for u in unsure
         ]
         if items:

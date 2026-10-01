@@ -308,6 +308,40 @@ class ServerConfig:
         self.remote = {**self.remote, "env_online": bool(value)}
 
     @property
+    def env_client_optional(self) -> bool:
+        """「客户端侧可选」的模组是否也发给客户端（按「需装」处理）。
+
+        例：百科标注「客户端可选, 服务端需装」——默认只发服务端（玩家客户端拿不到，
+        各客户端内容可能不一致）；打开后按双端处理，客户端那份也发出去。
+        """
+        return bool(self.remote.get("env_client_optional", False))
+
+    @env_client_optional.setter
+    def env_client_optional(self, value) -> None:
+        self.remote = {**self.remote, "env_client_optional": bool(value)}
+
+    @property
+    def env_server_optional(self) -> bool:
+        """「服务端侧可选」的模组是否也发到服务端（按「需装」处理）。"""
+        return bool(self.remote.get("env_server_optional", False))
+
+    @env_server_optional.setter
+    def env_server_optional(self, value) -> None:
+        self.remote = {**self.remote, "env_server_optional": bool(value)}
+
+    @property
+    def env_version_check(self) -> bool:
+        """分析模组时是否顺带查发布渠道的最新版本（Modrinth / CurseForge）。
+
+        用于更新模组时确认「这个文件是不是旧版」，避免差异审核里删错模组。
+        """
+        return bool(self.remote.get("env_version_check", True))
+
+    @env_version_check.setter
+    def env_version_check(self, value) -> None:
+        self.remote = {**self.remote, "env_version_check": bool(value)}
+
+    @property
     def push_settings(self) -> dict:
         """随发布待办下发的客户端软件默认设置（每台服务器独立）。"""
         return dict(self.remote.get("push_settings", {}))

@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
-"""服务端 - 发布待办页：检测服务端改动（新增/替换/删除），选择是否发布到客户端。
+"""服务端 - 发布待办页：检测客户端文件目录（client_files）的改动，选择是否发布到客户端。
 
-- 服务端改动树即任务清单：全部默认启用（发布），右键可禁用（变灰）/重新启用/批注。
-- 每次打开本页自动检测一遍服务端改动（带统一进度格式）。
+**本页只管一件事：要发什么给客户端。** 来源只有 client_files ——
+它是「待下发给客户端的文件」的存放/下载区（服主新做的客户端模组、资源包、配置等
+不能塞进服务端 mods，否则服务端会加载到客户端模组而炸，所以放这儿让客户端来下）。
+服务端 mods 是服务端自己加载模组的目录，与「发不发客户端」无关，本页不读它。
+
+- 改动树即任务清单：全部默认启用（发布），右键可禁用（变灰）/重新启用/批注。
+- 每次打开本页自动检测一遍改动（带统一进度格式）。
 - 发布时只把「启用」的改动写入清单；禁用项保持原基线，下次仍会检测出来。
 """
 import fnmatch
@@ -63,6 +68,23 @@ _STATUS_ORDER = {"new": 0, "update": 1, "rename": 2, "deleted": 3, "obsolete": 4
 
 # 末尾版本段：-1.0 / -1.20.1 / _2.0 / .1.0 等（不含连字符连接的更多段）
 _VERSION_SEG = re.compile(r"[-_.](v?\d[\d.]*)$")
+
+
+def client_files_from_repo_snapshot(server_id: str) -> dict[str, dict]:
+    """从「服务端文件仓库」快照里取出客户端文件目录的内容 → {rel: {"size", "hash"}}。
+
+    「更新服务端」页每次扫描服务端目录时，都会把客户端文件目录以 client_files/
+    前缀并入快照并回填远程哈希，所以这份快照就是 client_files 的现成读数：
+    刚上传完切到「发布待办」就能直接拿来算改动，不必再远程全量扫一遍。
+    快照不存在 / 里面没有 client_files 条目时返回空字典（调用方回退为远程扫描）。
+    """
+    prefix = "client_files/"
+    out: dict[str, dict] = {}
+    snap_files = normalize_files(load_snapshot(server_id, "repo").get("files", {}))
+    for key, meta in snap_files.items():
+        if key.startswith(prefix) and len(key) > len(prefix):
+            out[key[len(prefix):]] = meta
+    return out
 
 
 def _mod_group_key(filename: str) -> str:
@@ -150,7 +172,6 @@ class TodoPage(QWidget):
         self._auto_mode = False
         self._last_auto_detect = 0.0
         self._rows: list[dict] = []
-        self._server_mods: list[str] = []  # 服务端 mods 下的模组（只读展示，不下发）
         self._state = _load_todo_state(self.config.current_id())
         self._shared_tasks: list[dict] = []  # 共享文件下载任务 [{rel, target, category}]
         self._build()
@@ -201,11 +222,10 @@ class TodoPage(QWidget):
         shared_row.addWidget(self.list_shared_tasks, 1)
         layout.addLayout(shared_row)
 
-        # 服务端改动检测：改动树即任务清单，全部默认发布，右键可禁用/批注
+        # 客户端分发检测：改动树即任务清单，全部默认发布，右键可禁用/批注
         detect_box = QGroupBox(
-            "发布给客户端的内容（分两组：① 来自 client_files，会下发给客户端；"
-            "② 服务端独有，不下发。全部默认发布，右键可禁用 / 批注，"
-            "Ctrl/Shift 多选、Ctrl+Shift+A 反选）")
+            "发布给客户端的内容（来自客户端文件目录 client_files，与上次发布基线对比；"
+            "全部默认发布，右键可禁用 / 批注，Ctrl/Shift 多选、Ctrl+Shift+A 反选）")
         dv = QVBoxLayout(detect_box)
         dv.setSpacing(6)
 
@@ -259,8 +279,10 @@ class TodoPage(QWidget):
         self.lbl_status.setWordWrap(True)
         pub_row.addWidget(self.lbl_status, 1)
         self.btn_ignore = QPushButton("本次不发布（全部禁用）")
-        self.btn_ignore.setToolTip("把当前检测到的改动全部标记为「本次不发布」（变灰，不上传也不下发）\n"
-                                   "已禁用的改动可随时通过「恢复已禁用项」恢复")
+        self.btn_ignore.setToolTip(
+            "把当前检测到的改动全部标记为「本次不发布」（不上传也不下发）。\n"
+            "这些文件随后**不再参与检测**：下次检测既不比对也不计算远程哈希，\n"
+            "检测更快。可随时通过「恢复已禁用项」把它们放回检测范围。")
         self.btn_ignore.clicked.connect(self._ignore_all)
         self.btn_republish = QPushButton("恢复已禁用项")
         self.btn_republish.setToolTip("把已禁用的改动恢复为可发布（下次发布会一起下发给客户端）")
@@ -303,7 +325,9 @@ class TodoPage(QWidget):
         if not force and now - self._last_auto_detect < 5:
             return
         self._last_auto_detect = now
-        self._detect_changes(auto=True)
+        # 自动检测优先复用「更新服务端」页留下的快照（秒出，不远程重扫）；
+        # 手动点「重新检测」才做权威的远程全量扫描。
+        self._detect_changes(auto=True, from_snapshot=True)
 
     # ---------- 服务端改动检测 ----------
     def _refresh_pub_snap(self):
@@ -323,7 +347,7 @@ class TodoPage(QWidget):
         else:
             self._refresh_pub_snap()
 
-    def _detect_changes(self, auto: bool = False):
+    def _detect_changes(self, auto: bool = False, from_snapshot: bool = False):
         if self._detecting:
             return
         if not self.config.host():
@@ -335,17 +359,17 @@ class TodoPage(QWidget):
         self._auto_mode = auto
         self._detecting = True
         self.btn_detect.setEnabled(False)
-        self.lbl_status.setText("正在检测服务端改动…")
-        worker = Worker(self._detect_worker)
+        self.lbl_status.setText("正在检测客户端文件目录的改动…")
+        worker = Worker(self._detect_worker, from_snapshot)
         worker.progress.connect(self._on_detect_progress)
         worker.done.connect(self._on_detect_done)
         self._worker = worker
         worker.start()
 
     def _on_detect_progress(self, current, total, message):
-        self.lbl_status.setText(fmt_progress(current, total, message, "检测服务端改动"))
+        self.lbl_status.setText(fmt_progress(current, total, message, "检测客户端改动"))
 
-    def _detect_worker(self, progress_cb=None) -> str:
+    def _detect_worker(self, from_snapshot: bool = False, progress_cb=None) -> str:
         """当前客户端文件夹（client_files） vs 上次发布基线，返回 JSON 行列表。
 
         每行：{"rel", "status": new|update|rename|deleted|obsolete, "size", "old_rel"?}
@@ -354,44 +378,74 @@ class TodoPage(QWidget):
         - 大小不同，或大小相同但哈希不同 → 替换；
         - 当前新增与基线已移除的文件内容相同（大小 + 哈希一致）→ 改名；
         - 基线有、当前无且未配对 → 删除。
+
+        两处提速：
+        - from_snapshot=True：直接用「更新服务端」页扫描留下的本地快照（里面已含
+          client_files 的文件+大小+哈希），不远程重扫——刚上传完切过来就能秒出结果；
+          快照不可用时自动回退为远程扫描。
+        - 已标记「本次不发布」的文件不参与检测：不比对、不算远程哈希，也不会被当成删除。
         """
 
         def on_scan(dirs: int, entries: int):
             if progress_cb:
                 progress_cb(dirs, 0,
-                            f"正在读取服务端文件仓库…（已读 {dirs} 个目录 / {entries} 个条目）")
+                            f"正在读取客户端文件目录…（已读 {dirs} 个目录 / {entries} 个条目）")
 
-        with SFTPManager(self.config.host(), self.config.port(),
-                         self.config.username(), self.config.password()) as sftp:
-            # client_files 目录树较小：串行扫描，复用当前连接，不额外开连接
-            current = dict(sftp.list_files_recursive_with_size(
-                self.config.files_dir, max_workers=1,
-                progress_cb=on_scan))
-            base = normalize_files(
-                load_snapshot(self.config.current_id(), "publish").get("files", {}))
-            # 需要计算当前文件哈希（快速哈希：SFTP 远程计算，不下载内容）：
-            #  1) 当前新增（基线无）→ 与「服务端已移除」配对判断改名；
-            #  2) 基线存在、大小相同 → 总是远程计算当前哈希确认内容是否一致
-            #     （即使基线已存哈希也重新确认：服务端文件被替换但大小不变时同样能检出）。
-            #     （大小不同 → 直接判定替换，无需哈希，最快。）
-            cache = _load_hash_cache(self.config.current_id())
-            need_hash = []
-            for rel, rsize in current.items():
-                bmeta = base.get(rel)
-                if bmeta is None or bmeta["size"] == rsize:
-                    need_hash.append(rel)
-            cur_hash: dict[str, str] = {}
+        # 「本次不发布」的路径：用户已决定这批不发，检测时彻底跳过（省掉远程哈希）。
+        disabled = set(self._state.get("disabled") or ())
+        base = normalize_files(
+            load_snapshot(self.config.current_id(), "publish").get("files", {}))
+        cache = _load_hash_cache(self.config.current_id())
 
-            def on_hash_progress(done: int, count: int, key: str):
-                if progress_cb:
-                    progress_cb(done, count, f"计算哈希 {key}")
+        current: dict[str, int] = {}
+        cur_hash: dict[str, str] = {}
+        snap_used = False
+        if from_snapshot:
+            snap_files = client_files_from_repo_snapshot(self.config.current_id())
+            if snap_files:
+                # 快照里带的哈希是「更新服务端」页远程算好的，直接复用
+                current = {rel: m["size"] for rel, m in snap_files.items()}
+                cur_hash = {rel: m["hash"] for rel, m in snap_files.items() if m.get("hash")}
+                snap_used = True
+                log.info("发布待办检测：复用服务端扫描快照（client_files %d 个文件），"
+                         "本次不远程重扫", len(current))
 
-            tasks = [(rel, TodoManifest.remote_source_path(
-                sftp, self.config.files_dir, rel)) for rel in need_hash]
-            cur_hash = hash_remote_parallel(
-                sftp, self.config.host(), self.config.port(),
-                self.config.username(), self.config.password(),
-                tasks, on_hash_progress)
+        if not snap_used:
+            with SFTPManager(self.config.host(), self.config.port(),
+                             self.config.username(), self.config.password()) as sftp:
+                # client_files 目录树较小：串行扫描，复用当前连接，不额外开连接
+                current = dict(sftp.list_files_recursive_with_size(
+                    self.config.files_dir, max_workers=1,
+                    progress_cb=on_scan))
+                # 需要计算当前文件哈希（快速哈希：SFTP 远程计算，不下载内容）：
+                #  1) 当前新增（基线无）→ 与「服务端已移除」配对判断改名；
+                #  2) 基线存在、大小相同 → 总是远程计算当前哈希确认内容是否一致
+                #     （即使基线已存哈希也重新确认：服务端文件被替换但大小不变时同样能检出）。
+                #     （大小不同 → 直接判定替换，无需哈希，最快。）
+                need_hash = []
+                for rel, rsize in current.items():
+                    bmeta = base.get(rel)
+                    if bmeta is None or bmeta["size"] == rsize:
+                        need_hash.append(rel)
+
+                def on_hash_progress(done: int, count: int, key: str):
+                    if progress_cb:
+                        progress_cb(done, count, f"计算哈希 {key}")
+
+                tasks = [(rel, TodoManifest.remote_source_path(
+                    sftp, self.config.files_dir, rel)) for rel in need_hash]
+                cur_hash = hash_remote_parallel(
+                    sftp, self.config.host(), self.config.port(),
+                    self.config.username(), self.config.password(),
+                    tasks, on_hash_progress)
+
+        # 「本次不发布」的路径彻底跳过：不比对、不算远程哈希，也不会被当成「已删除」。
+        disabled_present = {rel for rel in current if rel in disabled}
+        if disabled_present:
+            log.info("发布待办检测：跳过 %d 个「本次不发布」的文件", len(disabled_present))
+            current = {rel: sz for rel, sz in current.items() if rel not in disabled}
+
+        if not snap_used:
             # 更新哈希缓存：仅记录与基线一致（或无法确认但大小相同）的文件，
             # 供下次检测跳过重复下载；大小变化 / 已移除的文件从缓存剔除。
             new_cache = dict(cache)
@@ -409,17 +463,6 @@ class TodoPage(QWidget):
                 if rel not in current:
                     new_cache.pop(rel, None)
             _save_hash_cache(self.config.current_id(), new_cache)
-
-            # 顺带看一眼服务端自己的 mods 目录（只读展示，不参与发布）：
-            # 这些是服务端模组，不下发给客户端；若里面混进了客户端模组，
-            # 提示腐竹到「更新服务端」页用「服务端模组归类…」把它搬到 client_files/mods。
-            mods_dir = SFTPManager.join(self.config.server_root, "mods")
-            try:
-                server_mods = sorted(
-                    n for n in sftp.list_dir(mods_dir) if n.lower().endswith(".jar"))
-            except Exception as exc:
-                log.debug("读取服务端 mods 目录失败: %s", exc)
-                server_mods = []
 
         rows = []
         for rel in sorted(current):
@@ -445,7 +488,9 @@ class TodoPage(QWidget):
 
         # 服务端已移除（基线里有、当前没有）→ 客户端应删除；
         # 内容与当前新增文件相同（大小 + 哈希一致）→ 判定为改名。
-        deleted_rels = [rel for rel in sorted(base) if rel not in current]
+        # 「本次不发布」的文件已从 current 剔除，不能因此被当成「已删除」。
+        deleted_rels = [rel for rel in sorted(base)
+                        if rel not in current and rel not in disabled]
         matched = self._match_rename_pairs(rows, base, deleted_rels)
         final = []
         for r in rows:
@@ -480,7 +525,8 @@ class TodoPage(QWidget):
         for rel in sorted(obsolete_rels):
             rows.append({"rel": rel, "status": "obsolete", "size": current[rel]})
         return json.dumps(
-            {"rows": rows, "server_mods": server_mods,
+            {"rows": rows, "from_snapshot": snap_used,
+             "disabled_present": sorted(disabled_present),
              "files_dir": self.config.files_dir, "server_root": self.config.server_root},
             ensure_ascii=False)
 
@@ -515,7 +561,7 @@ class TodoPage(QWidget):
         if not ok:
             self.lbl_status.setText("检测失败 ✘")
             if not self._auto_mode:  # 自动检测失败只提示状态，不弹窗
-                winutil.error(self, "检测失败", f"无法读取服务端文件仓库：\n{msg}")
+                winutil.error(self, "检测失败", f"无法读取客户端文件目录：\n{msg}")
             if self.status_cb:
                 self.status_cb(False)
             return
@@ -526,13 +572,13 @@ class TodoPage(QWidget):
         if isinstance(data, list):  # 兼容旧格式
             data = {"rows": data}
         rows = data.get("rows") or []
-        server_mods = data.get("server_mods") or []
         self._rows = rows
-        self._server_mods = server_mods
-        self._build_changes_tree(rows, server_mods)
-        # 清理已不再出现的禁用项（保留批注）
-        current_rels = {r["rel"] for r in rows}
-        stale = self._state["disabled"] - current_rels
+        self._build_changes_tree(rows)
+        # 清理已不在客户端文件目录里的禁用项（保留批注）。
+        # 注意：禁用项不参与检测，所以不能用 rows 判断它们是否还存在，
+        # 要用检测时回传的「实际存在」清单。
+        still_present = set(data.get("disabled_present") or [])
+        stale = self._state["disabled"] - still_present
         if stale:
             self._state["disabled"] -= stale
             _save_todo_state(self.config.current_id(), self._state)
@@ -540,40 +586,46 @@ class TodoPage(QWidget):
         upd_n = sum(1 for r in rows if r["status"] == "update")
         rnm_n = sum(1 for r in rows if r["status"] == "rename")
         del_n = sum(1 for r in rows if r["status"] in ("deleted", "obsolete"))
+        skipped_n = len(self._state["disabled"])
+        skip_note = (f"　已跳过 {skipped_n} 个「本次不发布」的文件（不参与检测）"
+                     if skipped_n else "")
+        snap_note = ("　（基于上次服务端扫描的快照秒出；"
+                     "点「重新检测」可强制远程重扫）" if data.get("from_snapshot") else "")
         if not rows:
             self.lbl_status.setText(
                 "未检测到需要下发给客户端的改动（client_files 与上次发布基线一致）。"
-                + (f"　服务端 mods 里另有 {len(server_mods)} 个模组（属于服务端，不下发）。"
-                   if server_mods else ""))
+                + skip_note + snap_note)
         else:
             self.lbl_status.setText(
                 f"将下发给客户端：新增 {new_n}、替换 {upd_n}"
                 f"{f'、改名 {rnm_n}' if rnm_n else ''}、删除 {del_n}，共 {len(rows)} 项 ✔"
-                "（全部默认发布，右键可禁用）"
-                + (f"　服务端 mods 里另有 {len(server_mods)} 个模组（不下发）。"
-                   if server_mods else ""))
+                "（全部默认发布，右键可禁用）" + skip_note + snap_note)
         log.info("服务端改动检测完成: new=%d update=%d rename=%d delete=%d",
                  new_n, upd_n, rnm_n, del_n)
 
     # ---------- 改动树 ----------
-    def _build_changes_tree(self, rows, server_mods=None):
-        """按检测结果重建改动树：明确分成两组，一眼分清谁发给客户端。
+    def _build_changes_tree(self, rows):
+        """按检测结果重建改动树（只列要下发给客户端的内容）。
 
-        ① 将发布给客户端（来自客户端文件目录 client_files）—— 参与发布，可禁用 / 批注；
-        ② 服务端独有，不下发（服务端 mods）—— 只读对照，客户端不会收到。
+        来源只有客户端文件目录 client_files —— 这就是「要发给客户端的东西」的
+        存放/下载区（服主新做的客户端模组、资源不能塞进服务端 mods，否则服务端会炸，
+        所以放这儿让客户端来下）。服务端 mods 是服务端自己加载模组的目录，
+        与「发不发客户端」无关，本页**不读它**（它的体检在「更新服务端」页的
+        「服务端模组归类」里做）。
         """
-        server_mods = server_mods or []
         self.changes_tree.blockSignals(True)
         self.changes_tree.clear()
 
-        group_client = QTreeWidgetItem(
-            [f"① 将发布给客户端（来自 {self.config.files_dir}）", "", ""])
+        group_client = QTreeWidgetItem([self.config.files_dir, "", ""])
         group_client.setData(0, Qt.UserRole, {"kind": "group"})
         group_client.setToolTip(
-            0, "这些文件来自客户端文件目录（客户端模组、资源包等）\n"
-               "发布后客户端会下载并安装到自己的游戏目录")
-        group_client.setExpanded(True)
+            0, "这些文件来自客户端文件目录 client_files，是发布的来源。\n"
+               "发布后，客户端会从这里下载并安装到自己的游戏目录\n"
+               "（例如 client_files/mods/foo.jar → 客户端游戏目录 mods/foo.jar）。\n\n"
+               "其中 mods/ 下既有「仅客户端」模组，也有「双端」模组客户端要装的\n"
+               "那一份——两者都会下发给客户端。")
         self.changes_tree.addTopLevelItem(group_client)
+        group_client.setExpanded(True)  # 必须在加入树之后设置，否则不生效
 
         nodes: dict[str, QTreeWidgetItem] = {}
         for r in rows:
@@ -613,27 +665,6 @@ class TodoPage(QWidget):
             for col in range(3):
                 empty.setForeground(col, gray)
             group_client.addChild(empty)
-
-        if server_mods:
-            group_server = QTreeWidgetItem(
-                [f"② 服务端独有，不下发（{SFTPManager.join(self.config.server_root, 'mods')}）",
-                 f"{len(server_mods)} 个", "客户端不用装"])
-            group_server.setData(0, Qt.UserRole, {"kind": "group"})
-            group_server.setToolTip(
-                0, "这些是服务端自己的模组，只装在服务器上，发布时不会下发给客户端\n"
-                   "若其中混进了「仅客户端」模组，请到「更新服务端」页点「服务端模组归类…」\n"
-                   "把它搬到客户端文件目录的 mods 下，再回到本页发布给客户端")
-            group_server.setExpanded(False)
-            gray = QBrush(QColor("#8a8a8a"))
-            for name in server_mods:
-                item = QTreeWidgetItem([name, "服务端模组", "服务端自己装，不发布"])
-                item.setData(0, Qt.UserRole, {"kind": "server_info", "name": name})
-                item.setToolTip(0, "服务端独有：不下发给客户端")
-                item.setFlags(item.flags() & ~Qt.ItemIsUserCheckable & ~Qt.ItemIsSelectable)
-                for col in range(3):
-                    item.setForeground(col, gray)
-                group_server.addChild(item)
-            self.changes_tree.addTopLevelItem(group_server)
 
         self._apply_state_recursive_top()  # 恢复禁用状态与批注
         self._re_sort()                    # 排序 + 搜索过滤
@@ -725,14 +756,21 @@ class TodoPage(QWidget):
             self._state["disabled"] -= rels
         _save_todo_state(self.config.current_id(), self._state)
         for it in items:
-            self._apply_state_item(it)  # 重新应用样式（目录含子树）
+            self._apply_state_item(it)  # 先给出即时视觉反馈
         self.lbl_status.setText(f"已{'禁用' if disable else '启用'} {len(rels)} 项")
+        # 「本次不发布」的文件不再参与检测，重新检测一次让列表与实际扫描范围一致
+        self._redetect_from_snapshot()
+
+    def _redetect_from_snapshot(self):
+        """状态（禁用/启用）变化后按快照重算列表：秒出，不远程重扫。"""
+        self._last_auto_detect = 0.0
+        self._detect_changes(auto=True, from_snapshot=True)
 
     def _ignore_all(self):
         """忽略本次快照更新：把当前检测到的全部改动标记为不发布（可随时恢复）。"""
         rels = [r["rel"] for r in self._rows]
         if not rels:
-            winutil.warn(self, "提示", "当前没有检测到的服务端改动，无需忽略。")
+            winutil.warn(self, "提示", "当前没有检测到的改动，无需忽略。")
             return
         if not winutil.confirm(
                 self, "忽略本次快照更新",
@@ -742,8 +780,8 @@ class TodoPage(QWidget):
             return
         self._state["disabled"].update(rels)
         _save_todo_state(self.config.current_id(), self._state)
-        self._apply_state_recursive_top()
         self.lbl_status.setText(f"已忽略本次快照更新：{len(rels)} 项本次不发布")
+        self._redetect_from_snapshot()
 
     def _republish_all(self):
         """重新发布已忽略：把全部已忽略的改动恢复为可发布状态。"""
@@ -759,8 +797,8 @@ class TodoPage(QWidget):
             return
         self._state["disabled"] = set()
         _save_todo_state(self.config.current_id(), self._state)
-        self._apply_state_recursive_top()
         self.lbl_status.setText(f"已恢复 {count} 项改动为可发布状态")
+        self._redetect_from_snapshot()
 
     def _annotate_items(self, items):
         """批注选区：一次输入，应用到全部选中项（目录直接作用于目录行）。"""
@@ -805,9 +843,31 @@ class TodoPage(QWidget):
             if (c.data(0, Qt.UserRole) or {}).get("kind") == "dir":
                 self._sort_children(c)
 
+    @staticmethod
+    def _expanded_state(items) -> dict:
+        """递归记录各项的展开状态（用 id 作键，重排后对象仍是同一个）。"""
+        snap = {}
+        stack = list(items)
+        while stack:
+            it = stack.pop()
+            snap[id(it)] = it.isExpanded()
+            stack.extend(it.child(i) for i in range(it.childCount()))
+        return snap
+
+    @staticmethod
+    def _restore_expanded(items, snap: dict):
+        """把重排前记录的展开状态回填。QTreeWidget 取走再加回会重置展开状态。"""
+        stack = list(items)
+        while stack:
+            it = stack.pop()
+            if id(it) in snap:
+                it.setExpanded(snap[id(it)])
+            stack.extend(it.child(i) for i in range(it.childCount()))
+
     def _re_sort(self):
         items = [self.changes_tree.topLevelItem(i)
                  for i in range(self.changes_tree.topLevelItemCount())]
+        snap = self._expanded_state(items)
         items.sort(key=self._sort_key)
         for c in items:
             idx = self.changes_tree.indexOfTopLevelItem(c)
@@ -816,6 +876,7 @@ class TodoPage(QWidget):
             self.changes_tree.addTopLevelItem(c)
             if (c.data(0, Qt.UserRole) or {}).get("kind") in ("dir", "group"):
                 self._sort_children(c)
+        self._restore_expanded(items, snap)  # 排序不得改变展开/折叠状态
         self._apply_filter()  # 排序后保持搜索过滤结果一致
 
     def _apply_filter(self):
@@ -967,7 +1028,7 @@ class TodoPage(QWidget):
                 winutil.warn(self, "提示",
                              "所有改动均已禁用。\n右键点击条目可重新启用后再发布。")
             else:
-                winutil.warn(self, "提示", "未检测到服务端改动，无需发布。")
+                winutil.warn(self, "提示", "未检测到改动，无需发布。")
             return
 
         detail = []

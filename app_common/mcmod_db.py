@@ -80,11 +80,12 @@ def _parse(buf: bytes) -> list[tuple[int, str, str, str]]:
 
 
 class McModDb:
-    """mcmod.buf 的只读内存索引：Slug / 英文名 → WikiId。"""
+    """mcmod.buf 的只读内存索引：Slug / 英文名 → (WikiId, CurseForgeSlug, ModrinthSlug)。"""
 
     def __init__(self, data_file: Path | str | None = None):
-        self._slug: dict[str, int] = {}
-        self._en_name: dict[str, int] = {}
+        # 键 → 记录 (wiki_id, cf_slug, mr_slug)；cf/mr slug 供发布渠道查询最新版本用
+        self._slug: dict[str, tuple[int, str, str]] = {}
+        self._en_name: dict[str, tuple[int, str, str]] = {}
         path = Path(data_file) if data_file else _data_file()
         if not path.is_file():
             return
@@ -92,19 +93,20 @@ class McModDb:
         for wiki_id, cn, cf, mr in _parse(raw):
             if not wiki_id:
                 continue
+            record = (wiki_id, cf, mr)
             if cf:
-                self._slug.setdefault(cf.lower(), wiki_id)
+                self._slug.setdefault(cf.lower(), record)
             if mr:
-                self._slug.setdefault(mr.lower(), wiki_id)
+                self._slug.setdefault(mr.lower(), record)
             # 中文名括号内的英文名（如 "工业时代2 (Industrial Craft 2)"）
             m = re.search(r"\(([^()]*)\)", cn)
             if m:
                 en = m.group(1).strip()
                 if en:
-                    self._en_name.setdefault(en.lower(), wiki_id)
+                    self._en_name.setdefault(en.lower(), record)
 
-    def wiki_id_for(self, name: str) -> int | None:
-        """按名称（文件名基名 / modid / slug）匹配 MC 百科 WikiId；未命中返回 None。"""
+    def _match(self, name: str) -> tuple[int, str, str] | None:
+        """按名称（文件名基名 / modid / slug）匹配百科记录；未命中返回 None。"""
         base = (name or "").strip().lower()
         if not base:
             return None
@@ -136,6 +138,16 @@ class McModDb:
             if cand_compact and cand_compact in self._slug:
                 return self._slug[cand_compact]
         return None
+
+    def wiki_id_for(self, name: str) -> int | None:
+        """按名称匹配 MC 百科 WikiId；未命中返回 None。"""
+        record = self._match(name)
+        return record[0] if record else None
+
+    def slugs_for(self, name: str) -> tuple[int | None, str, str]:
+        """按名称匹配百科记录 → (WikiId, CurseForgeSlug, ModrinthSlug)。"""
+        record = self._match(name)
+        return record if record else (None, "", "")
 
 
 # 已知加载器/无关标记（文件名中出现时忽略）
@@ -177,17 +189,37 @@ _db: McModDb | None = None
 _db_failed = False
 
 
-def wiki_id_for(name: str) -> int | None:
-    """查询模组名称对应的 MC 百科 WikiId；失败返回 None（调用方回退到百科搜索链接）。"""
+def _get_db() -> McModDb | None:
+    """懒加载数据库单例；文件缺失/损坏返回 None（调用方自行回退）。"""
     global _db, _db_failed
     if _db is None and not _db_failed:
         try:
             _db = McModDb()
         except Exception:
             _db_failed = True
-    if _db is None:
+    return _db
+
+
+def wiki_id_for(name: str) -> int | None:
+    """查询模组名称对应的 MC 百科 WikiId；失败返回 None（调用方回退到百科搜索链接）。"""
+    db = _get_db()
+    if db is None:
         return None
     try:
-        return _db.wiki_id_for(name)
+        return db.wiki_id_for(name)
     except Exception:
         return None
+
+
+def slugs_for(name: str) -> tuple[int | None, str, str]:
+    """查询模组名称对应的 (WikiId, CurseForgeSlug, ModrinthSlug)；失败返回 (None, "", "")。
+
+    供 mod_version 直接按 slug 查发布渠道（精确 slug 比按名字搜索可靠得多）。
+    """
+    db = _get_db()
+    if db is None:
+        return None, "", ""
+    try:
+        return db.slugs_for(name)
+    except Exception:
+        return None, "", ""

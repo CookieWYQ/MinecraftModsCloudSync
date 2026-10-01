@@ -196,6 +196,28 @@ class ServerSettingsPage(QWidget):
             "判定为「仅客户端」的模组改发 client_files/mods，不会被误传到服务端 mods。\n"
             "断网时会自动跳过（有整体超时，最多等约 45 秒）。")
         mr.addWidget(self.cb_env_online)
+        self.cb_env_client_optional = QCheckBox(
+            "「客户端可选」的模组也发给客户端（按「客户端需装」处理）")
+        self.cb_env_client_optional.setToolTip(
+            "有些模组百科标注为「客户端可选, 服务端需装」——客户端装不装都行。\n"
+            "默认只发服务端，玩家客户端不会拿到它，各客户端内容可能不一致。\n"
+            "打开后按「客户端需装」处理，客户端那份也发出去，保证玩家客户端内容一致。\n"
+            "只是个模组也可以单独指定：在差异审核列表右键改它的目标。")
+        mr.addWidget(self.cb_env_client_optional)
+        self.cb_env_server_optional = QCheckBox(
+            "「服务端可选」的模组也发到服务端（按「服务端需装」处理）")
+        self.cb_env_server_optional.setToolTip(
+            "镜像开关：有些模组百科标注为「客户端需装, 服务端可选」——服务端装不装都行。\n"
+            "默认只发客户端目录，服务端不会拿到它。打开后按「服务端需装」处理。")
+        mr.addWidget(self.cb_env_server_optional)
+        self.cb_version_check = QCheckBox(
+            "分析模组时顺带检查发布渠道的最新版本（Modrinth / CurseForge）")
+        self.cb_version_check.setToolTip(
+            "「分析模组环境…」时会按模组名到 Modrinth / CurseForge 查最新版本，\n"
+            "在「最新版本」列标出「已是最新 / 有新版本 x.y.z」。\n"
+            "用于更新模组时确认哪个文件才是旧版，避免差异审核里删错模组。\n"
+            "断网或渠道里查不到会自动标「未查到」（有整体超时，最多等约 30 秒）。")
+        mr.addWidget(self.cb_version_check)
         layout.addWidget(mod_box)
 
         # ---- 客户端软件设置（随待办下发） ----
@@ -272,6 +294,9 @@ class ServerSettingsPage(QWidget):
             "\n".join(self.config.exclude_names or sorted(DEFAULT_EXCLUDE)))
         self.ed_client_mods.setPlainText("\n".join(self.config.client_mods))
         self.cb_env_online.setChecked(self.config.env_online)
+        self.cb_env_client_optional.setChecked(self.config.env_client_optional)
+        self.cb_env_server_optional.setChecked(self.config.env_server_optional)
+        self.cb_version_check.setChecked(self.config.env_version_check)
         ps = self.config.push_settings
         self.cb_push.setChecked(bool(ps.get("enabled", False)))
         self.sp_interval.setValue(int(ps.get("check_interval_min", 60)))
@@ -300,6 +325,9 @@ class ServerSettingsPage(QWidget):
                                    for line in self.ed_client_mods.toPlainText().splitlines()
                                    if line.strip()]
         self.config.env_online = self.cb_env_online.isChecked()
+        self.config.env_client_optional = self.cb_env_client_optional.isChecked()
+        self.config.env_server_optional = self.cb_env_server_optional.isChecked()
+        self.config.env_version_check = self.cb_version_check.isChecked()
         self.config.push_settings = {
             "enabled": self.cb_push.isChecked(),
             "check_interval_min": self.sp_interval.value(),
