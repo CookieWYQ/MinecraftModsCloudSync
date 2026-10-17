@@ -1434,6 +1434,11 @@ class RemoteFilePage(QWidget):
     def _set_children_check(item, state):
         for i in range(item.childCount()):
             c = item.child(i)
+            d = c.data(0, Qt.UserRole) or {}
+            # 「服务端独有」的文件不参与父子勾选联动：勾父目录不会勾上它们，
+            # 防止用户全选时把服务端独有的核心文件（lib、newforge 等）误删。
+            if d.get("kind") == "file" and d.get("status") == "server":
+                continue
             if c.flags() & Qt.ItemIsUserCheckable:
                 c.setCheckState(0, state)
             RemoteFilePage._set_children_check(c, state)
