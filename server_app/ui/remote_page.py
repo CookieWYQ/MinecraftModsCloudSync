@@ -519,6 +519,14 @@ class RemoteFilePage(QWidget):
             return au, False
         return self._auto_target_of(rel), False
 
+    def _is_skipped(self, rel: str) -> bool:
+        """该路径是否被标注为「跳过」（忽略）。
+
+        被跳过的目录/文件在扫描阶段就排除：本地不读、不算哈希；
+        服务端不递归该目录、不列入对比。等同于旧版「忽略」语义。
+        """
+        return self._override_target_of(rel) == "skip"
+
     def _auto_detect(self):
         """创建服务端快照并自动对比本地差异（加载时/上传后/手动触发）。"""
         if self._snapshot_busy:
@@ -556,6 +564,10 @@ class RemoteFilePage(QWidget):
         但大小不变时漏检；「本地新增 ↔ 远程独有」的改名候选也一并计算用于匹配。
         """
         excludes = list(self._excludes) or list(DEFAULT_EXCLUDE)
+        # 标注为「跳过」的顶层目录加入排除集合：服务端扫描时直接不递归进去
+        skip_dirs = {k.split("/", 1)[0] for k, v in self._overrides.items()
+                     if v == "skip" and k}
+        excludes = list(set(excludes) | skip_dirs)
         server_root = self.config.server_root
         files_dir = self.config.files_dir
         local_root = self.config.local_mc_dir
@@ -606,6 +618,12 @@ class RemoteFilePage(QWidget):
                     self._server_dirs.discard(overlap.split("/", 1)[0].lower())
             log.info("服务端根目录 %s 下存在的顶层目录：%s",
                      server_root, "、".join(sorted(self._server_dirs)) or "（无）")
+            # 兜底：标注为「跳过」的文件（含单个文件、深层路径）从对比集合移除，
+            # 不参与哈希计算与差异展示（excludes 只跳过目录，文件级 skip 靠这里兜底）。
+            for k in list(files):
+                rel = k[len("client_files/"):] if k.startswith("client_files/") else k
+                if self._is_skipped(rel):
+                    del files[k]
             # 大小相同一律重新远程计算哈希确认内容（快速哈希，不下载文件），
             # 不再从旧快照继承哈希，防止服务端文件被外部改动且大小不变时漏检。
             self._fill_remote_hashes(sftp, files, local, progress_cb)
@@ -627,8 +645,12 @@ class RemoteFilePage(QWidget):
         """范围扫描：读一个范围条目在服务端仓库与客户端文件目录里的对应位置。
 
         文件夹条目递归列举其下所有文件；文件条目只取自身大小（不递归、不看同目录其它文件）。
+        范围内标注为「跳过」的目录也一并排除。
         """
-        excludes = self._excludes or None
+        excludes = list(self._excludes or [])
+        skip_dirs = {k.split("/", 1)[0] for k, v in self._overrides.items()
+                     if v == "skip" and k}
+        excludes = list(set(excludes) | skip_dirs) or None
         for base, prefix in ((self.config.server_root, ""),
                              (self.config.files_dir, "client_files/")):
             remote = SFTPManager.join(base, entry)
@@ -660,10 +682,15 @@ class RemoteFilePage(QWidget):
                     yield os.path.join(dirpath, fn)
 
     def _collect_local(self, root: str) -> dict:
-        """收集本地新客户端文件：{rel: {"size", "mtime", "hash"}}（本地直接计算 MD5）。"""
+        """收集本地新客户端文件：{rel: {"size", "mtime", "hash"}}（本地直接计算 MD5）。
+
+        被标注为「跳过」的目录/文件直接排除，不读、不算哈希。
+        """
         local: dict[str, dict] = {}
         for full in self._local_files(root):
             rel = os.path.relpath(full, root).replace("\\", "/")
+            if self._is_skipped(rel):
+                continue
             try:
                 info = {"size": os.path.getsize(full),
                         "mtime": os.path.getmtime(full),
