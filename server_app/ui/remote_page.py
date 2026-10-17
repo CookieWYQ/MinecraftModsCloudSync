@@ -772,6 +772,8 @@ class RemoteFilePage(QWidget):
         for rel in sorted(local):
             info = local[rel]
             target, manual = self._effective_target(rel)
+            if target == "skip":
+                continue  # 手动标注为「跳过」的目录/文件：不对比、不显示（等同忽略）
             status, remote_size = self._diff_status(
                 rel, target, info["size"], info.get("hash"), snapshot_files)
             if status is None:
@@ -826,6 +828,8 @@ class RemoteFilePage(QWidget):
             if rel.startswith("client_files/"):
                 if rel[len("client_files/"):] in local:
                     continue
+            if self._effective_target(rel)[0] == "skip":
+                continue  # 标注为「跳过」的目录下的服务端独有文件也不显示
             row = {"rel": rel, "status": "server", "size": 0,
                    "remote_size": snapshot_files[rel]["size"], "mtime": 0,
                    "target": "both", "manual": False}
