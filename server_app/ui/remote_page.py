@@ -855,6 +855,10 @@ class RemoteFilePage(QWidget):
             if rel.startswith("client_files/"):
                 if rel[len("client_files/"):] in local:
                     continue
+            # 保护服务端根目录下的顶层文件（start.sh、server.properties、eula.txt 等）：
+            # 这些是服务端核心文件，绝不能被同步操作当作「服务端独有」删除。
+            if "/" not in rel:
+                continue
             if self._effective_target(rel)[0] == "skip":
                 continue  # 标注为「跳过」的目录下的服务端独有文件也不显示
             row = {"rel": rel, "status": "server", "size": 0,
@@ -875,6 +879,9 @@ class RemoteFilePage(QWidget):
             if k.startswith("client_files/"):
                 if k[len("client_files/"):] in local:
                     continue
+            # 保护服务端根目录下的顶层文件：绝不能被当作改名的旧文件删除
+            if "/" not in k:
+                continue
             if meta.get("hash"):
                 server_only.setdefault((meta["size"], meta["hash"]), []).append(k)
         matched: dict[str, str] = {}
@@ -2376,6 +2383,10 @@ class RemoteFilePage(QWidget):
                            for o in renames.values()}
             for rel, is_client in ([(r, False) for r in deletes]
                                    + [(r, True) for r in deletes_client]):
+                # 硬防护：服务端根目录下的顶层文件（start.sh 等）绝不删除
+                if "/" not in rel:
+                    log.warning("拒绝删除服务端顶层文件: %s", rel)
+                    continue
                 done += 1
                 dest = client_dir if is_client else server_root
                 remote = TodoManifest.remote_source_path(sftp, dest, rel)
