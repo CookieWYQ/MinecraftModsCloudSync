@@ -608,6 +608,7 @@ class SFTPManager:
             raise SFTPError(f"下载失败: {remote_path} ({exc})") from exc
 
     def delete(self, remote_path: str) -> None:
+        self._refuse_root(remote_path)
         _invalidate_scan_cache()
         try:
             self._sftp.remove(self._posix(remote_path))
@@ -615,6 +616,16 @@ class SFTPManager:
             pass
         except Exception as exc:
             raise SFTPError(f"删除远程文件失败: {remote_path} ({exc})") from exc
+
+    @staticmethod
+    def _refuse_root(remote_path: str) -> None:
+        """拒绝把远程根目录当作删除目标（路径为空或 /）。
+
+        路径计算一旦出错（例如相对路径成了空串），join 会得到 "/"，
+        递归删除就会把整个服务器文件删光。这里做最后一道拦截，宁可报错。
+        """
+        if not str(remote_path or "").strip("/"):
+            raise SFTPError("拒绝删除远程根目录（目标路径为空或 /）")
 
     def move(self, src: str, dst: str) -> None:
         """在同一服务器内移动/重命名远程文件（不传输文件内容）。
@@ -636,7 +647,8 @@ class SFTPManager:
         log.info("服务器不支持 posix-rename，已用 rename 移动: %s → %s（%s）", src, dst, first)
 
     def delete_dir(self, remote_path: str) -> None:
-        """递归删除远程目录。"""
+        """递归删除远程目录（拒绝根目录）。"""
+        self._refuse_root(remote_path)
         _invalidate_scan_cache()
         try:
             stack = [self._posix(remote_path)]

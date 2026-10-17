@@ -15,7 +15,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from app_common.app_config import ServerConfig
-from server_app.ui.remote_page import RemoteFilePage
+from server_app.ui.remote_page import RemoteFilePage, _norm_scope
 
 app = QApplication([])
 root = tempfile.mkdtemp()
@@ -46,6 +46,7 @@ make_jar("create-1.20.1-0.5.1.jar", "META-INF/mods.toml",
 _fresh = ServerConfig(tempfile.mkstemp(suffix=".json")[1])
 assert _fresh.env_version_check is True, "版本检查默认开启"
 assert _fresh.env_client_optional is False and _fresh.env_server_optional is False
+assert _fresh.sync_scope == [], "同步范围默认为空（全量同步）"
 
 cfg = ServerConfig(os.path.join(tempfile.gettempdir(), "env_cfg.json"))
 cfg.store.set("servers", [])
@@ -175,5 +176,20 @@ assert "Modrinth" in node.toolTip(7)
 page._cancel_env_results()
 assert not page._version_results
 assert node.text(7) == "" and node.text(6) == ""
+
+# 7) 同步范围：只扫挑出来的文件夹/文件，范围外不读（范围为空 = 全量）
+world = os.path.join(root, "world")
+os.makedirs(world, exist_ok=True)
+with open(os.path.join(world, "level.dat"), "wb") as fh:
+    fh.write(b"x" * 8)
+assert _norm_scope(["mods", "mods/a.jar", "resourcepacks/", ""]) == ["mods", "resourcepacks"]
+page._scope = ["mods"]
+assert page._in_scope("mods/x.jar") and not page._in_scope("world/level.dat")
+assert "world/level.dat" not in page._collect_local(root), "范围外的本地文件不参与检测"
+assert page._collect_local(root), "范围内的本地文件照常收集"
+page._scope = []
+assert page._in_scope("world/level.dat"), "范围为空 = 全量"
+assert "world/level.dat" in page._collect_local(root), "全量模式仍收集整个目录"
+print("SCOPE OK")
 page.close()
 print("ANALYZE OK")

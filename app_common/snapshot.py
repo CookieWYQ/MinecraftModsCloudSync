@@ -138,6 +138,28 @@ def update_snapshot(server_id: str, files: dict, key: str = "repo",
     return {"saved_at": saved_at, "changed": changed, "aged": aged}
 
 
+def update_snapshot_scoped(server_id: str, files: dict, scope: list[str],
+                           key: str = "repo", max_age_min: int = 30) -> dict:
+    """按同步范围更新快照：只替换 scope 覆盖到的条目，范围外的旧记录原样保留。
+
+    「更新服务端」设了同步范围时只扫这几个路径，若直接覆盖式写入，
+    范围外的记录（尤其 client_files/ 的读数，会被「发布待办」复用）就全丢了。
+    所以这里先把旧快照里属于 scope 的条目清掉（本次扫描即为这些路径的权威结果），
+    再用新结果覆盖，其余保持不动。
+    """
+    old_files = load_snapshot(server_id, key).get("files", {})
+    prefixes = tuple(str(s).strip("/") for s in (scope or []) if str(s).strip("/"))
+
+    def _in_scope(rel: str) -> bool:
+        plain = rel[len("client_files/"):] if rel.startswith("client_files/") else rel
+        return any(plain == p or plain.startswith(p + "/") for p in prefixes)
+
+    merged = {} if not prefixes else {
+        rel: meta for rel, meta in old_files.items() if not _in_scope(rel)}
+    merged.update(files)
+    return update_snapshot(server_id, merged, key, max_age_min)
+
+
 def normalize_files(files: dict) -> dict:
     """归一化快照 files 值为 {rel: {"size": int, "hash": str|None}}。
 

@@ -365,18 +365,26 @@ class ServerConfig:
         self.remote = {**self.remote, "target_overrides": dict(value or {})}
 
     @property
-    def ignore_overrides(self) -> dict:
-        """「忽略」列表（持久化）：{相对路径 或 文件夹前缀: True}。
+    def sync_scope(self) -> list[str]:
+        """「更新服务端」的同步范围（持久化）：相对客户端根目录的路径，文件夹或文件。
 
-        被忽略的文件/文件夹不出现在差异审查中（本地、服务端独有、旧版残留都不显示），
-        可在差异审核树中勾选「显示已忽略项」后右键恢复。
+        非空时**只扫描、只对比**这些路径（含服务端/客户端文件目录里对应的位置），
+        范围外的一律不读、不出现在差异审核里——挑几个模组/资源包同步时不必全量扫描。
+        为空表示不限制（全量同步）。
+
+        条目若是**文件**，只比对这一个文件；若是**文件夹**，其下所有文件（含子目录）都算在内，
+        改名 / 旧版残留也只在文件夹条目下才会被检测到。
         """
-        ignored = self.remote.get("ignore_overrides", {})
-        return dict(ignored) if isinstance(ignored, dict) else {}
+        scope = self.remote.get("sync_scope", [])
+        if not isinstance(scope, list):
+            return []
+        return [str(p).strip("/") for p in scope if str(p).strip("/")]
 
-    @ignore_overrides.setter
-    def ignore_overrides(self, value) -> None:
-        self.remote = {**self.remote, "ignore_overrides": dict(value or {})}
+    @sync_scope.setter
+    def sync_scope(self, value) -> None:
+        self.remote = {**self.remote,
+                       "sync_scope": [str(p).strip("/") for p in (value or [])
+                                      if str(p).strip("/")]}
 
     # ---- 导出客户端配置（当前服务器的名称 + 唯一编号 + 授权列表） ----
     def export_name(self) -> str:

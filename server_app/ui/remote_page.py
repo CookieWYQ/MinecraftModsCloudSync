@@ -4,7 +4,7 @@
 流程：
 1. 启动程序与每次上传后，自动读取服务端目录树（server_root）创建快照（本地保存，作为对比基线）；
 2. 自动对比本地新客户端 vs 快照，展示「客户端有而服务端没有/不一致」的差异；
-3. 差异树支持：排除规则（logs/cache 等）、搜索、排序（名称/大小/类型/时间）、右键复制与设置发送目标；
+3. 差异树支持：排除规则（logs/cache 等）、同步范围（只扫挑出来的文件夹/文件）、搜索、排序（名称/大小/类型/时间）、右键复制与设置发送目标；
 4. 发送目标：双端（服务端+客户端）/ 服务端 / 客户端 / 跳过；
    标注为「客户端模组」的文件默认只发客户端；
 5. 人工追加需要上传的文件（从本地浏览 / 双击远程文件树）；
@@ -16,7 +16,7 @@ import tempfile
 from datetime import datetime
 
 from PySide6.QtCore import QUrl, Qt
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QFont
+from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMenu,
     QPushButton,
     QTreeWidgetItem,
@@ -63,6 +64,7 @@ from app_common.sftp import SFTPManager
 from app_common.snapshot import (
     load_snapshot,
     update_snapshot,
+    update_snapshot_scoped,
 )
 from app_common.tasks import TodoManifest
 from app_common.worker import Worker, fmt_progress
@@ -106,6 +108,74 @@ def _overlap_prefix(child: str, base: str) -> str | None:
     if child.startswith(base + "/"):
         return child[len(base) + 1:]
     return None
+
+
+def _norm_scope(entries) -> list[str]:
+    """规范化同步范围：去空、去重、丢掉被父目录覆盖的子项（「mods」已含「mods/foo.jar」）。"""
+    out: list[str] = []
+    for e in sorted({str(x).strip("/") for x in entries if str(x).strip("/")}):
+        if any(e == p or e.startswith(p + "/") for p in out):
+            continue
+        out.append(e)
+    return out
+
+
+class SyncScopeDialog(QDialog):
+    """同步范围管理：查看/移除已挑的路径，或一键恢复全量同步。
+
+    条目在「更新服务端」列表里右键添加（文件夹、文件都行），这里只做查看与调整，
+    确定后由页面保存并只按新范围重新扫描。
+    """
+
+    def __init__(self, scope: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("同步范围（只扫描这些内容）")
+        self.resize(620, 420)
+        self._scope = _norm_scope(scope)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 12, 12, 12)
+        lay.setSpacing(8)
+
+        hint = QLabel(
+            "范围为空 = 全量同步（整个客户端目录 ↔ 服务器仓库）。\n"
+            "· 不设范围时会全量扫描，慢；只挑需要的会快很多。\n"
+            "· 文件夹条目：其下所有文件（含子目录）都同步，改名 / 旧版残留也只有在文件夹条目下才会被检测。\n"
+            "· 文件条目：只比对这一个文件。\n"
+            "· 范围外的一切都不读取、不哈希、不参与对比，发送时也不会动它们。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+
+        self.lst = QListWidget()
+        self.lst.addItems(self._scope)
+        self.lst.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        lay.addWidget(self.lst, 1)
+
+        row = QHBoxLayout()
+        btn_remove = QPushButton("移除选中")
+        btn_clear = QPushButton("恢复全量（清空范围）")
+        btn_ok = QPushButton("确定")
+        btn_ok.setObjectName("primary")
+        btn_remove.clicked.connect(self._remove_selected)
+        btn_clear.clicked.connect(self._clear)
+        btn_ok.clicked.connect(self.accept)
+        row.addWidget(btn_remove)
+        row.addWidget(btn_clear)
+        row.addStretch(1)
+        row.addWidget(btn_ok)
+        lay.addLayout(row)
+
+    def _remove_selected(self):
+        for item in self.lst.selectedItems():
+            self.lst.takeItem(self.lst.row(item))
+
+    def _clear(self):
+        self.lst.clear()
+
+    def scope(self) -> list[str]:
+        """当前列表里的条目（已规范化）。列表为空 = 恢复全量。"""
+        return _norm_scope([self.lst.item(i).text() for i in range(self.lst.count())])
 
 
 class RemoteBrowserDialog(QDialog):
@@ -180,7 +250,7 @@ class RemoteFilePage(QWidget):
         self._client_keywords: list[str] = []
         self._overrides: dict[str, str] = {}  # 手动标注（持久化）：rel/文件夹前缀 → target
         self._auto_targets: dict[str, str] = {}  # 发送前环境检测自动纠正（持久化，可被覆盖）
-        self._ignored: dict[str, bool] = {}   # 忽略列表（持久化）：rel/文件夹前缀 → True
+        self._scope: list[str] = []           # 同步范围（持久化）：只扫这些文件夹/文件，空=全量
         self._env_results: dict[str, str] = {}   # 本次「分析模组环境」结果：文件名 → 发送目标
         self._env_sources: dict[str, str] = {}   # 文件名 → 判断来源说明
         self._env_summaries: dict[str, str] = {}  # 文件名 → 两侧状态摘要（客户端/服务端各自的要求）
@@ -236,8 +306,7 @@ class RemoteFilePage(QWidget):
         self.btn_cancel_env.hide()
         self.cb_show_server = QCheckBox("显示服务端独有文件（可勾选删除）")
         self.cb_show_server.setToolTip("服务端有而本地没有的文件；勾选后发送时将从服务端删除")
-        self.cb_show_ignored = QCheckBox("显示已忽略项")
-        self.cb_show_ignored.setToolTip("显示被「忽略」的文件/文件夹（灰色），右键可取消忽略恢复显示")
+        self.btn_scope = QPushButton("同步范围…")
         btn_row.addWidget(self.btn_scan)
         btn_row.addWidget(self.btn_add_local)
         btn_row.addWidget(self.btn_remove)
@@ -247,7 +316,7 @@ class RemoteFilePage(QWidget):
         btn_row.addWidget(self.btn_apply_env)
         btn_row.addWidget(self.btn_cancel_env)
         btn_row.addStretch(1)
-        btn_row.addWidget(self.cb_show_ignored)
+        btn_row.addWidget(self.btn_scope)
         btn_row.addWidget(self.cb_show_server)
         layout.addLayout(btn_row)
 
@@ -317,11 +386,11 @@ class RemoteFilePage(QWidget):
         self.btn_browse_remote.clicked.connect(self._browse_remote)
         self.btn_analyze.clicked.connect(self._analyze_mods)
         self.btn_tidy_mods.clicked.connect(self._tidy_server_mods)
+        self.btn_scope.clicked.connect(self._open_scope_dialog)
         self.btn_apply_env.clicked.connect(self._apply_env_results)
         self.btn_cancel_env.clicked.connect(self._cancel_env_results)
         self.btn_send.clicked.connect(self._send)
         self.cb_show_server.toggled.connect(lambda _: self._refresh_tree())
-        self.cb_show_ignored.toggled.connect(lambda _: self._refresh_tree())
         self.ed_search.textChanged.connect(lambda _: self._apply_filter())
         self.cb_sort.currentIndexChanged.connect(lambda _: self._re_sort())
         self.btn_sort_dir.toggled.connect(lambda _: self._re_sort())
@@ -333,7 +402,8 @@ class RemoteFilePage(QWidget):
         self._client_keywords = [k.strip().lower() for k in self.config.client_mods if k.strip()]
         self._overrides = dict(self.config.target_overrides)
         self._auto_targets = dict(self.config.auto_targets)
-        self._ignored = dict(self.config.ignore_overrides)
+        self._scope = list(self.config.sync_scope)
+        self._update_scope_button()
         host = self.config.host()
         if host:
             self.lbl_remote.setText(
@@ -385,14 +455,33 @@ class RemoteFilePage(QWidget):
             return "both"  # 没读到目录列表（连接失败等）：保守按双端，并在状态栏告警
         return "both" if top in self._server_dirs else "client"
 
-    def _is_ignored(self, rel: str) -> bool:
-        """是否被「忽略」：文件精确匹配优先，其次文件夹前缀（任一命中即忽略）。"""
-        if rel in self._ignored:
+    def _in_scope(self, rel: str) -> bool:
+        """rel 是否在同步范围内（范围为空 = 全量，全部命中）。
+
+        文件夹条目命中其下所有文件（含子目录），文件条目只命中自身。
+        """
+        if not self._scope:
             return True
-        for key in self._ignored:
-            if key and rel.startswith(key.rstrip("/") + "/"):
-                return True
-        return False
+        rel = str(rel).strip("/")
+        return any(rel == k or rel.startswith(k + "/") for k in self._scope)
+
+    def _scope_text(self) -> str:
+        """同步范围的一句话描述（底部统计栏用）。"""
+        if not self._scope:
+            return "同步范围：全量（整个客户端目录 ↔ 服务器仓库）"
+        shown = "、".join(self._scope[:3]) + ("…" if len(self._scope) > 3 else "")
+        return (f"同步范围：{len(self._scope)} 项（{shown}）"
+                "——范围外不扫描、不对比、不发送")
+
+    def _update_scope_button(self):
+        """同步范围按钮文字/提示跟随当前范围（空=全量）。"""
+        n = len(self._scope)
+        self.btn_scope.setText("同步范围…" if not n else f"同步范围（{n}）…")
+        self.btn_scope.setToolTip(
+            "只扫描、只对比挑出来的文件夹/文件（范围外不读取、不哈希、不出现在列表）。\n"
+            "· 在下方列表里右键文件夹或文件 →「只同步此项 / 加入同步范围」\n"
+            "· 范围为空 = 全量同步（整个客户端目录 ↔ 服务器仓库）\n"
+            "点此按钮可查看、移除条目或恢复全量。")
 
     def _override_target_of(self, rel: str) -> str | None:
         """手动标注的目标：文件精确匹配优先，其次文件夹前缀（最长优先）。"""
@@ -452,12 +541,15 @@ class RemoteFilePage(QWidget):
         worker.start()
 
     def _snapshot_scan_worker(self, progress_cb=None) -> str:
-        """读取服务端文件仓库 + 客户端文件目录 → 计算需要确认的远程哈希 → 覆盖式更新快照 → 对比本地差异。
+        """读取服务端文件仓库 + 客户端文件目录 → 计算需要确认的远程哈希 → 更新快照 → 对比本地差异。
 
         快照统一以「相对服务端文件仓库根目录」的键保存：
         - 服务端文件 → 相对 server_root 的路径（files_dir 位于其下时自动剔除，避免重复）
         - 客户端文件 → files_dir 的内容统一以 client_files/ 前缀并入
         （files_dir 可以是服务器上任意绝对位置，不再要求位于 server_root 之下）
+
+        设了同步范围时只读范围里的路径：本地只走这些文件夹/文件，服务端也只列
+        对应的那几个位置，范围外的一律不读、不哈希、不对比（挑几个模组同步就不必全量扫描）。
 
         哈希一律在远程直接计算（SFTP check-file 快速哈希，不下载文件内容）：
         「本地与远程大小相同」的候选总是重新确认，防止服务端文件被替换
@@ -477,17 +569,24 @@ class RemoteFilePage(QWidget):
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
             files: dict[str, dict] = {}
-            overlap = _overlap_prefix(files_dir, server_root)
-            for rel, size in sftp.list_files_recursive_with_size(
-                    server_root, excludes=excludes, skip_system=True,
-                    max_workers=4, progress_cb=on_scan_progress):
-                if overlap and (rel == overlap or rel.startswith(overlap + "/")):
-                    continue  # 属于客户端文件目录，避免重复计入
-                files[rel] = {"size": size, "hash": None}
-            for rel, size in sftp.list_files_recursive_with_size(
-                    files_dir, excludes=excludes, skip_system=False,
-                    max_workers=4, progress_cb=on_scan_progress):
-                files[f"client_files/{rel}"] = {"size": size, "hash": None}
+            if self._scope:
+                # 只扫范围内：服务端仓库与客户端文件目录各自的对应位置
+                for i, entry in enumerate(self._scope, 1):
+                    if progress_cb:
+                        progress_cb(i, len(self._scope), f"正在扫描同步范围：{entry}")
+                    self._scan_remote_entry(sftp, files, entry)
+            else:
+                overlap = _overlap_prefix(files_dir, server_root)
+                for rel, size in sftp.list_files_recursive_with_size(
+                        server_root, excludes=excludes, skip_system=True,
+                        max_workers=4, progress_cb=on_scan_progress):
+                    if overlap and (rel == overlap or rel.startswith(overlap + "/")):
+                        continue  # 属于客户端文件目录，避免重复计入
+                    files[rel] = {"size": size, "hash": None}
+                for rel, size in sftp.list_files_recursive_with_size(
+                        files_dir, excludes=excludes, skip_system=False,
+                        max_workers=4, progress_cb=on_scan_progress):
+                    files[f"client_files/{rel}"] = {"size": size, "hash": None}
             # 记录服务端文件仓库根目录下**实际存在**的顶层目录（含空目录，
             # 用一次目录列举拿到），供默认发送目标判定：服务端没在用这个目录时，
             # 该类别默认只发客户端文件仓库，不在服务端凭空建目录。
@@ -500,67 +599,98 @@ class RemoteFilePage(QWidget):
                 log.warning("读取服务端根目录失败，默认目标暂按双端处理: %s", exc)
                 self._server_dirs = set()
                 self._server_dirs_ok = False
-            if overlap:
-                # 客户端文件目录若位于服务端仓库下，不算作「服务端在用的目录」
-                self._server_dirs.discard(overlap.split("/", 1)[0].lower())
+            if not self._scope:
+                overlap = _overlap_prefix(files_dir, server_root)
+                if overlap:
+                    # 客户端文件目录若位于服务端仓库下，不算作「服务端在用的目录」
+                    self._server_dirs.discard(overlap.split("/", 1)[0].lower())
             log.info("服务端根目录 %s 下存在的顶层目录：%s",
                      server_root, "、".join(sorted(self._server_dirs)) or "（无）")
             # 大小相同一律重新远程计算哈希确认内容（快速哈希，不下载文件），
             # 不再从旧快照继承哈希，防止服务端文件被外部改动且大小不变时漏检。
             self._fill_remote_hashes(sftp, files, local, progress_cb)
-        snap = update_snapshot(self.config.current_id(), files)
+        if self._scope:
+            # 范围外的旧快照条目保留（发布待办会复用 client_files/ 的读数）
+            snap = update_snapshot_scoped(self.config.current_id(), files, self._scope)
+        else:
+            snap = update_snapshot(self.config.current_id(), files)
         rows = self._diff_local(files, local)
         return json.dumps({"saved_at": snap.get("saved_at", ""),
                            "changed": snap.get("changed", False),
                            "aged": snap.get("aged", False),
                            "dirs_ok": self._server_dirs_ok,
+                           "scope": list(self._scope),
                            "rows": rows, "repo_count": len(files)},
                           ensure_ascii=False)
 
+    def _scan_remote_entry(self, sftp, files: dict, entry: str) -> None:
+        """范围扫描：读一个范围条目在服务端仓库与客户端文件目录里的对应位置。
+
+        文件夹条目递归列举其下所有文件；文件条目只取自身大小（不递归、不看同目录其它文件）。
+        """
+        excludes = self._excludes or None
+        for base, prefix in ((self.config.server_root, ""),
+                             (self.config.files_dir, "client_files/")):
+            remote = SFTPManager.join(base, entry)
+            if sftp.is_dir(remote):
+                for rel, size in sftp.list_files_recursive_with_size(
+                        remote, excludes=excludes, skip_system=False, max_workers=4):
+                    files[f"{prefix}{entry}/{rel}"] = {"size": size, "hash": None}
+            elif sftp.exists(remote):
+                files[f"{prefix}{entry}"] = {"size": sftp.file_size(remote), "hash": None}
+
+    def _local_files(self, root: str):
+        """按同步范围产出本地文件绝对路径（范围为空 = 整个客户端目录）。
+
+        范围里的文件夹递归遍历（排除规则、隐藏项照旧跳过），文件只取自身；
+        范围里的路径本地不存在时直接跳过（例如刚删掉的旧模组）。
+        """
+        excludes = self._excludes or set(DEFAULT_EXCLUDE)
+        for entry in self._scope or [""]:
+            full = os.path.join(root, *entry.split("/")) if entry else root
+            if os.path.isfile(full):
+                yield full
+                continue
+            for dirpath, dirnames, filenames in os.walk(full):
+                dirnames[:] = [d for d in dirnames
+                               if not d.startswith(".") and d.lower() not in excludes]
+                for fn in filenames:
+                    if fn.startswith("."):
+                        continue
+                    yield os.path.join(dirpath, fn)
+
     def _collect_local(self, root: str) -> dict:
         """收集本地新客户端文件：{rel: {"size", "mtime", "hash"}}（本地直接计算 MD5）。"""
-        excludes = self._excludes or set(DEFAULT_EXCLUDE)
         local: dict[str, dict] = {}
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames
-                           if not d.startswith(".") and d.lower() not in excludes]
-            for fn in filenames:
-                if fn.startswith("."):
-                    continue
-                full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, root).replace("\\", "/")
-                try:
-                    # 忽略的文件不参与差异检测：跳过本地 MD5 计算（省 IO）
-                    local_hash = None if self._is_ignored(rel) else hash_file_cached(full)
-                    info = {"size": os.path.getsize(full),
-                            "mtime": os.path.getmtime(full),
-                            "hash": local_hash}
-                except OSError:
-                    continue
-                local[rel] = info
+        for full in self._local_files(root):
+            rel = os.path.relpath(full, root).replace("\\", "/")
+            try:
+                info = {"size": os.path.getsize(full),
+                        "mtime": os.path.getmtime(full),
+                        "hash": hash_file_cached(full)}
+            except OSError:
+                continue
+            local[rel] = info
         return local
 
     def _fill_remote_hashes(self, sftp, files: dict, local: dict,
                             progress_cb=None) -> int:
         """远程计算哈希并回填 files，返回计算数量（快速哈希优先，多线程并行）。
 
-        只处理需要检测的文件：**被「忽略」的本地文件完全跳过**（不算远程哈希、
-        不参与改名匹配），只对标注为 client / server / both 且大小相同的候选
+        只处理需要检测的文件：只对标注为 client / server / both 且大小相同的候选
         重新确认内容，防止服务端文件被替换但大小不变时漏检。
+        （local 只含同步范围内的文件，范围外本来就不在这里。）
         """
         need: list[str] = []
         for rel, linfo in local.items():
-            if self._is_ignored(rel):
-                continue  # 忽略的文件不参与差异检测
             target, _ = self._effective_target(rel)
             for k in self._remote_keys_of(rel, target):
                 meta = files.get(k)
                 if (meta is not None and meta["size"] == linfo["size"]):
                     need.append(k)
         new_rels = [r for r in local
-                    if not self._is_ignored(r)
-                    and not any(k in files for k in
-                                self._remote_keys_of(r, self._effective_target(r)[0]))]
+                    if not any(k in files for k in
+                               self._remote_keys_of(r, self._effective_target(r)[0]))]
         server_only_sizes: dict[int, list[str]] = {}
         for k, meta in files.items():
             if k in local:
@@ -649,8 +779,6 @@ class RemoteFilePage(QWidget):
             row = {"rel": rel, "status": status, "size": info["size"],
                    "remote_size": remote_size, "mtime": info["mtime"],
                    "target": target, "manual": manual}
-            if self._is_ignored(rel):
-                row["ignored"] = True  # 保留原状态，恢复时直接还原
             rows.append(row)
 
         # 改名配对：本地新增 Y ↔ 服务端独有 X（大小 + 哈希都相同 → 视为改名而非 新增+删除）
@@ -688,8 +816,6 @@ class RemoteFilePage(QWidget):
                 row = {"rel": rel, "status": "obsolete", "size": 0,
                        "remote_size": snapshot_files[rel]["size"], "mtime": 0,
                        "target": "server", "manual": False}
-                if self._is_ignored(rel):
-                    row["ignored"] = True
                 rows.append(row)
 
         matched_x = set(matched.values())
@@ -703,8 +829,6 @@ class RemoteFilePage(QWidget):
             row = {"rel": rel, "status": "server", "size": 0,
                    "remote_size": snapshot_files[rel]["size"], "mtime": 0,
                    "target": "both", "manual": False}
-            if self._is_ignored(rel):
-                row["ignored"] = True
             rows.append(row)
         return rows
 
@@ -757,7 +881,10 @@ class RemoteFilePage(QWidget):
         repo_count = data.get("repo_count", 0)
         changed = data.get("changed", False)
         aged = data.get("aged", False)
-        self.lbl_snapshot.setText(f"服务端快照：{saved_at or '—'}（{repo_count} 个文件）")
+        scope = data.get("scope") or []
+        self.lbl_snapshot.setText(
+            f"服务端快照：{saved_at or '—'}"
+            f"（{'范围内' if scope else ''}{repo_count} 个文件）")
         self._rows = [dict(r, checked=(r["status"] != "server")) for r in rows]
         self._refresh_tree()
         new_n = sum(1 for r in self._rows if r["status"] == "new")
@@ -771,19 +898,24 @@ class RemoteFilePage(QWidget):
             snap_note = "快照已自动刷新（距上次超过时限）"
         else:
             snap_note = "快照已刷新（内容未变化，仅更新时间）"
-        if repo_count == 0:
+        if repo_count == 0 and not scope:
             self.lbl_status.setText(
                 "警告：未读取到服务端文件仓库（server_root）的任何文件。\n"
                 "扫描根目录时已自动跳过系统目录（usr、etc、proc、home 等）"
                 "与「规则…」中的排除目录（logs、cache 等）。\n"
                 "请检查「SFTP 设置」连接信息，或在本页「服务端版本根目录」处"
                 "填写服务器文件实际所在根目录（默认 /）。")
+        elif repo_count == 0:
+            self.lbl_status.setText(
+                "警告：同步范围里没有读到任何文件。\n"
+                "请确认范围里的路径在本地与服务端确实存在（点「同步范围…」可移除或恢复全量）。")
         else:
             self.lbl_status.setText(
                 f"对比完成：新增 {new_n}、更新 {upd_n}"
                 f"{f'、改名 {rnm_n}' if rnm_n else ''}、"
                 f"旧版残留 {obs_n}、服务端独有 {srv_n} ✔"
-                f"（服务端仓库共 {repo_count} 个文件，{snap_note}）")
+                f"（{'范围内' if scope else '服务端仓库共'} {repo_count} 个文件，{snap_note}）"
+                f"　｜　{self._scope_text()}")
         if not data.get("dirs_ok", True):
             # 目录列表没读到 → 默认发送目标无法按目录结构判定，全部退化成「双端」
             self.lbl_status.setText(
@@ -791,8 +923,9 @@ class RemoteFilePage(QWidget):
                 "\n警告：未能读取服务端根目录的目录列表，默认发送目标暂时全部按「双端」，"
                 "无法判断服务端在不在用某个目录。请检查连接后点「重新扫描」。")
             log.warning("未能读取服务端根目录的目录列表，默认发送目标已退化为「双端」")
-        log.info("更新服务端对比完成: new=%d update=%d rename=%d obsolete=%d server=%d repo=%d changed=%s aged=%s",
-                 new_n, upd_n, rnm_n, obs_n, srv_n, repo_count, changed, aged)
+        log.info("更新服务端对比完成: scope=%s new=%d update=%d rename=%d obsolete=%d server=%d repo=%d changed=%s aged=%s",
+                 "、".join(scope) or "全量", new_n, upd_n, rnm_n, obs_n, srv_n,
+                 repo_count, changed, aged)
 
     # ---------- 人工添加（本地浏览） ----------
     def _add_local_files(self):
@@ -862,6 +995,7 @@ class RemoteFilePage(QWidget):
             stats = []
         added = 0
         root = self.config.local_mc_dir
+        added_rels = []
         for rel, rsize in stats:
             if not rel or rel in {r["rel"] for r in self._rows}:
                 continue
@@ -882,7 +1016,9 @@ class RemoteFilePage(QWidget):
                                "mtime": mtime, "target": self._auto_target_of(rel),
                                "manual": False,
                                "checked": status != "same"})
+            added_rels.append(rel)
             added += 1
+        self._ensure_in_scope(added_rels)  # 人工加入的文件并入同步范围，重扫后不会丢
         self._refresh_tree()
         self.lbl_status.setText(f"已人工添加 {added} 个文件 ✔" if added
                                 else "没有可添加的新文件。")
@@ -916,8 +1052,7 @@ class RemoteFilePage(QWidget):
                "size": lsize, "remote_size": lsize,
                "mtime": mtime, "target": target,
                "manual": manual, "checked": True}
-        if self._is_ignored(rel):
-            row["ignored"] = True
+        self._ensure_in_scope([rel])  # 人工加入的文件并入同步范围，重扫后不会丢
         self._rows.append(row)
         self._refresh_tree()
         self.lbl_status.setText(f"已人工加入审核列表：{rel} ✔")
@@ -935,11 +1070,8 @@ class RemoteFilePage(QWidget):
         self.review_tree.addTopLevelItem(root_item)
 
         show_server = self.cb_show_server.isChecked()
-        show_ignored = self.cb_show_ignored.isChecked()
         nodes = {"": root_item}
         for r in self._rows:
-            if r.get("ignored") and not show_ignored:
-                continue  # 被忽略的默认隐藏，勾选「显示已忽略项」后展示以便恢复
             if r["status"] == "server" and not show_server:
                 continue  # 服务端独有文件默认不展示，勾选开关后才显示（可删除）
             parts = r["rel"].split("/")
@@ -961,11 +1093,9 @@ class RemoteFilePage(QWidget):
             mtime_text = (datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M")
                           if r.get("mtime") else "—")
             env_text, env_tip = self._env_cell(r["rel"])
-            ignored = bool(r.get("ignored"))
-            status_label = "已忽略" if ignored else STATUS_LABELS.get(r["status"], r["status"])
             node = QTreeWidgetItem([
                 fname,
-                status_label,
+                STATUS_LABELS.get(r["status"], r["status"]),
                 TARGET_LABELS.get(r["target"], r["target"]),
                 fmt_size(size) if size else "—",
                 ftype,
@@ -975,27 +1105,16 @@ class RemoteFilePage(QWidget):
             ])
             node.setData(0, Qt.UserRole, {
                 "rel": r["rel"], "kind": "file", "status": r["status"],
-                "target": r.get("target", "both"),
+                "target": r.get("target", "both"), "old_rel": r.get("old_rel", ""),
                 "size": r.get("size", 0), "mtime": r.get("mtime", 0), "ftype": ftype})
             node.setToolTip(2, self._target_tooltip(r))  # 目标判断依据（手动标注）
             node.setToolTip(6, env_tip)  # 分析结果列：判断依据/未检测到提示
             self._paint_version(node, r["rel"])  # 最新版本列（文本 / 提示 / 配色）
             if r.get("old_rel"):
                 node.setToolTip(1, f"原名：{r['old_rel']}")
-            if ignored:
-                node.setToolTip(1, "已忽略：不参与差异审查，右键可取消忽略恢复")
-                node.setToolTip(0, "已忽略（右键可取消）")
             parent_item.addChild(node)
-            # 新增/更新/旧版残留/仅服务器：可勾选；旧版残留、仅服务器=删除；已忽略不可勾选
-            if ignored:
-                node.setFlags(node.flags() & ~Qt.ItemIsUserCheckable)
-                gray = QBrush(QColor("#888888"))
-                for col in range(node.columnCount()):
-                    node.setForeground(col, gray)
-                font = node.font(0)
-                font.setItalic(True)
-                node.setFont(0, font)
-            elif r["status"] in ("new", "update", "rename", "server", "obsolete"):
+            # 新增/更新/旧版残留/仅服务器：可勾选；旧版残留、仅服务器=删除
+            if r["status"] in ("new", "update", "rename", "server", "obsolete"):
                 node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
                 node.setCheckState(0, Qt.Checked if r.get("checked") else Qt.Unchecked)
             else:
@@ -1020,14 +1139,13 @@ class RemoteFilePage(QWidget):
                         and r.get("target") != "skip")
         obs_n = sum(1 for r in self._rows if r["status"] == "obsolete")
         server_n = sum(1 for r in self._rows if r["status"] == "server")
-        ignored_n = sum(1 for r in self._rows if r.get("ignored"))
         tip = ("，服务端独有已隐藏" if server_n and not show_server else
                f"，服务端独有 {server_n}（可勾选删除）" if show_server else "")
-        ig_tip = f"，已忽略 {ignored_n}（勾选「显示已忽略项」可恢复）" if ignored_n else ""
         self.lbl_summary.setText(
             f"共 {len(self._rows)} 项：新增 {new_n}、更新 {upd_n}"
             f"{f'、旧版残留 {obs_n}（默认勾选删除）' if obs_n else ''}"
-            f"、待发送 {checked_n}{tip}{ig_tip}"
+            f"、待发送 {checked_n}{tip}"
+            f"　｜　{self._scope_text()}"
             "（目标：双端=服务端+客户端；客户端=只进 "
             f"{self.config.files_dir} 下的客户端目录。鼠标悬停「目标」列可看判定依据）")
 
@@ -1317,14 +1435,19 @@ class RemoteFilePage(QWidget):
         keys = []
         for it in selected:
             keys.extend(self._keys_of(it.data(0, Qt.UserRole) or {}))
-        # 忽略 / 取消忽略：被忽略的文件/文件夹不参与差异审查（可恢复）
-        all_ignored = bool(keys) and all(self._is_ignored(k) for k in keys)
-        act_ignore = menu.addAction(
-            "取消忽略（恢复显示）" if all_ignored else
-            ("忽略（不参与差异审查）" if len(selected) == 1
-             else f"忽略（{len(selected)} 项）"))
-        act_ignore.setToolTip("被忽略的文件/文件夹不出现在差异审查中（无论新增/更新），\n"
-                              "可在按钮行勾选「显示已忽略项」后右键恢复")
+        # 同步范围：只扫/只对比挑出来的文件夹与文件，范围外不读取、不参与对比
+        if not keys:
+            act_scope = None
+        elif self._scope:
+            in_scope = all(self._in_scope(k) for k in keys)
+            act_scope = menu.addAction("移出同步范围" if in_scope else "加入同步范围（只同步这些）")
+            act_scope.setToolTip("同步范围里的文件夹/文件才会被扫描与对比；移出后不再扫描它们")
+        else:
+            act_scope = menu.addAction("只同步此项（设为同步范围）")
+            act_scope.setToolTip(
+                "把当前项设为同步范围：之后只扫描、只对比这几个文件夹/文件，\n"
+                "范围外的内容不读取、不哈希、不出现在列表里（列表为空时扫描很慢）。\n"
+                "右键其它项可继续加入范围；点「同步范围…」可查看或恢复全量。")
         menu.addSeparator()
         mark_menu = menu.addMenu("标注为" if len(selected) == 1
                                  else f"标注为（{len(selected)} 项）")
@@ -1355,8 +1478,8 @@ class RemoteFilePage(QWidget):
         elif act is act_path:
             QApplication.clipboard().setText(d.get("rel", ""))
             self.lbl_status.setText(f"已复制相对路径：{d.get('rel', '')}")
-        elif act is act_ignore:
-            self._toggle_ignore(keys, ignore=not all_ignored)
+        elif act is act_scope:
+            self._toggle_scope(keys)
         elif act.parent() is mark_menu:
             # 标注分支先于百科分支：百科 action 的 parent 是主菜单，不会被误吞
             if act is act_auto:
@@ -1424,102 +1547,70 @@ class RemoteFilePage(QWidget):
             self.lbl_status.setText(
                 f"已恢复 {changed} 个文件/文件夹的自动标注 ✔（已保存）")
 
-    def _toggle_ignore(self, keys: list[str], ignore: bool):
-        """忽略 / 取消忽略指定文件或文件夹（前缀），持久化并刷新差异树。
-
-        被忽略的项保留原始差异状态，取消后直接还原显示。
-        采用增量更新（仅刷新受影响行），不重建树、不改变目录树的展开/滚动状态。
-        """
-        for k in keys:
-            if ignore:
-                self._ignored[k] = True
-            else:
-                self._ignored.pop(k, None)
-        self.config.ignore_overrides = dict(self._ignored)
-        # 同步当前 rows 的 ignored 标记（保留原状态字段，恢复时还原）
-        for r in self._rows:
-            if self._is_ignored(r["rel"]):
-                r["ignored"] = True
-            else:
-                r.pop("ignored", None)
-        self._sync_ignore_rows(self.review_tree.topLevelItem(0))
-        self._update_summary()
-        n = len(keys)
-        if ignore:
-            self.lbl_status.setText(
-                f"已忽略 {n} 个文件/文件夹 ✔（勾选「显示已忽略项」可查看并恢复）")
+    def _toggle_scope(self, keys: list[str]):
+        """右键「只同步此项 / 加入范围 / 移出范围」：改完范围立即按新范围重扫。"""
+        if not self._scope:
+            # 之前是全量：把选中项直接设为范围（范围外不再扫描）
+            self._set_scope(keys, f"已切换为按范围同步：{'、'.join(keys)}（范围外不再扫描）")
+            return
+        in_scope = all(self._in_scope(k) for k in keys)
+        if in_scope:
+            remain = [k for k in self._scope
+                      if not any(k == x or k.startswith(x + "/") for x in keys)]
+            self._set_scope(remain, f"已移出同步范围：{'、'.join(keys)}")
         else:
-            self.lbl_status.setText(f"已取消忽略 {n} 个文件/文件夹，恢复显示 ✔")
+            self._set_scope(list(self._scope) + keys,
+                            f"已加入同步范围：{'、'.join(keys)}")
 
-    def _sync_ignore_rows(self, root) -> bool:
-        """增量刷新已忽略行的显示/隐藏与样式，返回该节点下是否有可见子项。
+    def _set_scope(self, entries, message: str):
+        """保存同步范围（持久化）并按新范围重新扫描。"""
+        self._scope = _norm_scope(entries)
+        self.config.sync_scope = list(self._scope)
+        self._update_scope_button()
+        self.lbl_status.setText(message + "，正在按新范围重新检测…")
+        self._auto_detect()
 
-        不重建树：只更新受影响行的状态文本、灰色斜体样式与隐藏状态，
-        文件夹节点按可见子项自动隐藏/显示。
-        """
-        if root is None:
-            return False
-        show_ignored = self.cb_show_ignored.isChecked()
-        by_rel = {r["rel"]: r for r in self._rows}
-        default_font = QFont(self.review_tree.font())
+    def _open_scope_dialog(self):
+        """「同步范围…」：查看/移除范围条目，或恢复全量。"""
+        dlg = SyncScopeDialog(self._scope, self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_scope = dlg.scope()
+        if new_scope == self._scope:
+            self.lbl_status.setText("同步范围未改动。")
+            return
+        self._set_scope(new_scope, "已恢复全量同步（扫描整个客户端目录）" if not new_scope
+                        else f"同步范围已更新为 {len(new_scope)} 项")
 
-        def walk(item) -> bool:
-            d = item.data(0, Qt.UserRole) or {}
-            if d.get("kind") == "file":
-                row = by_rel.get(d.get("rel", ""))
-                ignored = bool(row and row.get("ignored"))
-                if ignored:
-                    item.setText(1, "已忽略")
-                    gray = QBrush(QColor("#888888"))
-                    for col in range(item.columnCount()):
-                        item.setForeground(col, gray)
-                    f = item.font(0)
-                    f.setItalic(True)
-                    item.setFont(0, f)
-                    item.setToolTip(1, "已忽略：不参与差异审查，右键可取消忽略恢复")
-                    item.setToolTip(0, "已忽略（右键可取消）")
-                    item.setHidden(not show_ignored)
-                    return show_ignored
-                # 恢复普通显示
-                if row:
-                    item.setText(1, STATUS_LABELS.get(row["status"], row["status"]))
-                for col in range(item.columnCount()):
-                    item.setForeground(col, QBrush())
-                item.setFont(0, default_font)
-                item.setToolTip(1, "")
-                item.setToolTip(0, "")
-                item.setHidden(False)
-                return True
-            # 文件夹：递归后按可见子项决定隐藏
-            any_visible = False
-            for i in range(item.childCount()):
-                if walk(item.child(i)):
-                    any_visible = True
-            item.setHidden(not any_visible)
-            return any_visible
-
-        return walk(root)
+    def _ensure_in_scope(self, rels: list[str]):
+        """人工加入审核列表的文件并入同步范围，否则下次按范围扫描时会被丢掉。"""
+        if not self._scope:
+            return
+        merged = _norm_scope(self._scope + list(rels))
+        if merged != self._scope:
+            self._scope = merged
+            self.config.sync_scope = list(merged)
+            self._update_scope_button()
 
     def _collect_actions(self):
         """收集发送动作：
         uploads=[(rel, target)]，deletes=[server_root 相对路径]，deletes_client=[files_dir 相对路径]，
-        返回 (uploads, deletes, deletes_client, 旧版残留数量)。
+        返回 (uploads, deletes, deletes_client, 旧版残留数量, 改名映射 {新 rel: 旧 rel})。
         改名 = 上传新文件 + 删除旧文件；client_files/ 前缀的删除走 files_dir。
         """
         root = self.review_tree.topLevelItem(0)
         if root is None:
-            return [], [], [], 0
+            return [], [], [], 0, {}
         uploads: list[tuple[str, str]] = []
         deletes: list[str] = []
         deletes_client: list[str] = []
+        renames: dict[str, str] = {}
         obsolete_n = 0
 
         def walk(item):
             nonlocal obsolete_n
             d = item.data(0, Qt.UserRole) or {}
             if d.get("kind") == "file":
-                if d.get("ignored"):
-                    return  # 已忽略项不参与发送
                 if item.checkState(0) != Qt.Checked:
                     return
                 status = d.get("status")
@@ -1530,11 +1621,16 @@ class RemoteFilePage(QWidget):
                     # 改名 = 上传新文件（按目标）+ 删除旧文件（按原位置）
                     if d.get("target") != "skip":
                         uploads.append((d["rel"], d.get("target", "both")))
-                    old = d.get("old_rel", "")
-                    if old.startswith("client_files/"):
-                        deletes_client.append(old[len("client_files/"):])
+                    old = (d.get("old_rel") or "").strip("/")
+                    if not old:
+                        # 旧名为空说明数据不完整：宁可不删，也绝不退化成删除远程根目录
+                        log.warning("改名项缺少原文件名，已跳过旧文件删除: %s", d.get("rel"))
                     else:
-                        deletes.append(old)
+                        renames[d["rel"]] = old
+                        if old.startswith("client_files/"):
+                            deletes_client.append(old[len("client_files/"):])
+                        else:
+                            deletes.append(old)
                 elif status in ("server", "obsolete"):
                     rel = d["rel"]
                     if rel.startswith("client_files/"):
@@ -1548,7 +1644,9 @@ class RemoteFilePage(QWidget):
                     walk(item.child(i))
 
         walk(root)
-        return uploads, deletes, deletes_client, obsolete_n
+        deletes = [r for r in deletes if r]
+        deletes_client = [r for r in deletes_client if r]
+        return uploads, deletes, deletes_client, obsolete_n, renames
 
     def _remove_rows(self):
         items = self.review_tree.selectedItems()
@@ -1992,7 +2090,7 @@ class RemoteFilePage(QWidget):
         检测的目的：确保客户端模组只进客户端文件目录（client_files/mods），
         服务端模组只进服务端 mods，不让客户端模组被误传进服务端 mods。
         """
-        uploads, deletes, deletes_client, _obsolete = self._collect_actions()
+        uploads, deletes, deletes_client, _obsolete, _renames = self._collect_actions()
         if not uploads and not deletes and not deletes_client:
             winutil.warn(self, "提示",
                          "没有勾选任何操作。\n\n勾选「新增/更新/改名」= 上传（按目标，改名同时删除旧文件）；\n"
@@ -2133,7 +2231,7 @@ class RemoteFilePage(QWidget):
         corrected = corrected or []
         conflicts = conflicts or []
         unsure = unsure or []
-        uploads, deletes, deletes_client, obsolete_n = self._collect_actions()
+        uploads, deletes, deletes_client, obsolete_n, renames = self._collect_actions()
         if not uploads and not deletes and not deletes_client:
             winutil.warn(self, "提示",
                          "没有勾选任何操作。\n\n勾选「新增/更新/改名」= 上传（按目标，改名同时删除旧文件）；\n"
@@ -2146,6 +2244,8 @@ class RemoteFilePage(QWidget):
             lines.append(f"【上传】共 {len(uploads)} 个文件")
             lines.append(f"· 服务端 {self.config.server_root}：{server_n} 个")
             lines.append(f"· 客户端 {self.config.files_dir}：{client_n} 个（双端会两边都放）")
+            if renames:
+                lines.append(f"· 其中改名 {len(renames)} 个（上传新文件名 + 删除旧文件）")
         del_n = len(deletes) + len(deletes_client)
         if del_n:
             if obsolete_n:
@@ -2186,27 +2286,34 @@ class RemoteFilePage(QWidget):
             return
         self.btn_send.setEnabled(False)
         self.btn_scan.setEnabled(False)
-        worker = Worker(self._send_worker, uploads, deletes, deletes_client)
+        worker = Worker(self._send_worker, uploads, deletes, deletes_client, renames)
         worker.progress.connect(self._on_progress)
         worker.done.connect(self._on_send_done)
         self._worker = worker
         worker.start()
 
     def _remote_disp(self, remote: str) -> str:
-        """远程路径显示：转为相对服务端根目录，便于区分服务端与 client_files。"""
-        root = self.config.server_root.rstrip("/") + "/"
-        if remote.startswith(root):
-            return remote[len(root):]
+        """远程路径显示：服务端文件相对 server_root，客户端文件带 client_files/ 前缀。"""
+        for root, prefix in ((self.config.server_root, ""),
+                             (self.config.files_dir, "client_files/")):
+            base = root.rstrip("/") + "/"
+            if remote.startswith(base):
+                return prefix + remote[len(base):]
         return remote
 
-    def _send_worker(self, uploads, deletes, deletes_client, progress_cb=None) -> str:
+    def _send_worker(self, uploads, deletes, deletes_client, renames=None,
+                     progress_cb=None) -> str:
         """按目标上传：双端→服务端与 client_files 各一份，服务端→server_root，客户端→client_files。
 
         删除分两类：deletes 删除 server_root 下的文件，deletes_client 删除 files_dir 下的文件
         （client_files/ 前缀 / 改名旧文件）。
         进度消息显示远程目标路径（相对服务端根目录），
         客户端的一律带 client_files 前缀，避免与本地相对路径混淆。
+        改名项（renames: 新 rel → 旧 rel）的进度显示为「改名 旧 → 新」，
+        而不是含糊的「上传」——它同时还要删掉旧文件。
         """
+        renames = renames or {}
+
         def steps_of(target: str) -> int:
             return 2 if target == "both" else 1
 
@@ -2219,40 +2326,35 @@ class RemoteFilePage(QWidget):
                          self.config.username(), self.config.password()) as sftp:
             for rel, target in uploads:
                 local = os.path.join(root, rel)
-                if target in ("server", "both"):
+                old = renames.get(rel, "")
+                for step_target, dest in (("server", server_root), ("client", client_dir)):
+                    if target != "both" and target != step_target:
+                        continue
                     done += 1
-                    remote = TodoManifest.remote_source_path(sftp, server_root, rel)
+                    remote = TodoManifest.remote_source_path(sftp, dest, rel)
                     sftp.upload(local, remote)
                     if progress_cb:
-                        progress_cb(done, total,
-                                    f"上传 {self._remote_disp(remote)}"
-                                    f"（{TARGET_LABELS.get(target, target)}）")
-                if target in ("client", "both"):
-                    done += 1
-                    remote = TodoManifest.remote_source_path(sftp, client_dir, rel)
-                    sftp.upload(local, remote)
-                    if progress_cb:
-                        progress_cb(done, total,
-                                    f"上传 {self._remote_disp(remote)}"
-                                    f"（{TARGET_LABELS.get(target, target)}）")
-            for rel in deletes:
+                        if old:
+                            msg = (f"改名 {old} → {self._remote_disp(remote)}"
+                                   f"（{TARGET_LABELS.get(target, target)}）")
+                        else:
+                            msg = (f"上传 {self._remote_disp(remote)}"
+                                   f"（{TARGET_LABELS.get(target, target)}）")
+                        progress_cb(done, total, msg)
+            rename_olds = {o[len("client_files/"):] if o.startswith("client_files/") else o
+                           for o in renames.values()}
+            for rel, is_client in ([(r, False) for r in deletes]
+                                   + [(r, True) for r in deletes_client]):
                 done += 1
-                remote = TodoManifest.remote_source_path(sftp, server_root, rel)
+                dest = client_dir if is_client else server_root
+                remote = TodoManifest.remote_source_path(sftp, dest, rel)
                 if sftp.is_dir(remote):
                     sftp.delete_dir(remote)
                 else:
                     sftp.delete(remote)
                 if progress_cb:
-                    progress_cb(done, total, f"删除 {self._remote_disp(remote)}")
-            for rel in deletes_client:
-                done += 1
-                remote = TodoManifest.remote_source_path(sftp, client_dir, rel)
-                if sftp.is_dir(remote):
-                    sftp.delete_dir(remote)
-                else:
-                    sftp.delete(remote)
-                if progress_cb:
-                    progress_cb(done, total, f"删除 {self._remote_disp(remote)}")
+                    head = "改名：删除旧文件" if rel in rename_olds else "删除"
+                    progress_cb(done, total, f"{head} {self._remote_disp(remote)}")
         return f"已上传 {len(uploads)} 个、删除 {len(deletes) + len(deletes_client)} 个。"
 
     def _on_progress(self, current, total, message):
