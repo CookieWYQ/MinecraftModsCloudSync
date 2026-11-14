@@ -13,6 +13,7 @@ from PySide6.QtCore import QThread, Signal
 
 from app_common import winutil
 from app_common.app_config import ClientConfig
+from app_common.auto_sync import apply_sync, load_policy, plan_sync
 from app_common.c2c import files_root as c2c_files_root
 from app_common.c2c import load_client_manifest
 from app_common.constants import (
@@ -24,7 +25,7 @@ from app_common.license import AuthError, verify
 from app_common.logger import get_logger
 from app_common.profile import client_identity, parse_profile_content
 from app_common.sftp import SFTPError, SFTPManager
-from app_common.tasks import TodoManifest, safe_target
+from app_common.tasks import TodoManifest, manifest_signature, safe_target
 from app_common.upload_files import upload_files_dir
 
 log = get_logger("client.engine")
@@ -115,7 +116,8 @@ def check_all(config: ClientConfig, progress_cb=None) -> dict:
                     c2c_manifest = None
             if manifest is not None:
                 config.mark_seen(sid, manifest.version,
-                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 sig=manifest_signature(manifest))
             if c2c_manifest is not None:
                 config.mark_seen_c2c(sid, c2c_manifest.version,
                                      datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -133,6 +135,35 @@ def check_all(config: ClientConfig, progress_cb=None) -> dict:
         if progress_cb:
             progress_cb(i + 1, len(profiles), name)
     return results
+
+
+def is_manifest_new(profile: dict, manifest: TodoManifest | None,
+                    c2c_manifest: TodoManifest | None = None) -> bool:
+    """该服务器的清单是否算「有新更新」（客户端决定提醒/允许应用）。
+
+    判定：版本号变化，或版本号相同但清单内容指纹变化。
+    后者用于「服务器当天二次发布、版本号重复」的情况——只比版本号会漏掉。
+    """
+    profile = profile or {}
+    if manifest is not None:
+        if manifest.version != profile.get("last_applied_version", ""):
+            return True
+        prev_sig = profile.get("last_applied_sig") or ""
+        if prev_sig and manifest_signature(manifest) != prev_sig:
+            return True
+    if c2c_manifest is not None and \
+            c2c_manifest.version != profile.get("last_applied_c2c", ""):
+        return True
+    return False
+
+
+def is_silent_batch(*manifests: TodoManifest | None) -> bool:
+    """这批清单是否全部由「静默 + 非可选」任务组成（客户端可后台自动应用）。
+
+    服务端「发布待办」页勾选「静默下载应用」时，会给该批全部任务打 silent 标记。
+    """
+    tasks = [t for m in manifests if m is not None for t in m.tasks]
+    return bool(tasks) and all(t.silent and not t.optional for t in tasks)
 
 
 # ---------------- 应用更新 ----------------
@@ -284,3 +315,96 @@ def apply_update(config: ClientConfig, profile: dict, manifest: TodoManifest,
             summary["errors"].append(f"设置 {key}（{exc}）")
 
     return summary
+
+
+# ---------------- 自动同步（免待办直连拉取） ----------------
+AUTO_SYNC_SKIP_LABELS = {
+    "policy_missing": "服务器尚未下发自动同步策略",
+    "policy_disabled": "服务器已关闭自动同步",
+    "policy_empty": "服务器的同步范围为空白名单",
+}
+
+
+class AutoSyncThread(QThread):
+    """按服务端策略对比服务器文件仓库与本地游戏目录，并自动下载差异。
+
+    与 S2C 待办互不影响；只下载新增/变化文件，不删除本地文件。
+    """
+
+    done = Signal(bool, object, str)  # (成功, result dict, 错误信息)
+    progress = Signal(int, int, str)
+
+    def __init__(self, config: ClientConfig, profile: dict,
+                 apply: bool = True, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.profile = profile
+        self.apply = apply
+
+    def run(self):
+        try:
+            result = auto_sync_run(self.config, self.profile, self.apply,
+                                   self._progress)
+            self.done.emit(True, result, "")
+        except AuthError as exc:
+            log.warning("自动同步授权校验未通过: %s", exc)
+            self.done.emit(False, None, f"授权:{exc}")
+        except Exception as exc:
+            log.exception("自动同步失败")
+            self.done.emit(False, None, str(exc))
+
+    def _progress(self, cur: int, total: int, msg: str):
+        self.progress.emit(cur, total, msg)
+
+
+def auto_sync_run(config: ClientConfig, profile: dict, apply: bool = True,
+                  progress_cb=None) -> dict:
+    """读取服务端策略 → 扫描对比 → （可选）下载差异文件。
+
+    返回字段：
+    - ``skipped``：非空表示本次没有执行（policy_missing / policy_disabled /
+      policy_empty），其余字段为空；
+    - ``downloads`` / ``installed``：计划下载、实际下载成功的相对路径；
+    - ``extras``：本地有、服务器没有的文件（只报告，不删除）；
+    - ``errors`` / ``warnings``：下载失败项与提示（如文件名大小写冲突）。
+    """
+    profile = profile or {}
+    info = profile_sftp_info(profile)
+    ident = client_identity(profile)  # 客户端身份：client_id，旧配置回退 server_id
+    game_dir = config.local_mc_dir
+    if not game_dir or not os.path.isdir(game_dir):
+        raise RuntimeError("游戏目录无效，请先在主界面选择客户端根目录。")
+
+    result = {
+        "skipped": "", "policy": {},
+        "remote_files": 0, "local_files": 0,
+        "downloads": [], "installed": [], "errors": [], "extras": [],
+        "total_bytes": 0, "bytes": 0, "warnings": [], "scanned_at": "",
+    }
+    with _connect(info) as sftp:
+        verify(sftp, ident)
+        policy = load_policy(sftp, info["todo_dir"])
+        if policy is None:
+            result["skipped"] = "policy_missing"
+            return result
+        result["policy"] = policy
+        if not policy.get("enabled"):
+            result["skipped"] = "policy_disabled"
+            return result
+        if not policy.get("include"):
+            result["skipped"] = "policy_empty"
+            return result
+        plan = plan_sync(sftp, info["files_dir"], game_dir, policy,
+                         progress_cb)
+        for key in ("remote_files", "local_files", "downloads", "extras",
+                    "total_bytes", "warnings", "scanned_at"):
+            result[key] = plan.get(key, result.get(key))
+        if apply and plan["downloads"]:
+            summary = apply_sync(sftp, info["files_dir"], game_dir,
+                                 plan["downloads"], progress_cb)
+            result["installed"] = summary["installed"]
+            result["errors"] = summary["errors"]
+            result["bytes"] = summary["bytes"]
+        elif apply and progress_cb:
+            progress_cb(0, 0, "已是最新，无需下载")
+    return result

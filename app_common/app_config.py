@@ -285,6 +285,49 @@ class ServerConfig:
         self.remote = {**self.remote, "client_mods": list(value or [])}
 
     @property
+    def history_enabled(self) -> bool:
+        """「更新服务端」删除 / 替换前，是否把旧文件备份到服务器历史目录（回收站）。"""
+        return bool(self.remote.get("history_enabled", False))
+
+    @history_enabled.setter
+    def history_enabled(self, value) -> None:
+        self.remote = {**self.remote, "history_enabled": bool(value)}
+
+    @property
+    def history_keep(self) -> int:
+        """每条路径最多保留的历史版本数（1–50，默认 3）。"""
+        try:
+            n = int(self.remote.get("history_keep", 3))
+        except (TypeError, ValueError):
+            n = 3
+        return max(1, min(50, n))
+
+    @history_keep.setter
+    def history_keep(self, value) -> None:
+        try:
+            n = max(1, min(50, int(value)))
+        except (TypeError, ValueError):
+            n = 3
+        self.remote = {**self.remote, "history_keep": n}
+
+    @property
+    def history_max_mb(self) -> int:
+        """历史目录总大小上限（MB，0 = 不限，默认 512）。"""
+        try:
+            n = int(self.remote.get("history_max_mb", 512))
+        except (TypeError, ValueError):
+            n = 512
+        return max(0, min(20480, n))
+
+    @history_max_mb.setter
+    def history_max_mb(self, value) -> None:
+        try:
+            n = max(0, min(20480, int(value)))
+        except (TypeError, ValueError):
+            n = 512
+        self.remote = {**self.remote, "history_max_mb": n}
+
+    @property
     def auto_targets(self) -> dict:
         """发送前环境检测自动纠正的发送目标（rel → target）。
 
@@ -415,6 +458,8 @@ class ClientConfig:
             "autostart": False,
             "notify": True,
             "auto_update_check": True,
+            "auto_sync_enabled": False,
+            "auto_sync_interval_min": 30,
             "profiles": [],
         })
 
@@ -441,10 +486,15 @@ class ClientConfig:
             "content": content,
             "last_applied_version": "",
             "last_applied_at": "",
+            "last_applied_sig": "",
             "last_seen_version": "",
             "last_seen_at": "",
+            "last_seen_sig": "",
             "last_applied_c2c": "",
             "last_seen_c2c": "",
+            "auto_sync_at": "",
+            "auto_sync_files": 0,
+            "auto_sync_status": "",
         })
         self.store.set("profiles", profiles)
 
@@ -460,15 +510,22 @@ class ClientConfig:
                 break
         self.store.set("profiles", profiles)
 
-    def mark_applied(self, server_id: str, version: str, applied_at: str) -> None:
-        self._update_profile(server_id,
-                             last_applied_version=version,
-                             last_applied_at=applied_at)
+    def mark_applied(self, server_id: str, version: str, applied_at: str,
+                     sig: str = "") -> None:
+        """记录已应用版本；sig 为清单内容指纹（版本号相同但内容变过时用来识别）。"""
+        fields = {"last_applied_version": version,
+                  "last_applied_at": applied_at}
+        if sig:
+            fields["last_applied_sig"] = sig
+        self._update_profile(server_id, **fields)
 
-    def mark_seen(self, server_id: str, version: str, seen_at: str) -> None:
-        self._update_profile(server_id,
-                             last_seen_version=version,
-                             last_seen_at=seen_at)
+    def mark_seen(self, server_id: str, version: str, seen_at: str,
+                  sig: str = "") -> None:
+        fields = {"last_seen_version": version,
+                  "last_seen_at": seen_at}
+        if sig:
+            fields["last_seen_sig"] = sig
+        self._update_profile(server_id, **fields)
 
     def mark_applied_c2c(self, server_id: str, version: str) -> None:
         self._update_profile(server_id, last_applied_c2c=version)
@@ -529,6 +586,37 @@ class ClientConfig:
     @notify.setter
     def notify(self, value: bool) -> None:
         self.store.set("notify", bool(value))
+
+    # ---- 自动同步（免待办直连拉取） ----
+    @property
+    def auto_sync_enabled(self) -> bool:
+        """客户端本地的自动同步开关（默认关闭；服务端策略还需启用才生效）。"""
+        return bool(self.store.get("auto_sync_enabled", False))
+
+    @auto_sync_enabled.setter
+    def auto_sync_enabled(self, value: bool) -> None:
+        self.store.set("auto_sync_enabled", bool(value))
+
+    @property
+    def auto_sync_interval_min(self) -> int:
+        """自动同步检测间隔（分钟），限制在 5–1440。"""
+        try:
+            return max(5, min(1440, int(self.store.get(
+                "auto_sync_interval_min", 30))))
+        except (TypeError, ValueError):
+            return 30
+
+    @auto_sync_interval_min.setter
+    def auto_sync_interval_min(self, value: int) -> None:
+        self.store.set("auto_sync_interval_min",
+                       max(5, min(1440, int(value))))
+
+    def mark_auto_sync(self, server_id: str, when: str, files: int,
+                       status: str = "") -> None:
+        """记录最近一次自动同步结果（仅用于界面展示）。"""
+        self._update_profile(server_id, auto_sync_at=when,
+                             auto_sync_files=int(files),
+                             auto_sync_status=str(status))
 
     # ---- 软件本体更新 ----
     @property

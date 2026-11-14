@@ -47,6 +47,64 @@ def filename_base(name: str) -> str:
     return stem.strip().lower()
 
 
+# ---------- 文件名归一化（旧版残留 / 垃圾文件判定） ----------
+# 临时/备份类后缀：.bak / .temp / .new / .old / .tmp，以及带时间戳的 .disabled.1793431851
+JUNK_SUFFIX_RE = re.compile(
+    r"\.(?:bak|temp|tmp|new|old)(?:\.\d+)?$|\.disabled\.\d+$", re.IGNORECASE)
+_ANY_SUFFIX_RE = re.compile(
+    r"\.(?:jar|zip|disabled|bak|temp|tmp|new|old)(?:\.\d+)?$", re.IGNORECASE)
+_LOADER_TOKENS = {"neoforge", "forge", "fabric", "quilt", "neo", "mc"}
+_VERSION_TOKEN_RE = re.compile(r"^[vV]?\d")
+
+
+def is_junk_filename(name: str) -> bool:
+    """是否临时/备份文件（不参与同步；服务端发现时按「临时/备份」列出可清理）。"""
+    return bool(JUNK_SUFFIX_RE.search(name or ""))
+
+
+def strip_file_suffixes(name: str) -> str:
+    """去掉 .jar / .zip / .disabled / .bak 等尾部后缀（只剥后缀，不动主体）。"""
+    out = name or ""
+    for _ in range(6):
+        new = _ANY_SUFFIX_RE.sub("", out)
+        if new == out:
+            break
+        out = new
+    return out
+
+
+def mod_key(name: str) -> str:
+    """模组文件名的归一化身份键：同一模组的版本升级 / 换名尽量得到同一个键。
+
+    规则：
+    1. 去掉 .jar / .disabled / .bak / .new 等尾部后缀；
+    2. 按 -/_/./空格/加号切词；
+    3. 丢弃加载器词（neoforge/forge/fabric/quilt/neo/mc）；
+    4. 遇到第一个「版本段」（以数字或 v+数字开头的词）就停止，后面都是版本/环境信息；
+    5. 剩余词只保留字母数字并转小写后拼接（中文/符号前缀自动忽略）。
+
+    这样以下都会归一为同一个键（createcentralkitchen / copycats / itemphysic）：
+      create-central-kitchen-2.6.2.jar       ↔ create-central-kitchen-2.6.2b.jar
+      copycats-3.0.9+mc.1.21.1-neoforge.jar  ↔ copycats-3.0.11+mc.1.21.1-neoforge.jar
+      ItemPhysic_NEOFORGE_v1.8.13_mc1.21.1   ↔ ItemPhysic_NEOFORGE_v1.8.17_mc1.21.1
+    """
+    stem = strip_file_suffixes(name)
+    key: list[str] = []
+    for token in re.split(r"[-_.+ ]+", stem):
+        if not token:
+            continue
+        clean = re.sub(r"[^A-Za-z0-9]", "", token).lower()
+        if not clean:
+            continue
+        if clean in _LOADER_TOKENS:
+            continue
+        if _VERSION_TOKEN_RE.match(token) and key:
+            break
+        key.append(clean)
+    return "".join(key)
+
+
+
 def _parse_toml_modid(text: bytes) -> str:
     """mods.toml / neoforge.mods.toml：取第一个 modId="..."。"""
     m = re.search(rb'modId\s*=\s*"([^"]+)"', text)

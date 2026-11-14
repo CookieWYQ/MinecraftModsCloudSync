@@ -21,3 +21,12 @@ release/
 
 # 运行时数据目录（配置与日志，位于安装目录下）
 .mc-sync-data/
+
+# 本地临时预览脚本与截图（开发辅助，不入库）
+tools/_tmp_*
+
+# 本地安装包（正式产物发布到 Release，不入库）
+MinecraftModsCloudSync_Setup_*.exe
+
+# 临时探测脚本
+_tmp_*.py

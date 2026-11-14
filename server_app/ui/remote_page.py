@@ -37,8 +37,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app_common import winutil
+from app_common import mod_online, winutil
 from app_common.file_hash import hash_file_cached, hash_remote_parallel
+from app_common.history import HistoryStore
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_display_name
 from app_common.mod_env import (
@@ -49,7 +50,11 @@ from app_common.mod_env import (
     side_label,
     side_summary,
 )
-from app_common.mod_identity import filename_base, jar_identifiers
+from app_common.mod_identity import (
+    is_junk_filename,
+    jar_identifiers,
+    mod_key,
+)
 from app_common.mod_version import (
     VER_AHEAD,
     VER_LATEST,
@@ -74,7 +79,8 @@ from .remote_tree import RemoteTreeWidget, SelectTreeWidget, fmt_size
 log = get_logger("server.remote_page")
 
 STATUS_LABELS = {"new": "新增", "update": "更新", "server": "仅服务器",
-                 "obsolete": "旧版残留", "same": "已一致", "rename": "改名"}
+                 "obsolete": "旧版残留", "junk": "临时/备份",
+                 "same": "已一致", "rename": "改名"}
 
 # 「最新版本」列的状态配色：有新版本最需要引起注意，未查到保持灰色不喧宾夺主
 _VERSION_COLORS = {
@@ -255,6 +261,8 @@ class RemoteFilePage(QWidget):
         self._env_sources: dict[str, str] = {}   # 文件名 → 判断来源说明
         self._env_summaries: dict[str, str] = {}  # 文件名 → 两侧状态摘要（客户端/服务端各自的要求）
         self._version_results: dict[str, dict] = {}  # 文件名 → 版本检查结果（本地是否为旧版）
+        self._online_results: dict[str, dict] = {}  # rel → 联网核对结果（Modrinth / CurseForge）
+        self._online_busy = False
         self._build()
         self._load_config()
 
@@ -297,6 +305,15 @@ class RemoteFilePage(QWidget):
             "一致才用本地文件分析，否则从服务端下载到临时目录分析）\n"
             "确认后把判定为「仅客户端」的模组搬到客户端文件目录的 mods 下，\n"
             "并自动标注为「客户端」，避免下次发送又把它传回服务端 mods")
+        self.btn_online = QPushButton("联网核对…")
+        self.btn_online.setToolTip(
+            "用 Modrinth / CurseForge 的项目文件列表核对「旧版残留」：\n"
+            "· 服务端文件名精确出现在某模组项目的文件列表里 → 确认它属于该模组；\n"
+            "· 按发布时间/版本号判断服务端那份是旧版还是**比本地更新**"
+            "（服端更新会自动取消勾选，避免删了导致玩家降级）；\n"
+            "· 还能发现文件名归一化漏掉的旧版（渠道文件列表里有、本地已有同一项目）。\n"
+            "离线/查不到时只显示「未收录」，不会影响原本的勾选；"
+            "结果缓存 7 天，第二次核对很快。")
         self.btn_apply_env = QPushButton("全部应用")
         self.btn_apply_env.setObjectName("primary")
         self.btn_apply_env.setToolTip("把本次分析结果写入标注（已手动标注的不覆盖）；\n"
@@ -306,19 +323,34 @@ class RemoteFilePage(QWidget):
         self.btn_cancel_env.hide()
         self.cb_show_server = QCheckBox("显示服务端独有文件（可勾选删除）")
         self.cb_show_server.setToolTip("服务端有而本地没有的文件；勾选后发送时将从服务端删除")
+        self.btn_history = QPushButton("历史版本…")
+        self.btn_history.setToolTip(
+            "查看 / 还原「更新服务端」删除或替换过的旧文件。\n"
+            "可在对话框里开启「删除前备份」，并设置每条路径保留几个版本、"
+            "历史目录最多占多少 MB。\n"
+            "历史文件保存在服务器客户端文件目录下的 .mc-sync-history"
+            "（隐藏目录，不参与同步与发布）。")
         self.btn_scope = QPushButton("同步范围…")
         btn_row.addWidget(self.btn_scan)
         btn_row.addWidget(self.btn_add_local)
         btn_row.addWidget(self.btn_remove)
         btn_row.addWidget(self.btn_browse_remote)
         btn_row.addWidget(self.btn_analyze)
+        btn_row.addWidget(self.btn_online)
         btn_row.addWidget(self.btn_tidy_mods)
         btn_row.addWidget(self.btn_apply_env)
         btn_row.addWidget(self.btn_cancel_env)
         btn_row.addStretch(1)
-        btn_row.addWidget(self.btn_scope)
-        btn_row.addWidget(self.cb_show_server)
         layout.addLayout(btn_row)
+
+        # 第二行：同步范围 / 历史版本 / 显示服务端独有
+        # （按钮较多，窄窗口下挤在一行会把右侧复选框截断，单独一行更稳）
+        sub_row = QHBoxLayout()
+        sub_row.addWidget(self.cb_show_server)
+        sub_row.addStretch(1)
+        sub_row.addWidget(self.btn_scope)
+        sub_row.addWidget(self.btn_history)
+        layout.addLayout(sub_row)
 
         # ---- 差异审核树 ----
         review_box = QGroupBox("差异审核（勾选发送；右键可复制 / 标注为双端、客户端或服务端）")
@@ -345,9 +377,10 @@ class RemoteFilePage(QWidget):
         rv.addLayout(toolbar)
 
         self.review_tree = SelectTreeWidget()
-        self.review_tree.setColumnCount(8)
+        self.review_tree.setColumnCount(9)
         self.review_tree.setHeaderLabels(
-            ["文件 / 文件夹", "状态", "目标", "大小", "类型", "时间", "分析结果", "最新版本"])
+            ["文件 / 文件夹", "状态", "目标", "大小", "类型", "时间", "分析结果",
+             "最新版本", "联网核对"])
         self.review_tree.setRootIsDecorated(True)  # 保留展开三角标注
         self.review_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.review_tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -355,7 +388,7 @@ class RemoteFilePage(QWidget):
         rh = self.review_tree.header()
         rh.setSectionsMovable(True)
         rh.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in (1, 2, 3, 4, 5, 6, 7):
+        for col in (1, 2, 3, 4, 5, 6, 7, 8):
             rh.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.review_tree.setMinimumHeight(260)
         self.review_tree.itemChanged.connect(self._on_item_changed)
@@ -385,8 +418,10 @@ class RemoteFilePage(QWidget):
         self.btn_remove.clicked.connect(self._remove_rows)
         self.btn_browse_remote.clicked.connect(self._browse_remote)
         self.btn_analyze.clicked.connect(self._analyze_mods)
+        self.btn_online.clicked.connect(self._online_verify)
         self.btn_tidy_mods.clicked.connect(self._tidy_server_mods)
         self.btn_scope.clicked.connect(self._open_scope_dialog)
+        self.btn_history.clicked.connect(self._open_history)
         self.btn_apply_env.clicked.connect(self._apply_env_results)
         self.btn_cancel_env.clicked.connect(self._cancel_env_results)
         self.btn_send.clicked.connect(self._send)
@@ -428,6 +463,7 @@ class RemoteFilePage(QWidget):
         self._env_sources.clear()
         self._env_summaries.clear()
         self._version_results.clear()
+        self._online_results.clear()
         self.btn_apply_env.hide()
         self.btn_cancel_env.hide()
         self.btn_analyze.show()
@@ -684,12 +720,16 @@ class RemoteFilePage(QWidget):
     def _collect_local(self, root: str) -> dict:
         """收集本地新客户端文件：{rel: {"size", "mtime", "hash"}}（本地直接计算 MD5）。
 
-        被标注为「跳过」的目录/文件直接排除，不读、不算哈希。
+        被标注为「跳过」的目录/文件直接排除，不读、不算哈希；
+        临时/备份文件（.bak/.temp/.new/.old/.disabled.<时间戳>）也排除，
+        它们本来就不该参与同步（服务端若已有，会作为「临时/备份」列出可清理）。
         """
         local: dict[str, dict] = {}
         for full in self._local_files(root):
             rel = os.path.relpath(full, root).replace("\\", "/")
             if self._is_skipped(rel):
+                continue
+            if is_junk_filename(rel.rsplit("/", 1)[-1]):
                 continue
             try:
                 info = {"size": os.path.getsize(full),
@@ -725,6 +765,8 @@ class RemoteFilePage(QWidget):
             if k.startswith("client_files/"):
                 if k[len("client_files/"):] in local:
                     continue
+            if is_junk_filename(k.rsplit("/", 1)[-1]):
+                continue  # 临时/备份文件不参与改名配对，不必算哈希
             server_only_sizes.setdefault(meta["size"], []).append(k)
         for y in new_rels:
             for k in server_only_sizes.get(local[y]["size"], []):
@@ -822,34 +864,59 @@ class RemoteFilePage(QWidget):
                 r["old_rel"] = x
                 r["remote_size"] = snapshot_files[x]["size"]
 
-        # 旧版残留：本地 mods 下的 jar 标识集合（modid + 文件名基名），
-        # 服务端 mods 下本地不存在的 jar 若命中同一标识 → 视为旧版本残留（默认勾选删除）
-        local_jar_ids: set[str] = set()
+        # 旧版残留 / 临时备份：
+        # - 本地 mods 下所有 jar（含 .disabled）归一化为「模组键」（mod_key），
+        #   服务端 mods 与 client_files/mods 下同键、但本地没有的文件 → 旧版残留；
+        # - 文件名带 .bak/.temp/.new/.old、或 .disabled.<时间戳> → 临时/备份文件，默认清理。
+        # 只看文件名（服务端 jar 不下载）；mod_key 能把「版本号 + 加载器后缀 + 大小写/
+        # 下划线/连字符」归一，解决 2.6.2b、copycats-3.0.9+mc… 这类旧版漏检。
+        local_mod_keys: set[str] = set()
         for rel in local:
-            if rel.split("/", 1)[0] == "mods" and rel.rsplit("/", 1)[-1].lower().endswith(".jar"):
-                try:
-                    local_jar_ids.update(i for i in jar_identifiers(
-                        os.path.join(self.config.local_mc_dir, rel)) if i)
-                except Exception:
-                    continue
-        obsolete_rels: set[str] = set()
+            if rel.split("/", 1)[0] != "mods":
+                continue
+            name = rel.rsplit("/", 1)[-1]
+            low = name.lower()
+            if is_junk_filename(name):
+                continue
+            if low.endswith(".jar") or low.endswith(".jar.disabled"):
+                key = mod_key(name)
+                if key:
+                    local_mod_keys.add(key)
+        flagged: set[str] = set()
+        matched_old = set(matched.values())
         for rel in sorted(snapshot_files):
-            if rel in local or rel.split("/", 1)[0] != "mods":
+            if rel in matched_old:
                 continue
-            fname = rel.rsplit("/", 1)[-1].lower()
-            if not fname.endswith(".jar"):
+            # 服务端仓库 mods/… 与客户端文件目录 client_files/mods/… 都要检测：
+            # 「双端」旧版在 client_files 里还有一份副本，只删服务端那份会留下过期文件
+            # （发布待办会把它当成客户端文件反复下发）；「仅客户端」旧版只存在于这里，
+            # 不检测就永远清不掉。
+            plain = rel[len("client_files/"):] if rel.startswith("client_files/") else rel
+            if plain in local:
+                continue  # 完全同名的文件在本地存在 → 已同步
+            if plain.split("/", 1)[0] != "mods":
                 continue
-            base = filename_base(fname)
-            if base and base in local_jar_ids:
-                obsolete_rels.add(rel)
-                row = {"rel": rel, "status": "obsolete", "size": 0,
-                       "remote_size": snapshot_files[rel]["size"], "mtime": 0,
-                       "target": "server", "manual": False}
-                rows.append(row)
+            name = plain.rsplit("/", 1)[-1]
+            low = name.lower()
+            if is_junk_filename(name):
+                status = "junk"
+            elif low.endswith(".jar") or low.endswith(".jar.disabled"):
+                key = mod_key(name)
+                status = "obsolete" if key and key in local_mod_keys else ""
+            else:
+                continue
+            if not status:
+                continue
+            flagged.add(rel)
+            rows.append({"rel": rel, "status": status, "size": 0,
+                         "remote_size": snapshot_files[rel]["size"], "mtime": 0,
+                         "target": ("client" if rel.startswith("client_files/")
+                                    else "server"),
+                         "manual": False})
 
         matched_x = set(matched.values())
         for rel in sorted(snapshot_files):
-            if rel in local or rel in obsolete_rels or rel in matched_x:
+            if rel in local or rel in flagged or rel in matched_x:
                 continue
             # client_files/ 下的文件对应本地同路径（去掉前缀），本地存在 → 已同步，不是服务端独有
             if rel.startswith("client_files/"):
@@ -882,8 +949,14 @@ class RemoteFilePage(QWidget):
             # 保护服务端根目录下的顶层文件：绝不能被当作改名的旧文件删除
             if "/" not in k:
                 continue
+            if is_junk_filename(k.rsplit("/", 1)[-1]):
+                continue  # 临时/备份文件不参与改名配对，留给「临时/备份」清理
             if meta.get("hash"):
                 server_only.setdefault((meta["size"], meta["hash"]), []).append(k)
+        # 同名内容配对时优先服务端仓库那份：改名行显示「mods/旧名」更直观，
+        # client_files 里的副本交给「旧版残留」检测删除。
+        for v in server_only.values():
+            v.sort(key=lambda k: (k.startswith("client_files/"), k))
         matched: dict[str, str] = {}
         used: set[str] = set()
         for y, info in sorted(local.items()):
@@ -930,6 +1003,7 @@ class RemoteFilePage(QWidget):
         rnm_n = sum(1 for r in self._rows if r["status"] == "rename")
         srv_n = sum(1 for r in self._rows if r["status"] == "server")
         obs_n = sum(1 for r in self._rows if r["status"] == "obsolete")
+        junk_n = sum(1 for r in self._rows if r["status"] == "junk")
         if changed:
             snap_note = "快照已更新（服务端内容有变化）"
         elif aged:
@@ -951,9 +1025,13 @@ class RemoteFilePage(QWidget):
             self.lbl_status.setText(
                 f"对比完成：新增 {new_n}、更新 {upd_n}"
                 f"{f'、改名 {rnm_n}' if rnm_n else ''}、"
-                f"旧版残留 {obs_n}、服务端独有 {srv_n} ✔"
+                f"旧版残留 {obs_n}、临时/备份 {junk_n}、服务端独有 {srv_n} ✔"
                 f"（{'范围内' if scope else '服务端仓库共'} {repo_count} 个文件，{snap_note}）"
                 f"　｜　{self._scope_text()}")
+        if obs_n and not self._online_busy:
+            self.lbl_status.setText(
+                self.lbl_status.text() + "　｜　可点「联网核对…」用 Modrinth / CurseForge "
+                "文件列表确认旧版身份")
         if not data.get("dirs_ok", True):
             # 目录列表没读到 → 默认发送目标无法按目录结构判定，全部退化成「双端」
             self.lbl_status.setText(
@@ -1102,7 +1180,7 @@ class RemoteFilePage(QWidget):
         self.review_tree.blockSignals(True)
         self.review_tree.clear()
         root_name = os.path.basename(self.config.local_mc_dir.rstrip("/\\")) or "客户端根目录"
-        root_item = QTreeWidgetItem([root_name, "", "", "", "", "", "", ""])
+        root_item = QTreeWidgetItem([root_name, "", "", "", "", "", "", "", ""])
         root_item.setData(0, Qt.UserRole, {"rel": "", "kind": "dir"})
         root_item.setExpanded(True)
         self.review_tree.addTopLevelItem(root_item)
@@ -1119,7 +1197,7 @@ class RemoteFilePage(QWidget):
                 child_rel = f"{parent_rel}/{part}" if parent_rel else part
                 node = nodes.get(child_rel)
                 if node is None:
-                    node = QTreeWidgetItem([part, "", "", "", "", "", "", ""])
+                    node = QTreeWidgetItem([part, "", "", "", "", "", "", "", ""])
                     node.setData(0, Qt.UserRole, {"rel": child_rel, "kind": "dir"})
                     parent_item.addChild(node)
                     nodes[child_rel] = node
@@ -1140,6 +1218,7 @@ class RemoteFilePage(QWidget):
                 mtime_text,
                 env_text,
                 "",
+                "",
             ])
             node.setData(0, Qt.UserRole, {
                 "rel": r["rel"], "kind": "file", "status": r["status"],
@@ -1148,11 +1227,12 @@ class RemoteFilePage(QWidget):
             node.setToolTip(2, self._target_tooltip(r))  # 目标判断依据（手动标注）
             node.setToolTip(6, env_tip)  # 分析结果列：判断依据/未检测到提示
             self._paint_version(node, r["rel"])  # 最新版本列（文本 / 提示 / 配色）
+            self._paint_online(node, r)  # 联网核对列（文本 / 提示 / 配色）
             if r.get("old_rel"):
                 node.setToolTip(1, f"原名：{r['old_rel']}")
             parent_item.addChild(node)
             # 新增/更新/旧版残留/仅服务器：可勾选；旧版残留、仅服务器=删除
-            if r["status"] in ("new", "update", "rename", "server", "obsolete"):
+            if r["status"] in ("new", "update", "rename", "server", "obsolete", "junk"):
                 node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
                 node.setCheckState(0, Qt.Checked if r.get("checked") else Qt.Unchecked)
             else:
@@ -1176,12 +1256,14 @@ class RemoteFilePage(QWidget):
                         if r.get("checked") and r["status"] in ("new", "update")
                         and r.get("target") != "skip")
         obs_n = sum(1 for r in self._rows if r["status"] == "obsolete")
+        junk_n = sum(1 for r in self._rows if r["status"] == "junk")
         server_n = sum(1 for r in self._rows if r["status"] == "server")
         tip = ("，服务端独有已隐藏" if server_n and not show_server else
                f"，服务端独有 {server_n}（可勾选删除）" if show_server else "")
         self.lbl_summary.setText(
             f"共 {len(self._rows)} 项：新增 {new_n}、更新 {upd_n}"
             f"{f'、旧版残留 {obs_n}（默认勾选删除）' if obs_n else ''}"
+            f"{f'、临时/备份 {junk_n}（默认勾选清理）' if junk_n else ''}"
             f"、待发送 {checked_n}{tip}"
             f"　｜　{self._scope_text()}"
             "（目标：双端=服务端+客户端；客户端=只进 "
@@ -1267,6 +1349,218 @@ class RemoteFilePage(QWidget):
         color = _VERSION_COLORS.get(info.get("status", VER_UNKNOWN))
         if color:
             item.setForeground(7, QBrush(QColor(color)))
+
+    def _paint_online(self, item, row: dict) -> None:
+        """把联网核对结果写进「联网核对」列：文本 + 悬停证据 + 状态配色。"""
+        d = self._online_results.get(row.get("rel", ""))
+        if not d:
+            return
+        item.setText(8, mod_online.verdict_label(d))
+        item.setToolTip(8, mod_online.verdict_tooltip(d))
+        color = {"older": "#4caf50", "newer": "#d9534f",
+                 "same": "#888888", "unknown": "#888888"}.get(d.get("verdict"))
+        if color:
+            item.setForeground(8, QBrush(QColor(color)))
+        if d.get("verdict") == mod_online.NEWER:
+            old_tip = item.toolTip(1)
+            item.setToolTip(1, (old_tip + "\n\n" if old_tip else "")
+                            + "联网核对：服务端这份比本地新，已取消勾选，删除会导致玩家降级。")
+
+    def _online_verify(self):
+        """联网核对旧版文件（Modrinth / CurseForge 项目文件列表）。"""
+        if self._online_busy:
+            return
+        rows = [r for r in self._rows if r["status"] in ("obsolete", "junk", "server")]
+        if not rows:
+            winutil.warn(self, "提示",
+                         "当前没有需要核对的旧版 / 临时 / 服务端独有文件。\n\n"
+                         "先点「刷新（重新检测差异）」生成差异列表。")
+            return
+        payload = self._collect_online_payload(rows)
+        if not payload["items"] and not payload["discover"]:
+            winutil.warn(self, "提示",
+                         "没有找到与服务端旧版文件对应的本地模组（本地 mods 目录为空？）。")
+            return
+        self._online_busy = True
+        self.btn_online.setEnabled(False)
+        self.btn_scan.setEnabled(False)
+        self.btn_send.setEnabled(False)
+        self.lbl_status.setText(
+            f"正在联网核对 {len(payload['items'])} 个本地模组的身份"
+            "（Modrinth / CurseForge 文件列表，首次会慢一些）…")
+        worker = Worker(self._online_worker, payload)
+        worker.progress.connect(self._on_online_progress)
+        worker.done.connect(self._on_online_done)
+        self._worker = worker
+        worker.start()
+
+    def _on_online_progress(self, current, total, message):
+        self.lbl_status.setText(fmt_progress(current, total, message, "联网核对"))
+
+    def _collect_online_payload(self, rows) -> dict:
+        """收集联网核对需要的本地模组项 + 服务端文件名 + 服务端独有文件。"""
+        root = self.config.local_mc_dir
+        mods_dir = os.path.join(root, "mods") if root else ""
+        obsolete_keys = set()
+        for r in rows:
+            if r["status"] != "obsolete":
+                continue
+            name = r["rel"].rsplit("/", 1)[-1]
+            low = name.lower()
+            if low.endswith(".jar") or low.endswith(".jar.disabled"):
+                key = mod_key(name)
+                if key:
+                    obsolete_keys.add(key)
+        items: list[dict] = []
+        if obsolete_keys and mods_dir and os.path.isdir(mods_dir):
+            by_key: dict[str, list[str]] = {}
+            for fn in sorted(os.listdir(mods_dir)):
+                low = fn.lower()
+                if not (low.endswith(".jar") or low.endswith(".jar.disabled")):
+                    continue
+                key = mod_key(fn)
+                if key in obsolete_keys:
+                    by_key.setdefault(key, []).append(fn)
+            for files in by_key.values():
+                # 同一模组同时有启用版与 .disabled 旧版时，用启用中的那份当基准
+                files.sort(key=lambda f: f.lower().endswith(".disabled"))
+                fn = files[0]
+                path = os.path.join(mods_dir, fn)
+                try:
+                    version, loader = jar_meta(path)
+                    ids = jar_identifiers(path)
+                except Exception:
+                    version, loader, ids = "", "", []
+                items.append({
+                    "file": fn, "name": mod_display_name(path, fn),
+                    "modid": ids[1] if len(ids) > 1 else "",
+                    "version": version, "loader": loader,
+                })
+        server_names: list[str] = []
+        discover: list[dict] = []
+        for r in rows:
+            name = r["rel"].rsplit("/", 1)[-1]
+            low = name.lower()
+            if r["status"] in ("obsolete", "junk"):
+                server_names.append(name)
+            elif r["status"] == "server" and (low.endswith(".jar")
+                                              or low.endswith(".jar.disabled")):
+                discover.append({"rel": r["rel"], "name": name})
+        return {"items": items, "server_names": server_names, "discover": discover}
+
+    def _online_worker(self, payload: dict, progress_cb=None) -> str:
+        """后台线程：调用 mod_online.verify（有整体超时与缓存，断网不影响原列表）。"""
+        data = mod_online.verify(
+            payload.get("items", []), payload.get("server_names", []),
+            discover=payload.get("discover", ()),
+            progress_cb=progress_cb)
+        return json.dumps(data, ensure_ascii=False)
+
+    def _on_online_done(self, ok: bool, msg: str):
+        self._online_busy = False
+        self.btn_online.setEnabled(True)
+        self.btn_scan.setEnabled(True)
+        self.btn_send.setEnabled(True)
+        if not ok:
+            self.lbl_status.setText("联网核对失败（不影响原有勾选，可重试）")
+            winutil.warn(self, "联网核对失败",
+                         f"联网核对时出错：\n{msg}\n\n"
+                         "原有勾选保持不变；可检查网络后重试。")
+            return
+        try:
+            data = json.loads(msg or "{}")
+        except Exception:
+            data = {}
+        matches = data.get("matches") or {}
+        stats = data.get("stats") or {}
+        by_stem = {r["rel"]: r for r in self._rows}
+        older = newer = same = unknown = 0
+        for r in self._rows:
+            if r["status"] not in ("obsolete", "junk"):
+                continue
+            stem = mod_online._file_stem(r["rel"].rsplit("/", 1)[-1])
+            d = matches.get(stem)
+            if not d:
+                continue
+            r["online"] = d
+            self._online_results[r["rel"]] = d
+            v = d.get("verdict")
+            if v == mod_online.NEWER:
+                newer += 1
+                r["checked"] = False  # 服端更新：绝不默认删除（删了是降级）
+            elif v == mod_online.OLDER:
+                older += 1
+            elif v == mod_online.SAME:
+                same += 1
+            else:
+                unknown += 1
+        # 服务端独有、但联网发现是「本地已有模组项目」的旧文件：追加为可删除的旧版残留
+        added = 0
+        for d in data.get("discovered") or []:
+            rel = str(d.get("rel") or "")
+            if not rel:
+                continue
+            v = d.get("verdict") or {}
+            self._online_results[rel] = v
+            old_row = by_stem.get(rel)
+            if old_row is not None:
+                # 原本是「服务端独有」：联网确认它其实是本地已有模组的旧版 → 改判为旧版残留
+                if old_row.get("status") != "server":
+                    continue
+                old_row.update({"status": "obsolete", "checked": False,
+                                "online": v, "discovered": True})
+                added += 1
+                continue
+            self._rows.append({
+                "rel": rel, "status": "obsolete", "size": 0,
+                "remote_size": 0, "mtime": 0,
+                "target": ("client" if rel.startswith("client_files/") else "server"),
+                "manual": False, "checked": False, "online": v, "discovered": True,
+            })
+            added += 1
+        if added:
+            self._refresh_tree()
+        else:
+            self._update_online_columns()
+        note = data.get("note") or ""
+        parts = [f"联网核对完成：确认旧版 {older}"]
+        if newer:
+            parts.append(f"服端更新 {newer}（已取消勾选，避免降级）")
+        if same:
+            parts.append(f"同项目 {same}")
+        if unknown:
+            parts.append(f"未收录 {unknown}")
+        if added:
+            parts.append(f"发现文件名规则漏掉的旧版 {added} 个（未默认勾选，请核对）")
+        if stats.get("requests"):
+            parts.append(f"联网请求 {stats['requests']} 次"
+                         f"{'（缓存命中 %d）' % stats['cache_hits'] if stats.get('cache_hits') else ''}")
+        if note:
+            parts.append(note)
+        self.lbl_status.setText("；".join(parts) + "。")
+        self._update_summary()
+
+    def _update_online_columns(self):
+        """仅刷新「联网核对」列，不重建树（保持展开/滚动状态）。"""
+        root = self.review_tree.topLevelItem(0)
+        if root is None:
+            return
+        by_rel = {r["rel"]: r for r in self._rows}
+        stack = [root]
+        while stack:
+            item = stack.pop()
+            d = item.data(0, Qt.UserRole) or {}
+            if d.get("kind") == "file":
+                row = by_rel.get(d.get("rel", ""))
+                if row is not None:
+                    item.setText(8, "")
+                    item.setToolTip(8, "")
+                    self._paint_online(item, row)
+                    if row.get("status") in ("obsolete", "junk"):
+                        item.setCheckState(0, Qt.Checked if row.get("checked")
+                                           else Qt.Unchecked)
+            for i in range(item.childCount()):
+                stack.append(item.child(i))
 
     def _update_env_column(self):
         """仅刷新「分析结果」「最新版本」列，不重建树（保持展开/滚动状态）。"""
@@ -1613,6 +1907,18 @@ class RemoteFilePage(QWidget):
         self.lbl_status.setText(message + "，正在按新范围重新检测…")
         self._auto_detect()
 
+    def _open_history(self):
+        """「历史版本…」：查看 / 还原 / 清理删除或替换掉的旧文件。"""
+        if not self.config.host():
+            winutil.warn(self, "提示", "请先在「服务器设置」页填写 SFTP 信息。")
+            return
+        from app_common.history_dialog import HistoryDialog
+        dlg = HistoryDialog(self, self.config)
+        dlg.exec()
+        if getattr(dlg, "changed", False):
+            self.lbl_status.setText("历史版本有还原操作，正在重新检测差异…")
+            self._auto_detect()
+
     def _open_scope_dialog(self):
         """「同步范围…」：查看/移除范围条目，或恢复全量。"""
         dlg = SyncScopeDialog(self._scope, self)
@@ -1674,13 +1980,13 @@ class RemoteFilePage(QWidget):
                             deletes_client.append(old[len("client_files/"):])
                         else:
                             deletes.append(old)
-                elif status in ("server", "obsolete"):
+                elif status in ("server", "obsolete", "junk"):
                     rel = d["rel"]
                     if rel.startswith("client_files/"):
                         deletes_client.append(rel[len("client_files/"):])
                     else:
                         deletes.append(rel)
-                    if status == "obsolete":
+                    if status in ("obsolete", "junk"):
                         obsolete_n += 1
             else:
                 for i in range(item.childCount()):
@@ -2292,9 +2598,15 @@ class RemoteFilePage(QWidget):
         del_n = len(deletes) + len(deletes_client)
         if del_n:
             if obsolete_n:
-                lines.append(f"【删除】{del_n} 个文件（其中旧版残留 {obsolete_n} 个）")
+                lines.append(f"【删除】{del_n} 个文件（其中旧版残留 / 临时备份 {obsolete_n} 个）")
             else:
                 lines.append(f"【删除】{del_n} 个服务端独有 / 改名旧文件")
+        if self.config.history_enabled:
+            max_mb = self.config.history_max_mb
+            lines.append(
+                f"【历史版本】删除 / 替换前会先备份到服务器"
+                f"（每条路径保留最近 {self.config.history_keep} 个，"
+                f"上限 {max_mb if max_mb > 0 else '不限'} MB）")
         head = ""
         if corrected:
             head += (f"上传前检查：{len(corrected)} 个模组的目标与运行环境不符，"
@@ -2354,6 +2666,10 @@ class RemoteFilePage(QWidget):
         客户端的一律带 client_files 前缀，避免与本地相对路径混淆。
         改名项（renames: 新 rel → 旧 rel）的进度显示为「改名 旧 → 新」，
         而不是含糊的「上传」——它同时还要删掉旧文件。
+
+        开启了「历史版本」时：替换/删除前先把旧文件移动（或下载后上传）到
+        `{files_dir}/.mc-sync-history`，再执行删除/上传；备份失败的条目会跳过，
+        绝不在没有备份的情况下做破坏性操作。
         """
         renames = renames or {}
 
@@ -2364,45 +2680,90 @@ class RemoteFilePage(QWidget):
         root = self.config.local_mc_dir
         server_root = self.config.server_root
         client_dir = self.config.files_dir
+        history_on = bool(self.config.history_enabled)
+        keep_n = self.config.history_keep
+        max_mb = self.config.history_max_mb
+        archived = 0
+        pruned: list[dict] = []
+        skipped: list[str] = []
+        store = None
         done = 0
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
-            for rel, target in uploads:
-                local = os.path.join(root, rel)
-                old = renames.get(rel, "")
-                for step_target, dest in (("server", server_root), ("client", client_dir)):
-                    if target != "both" and target != step_target:
+            if history_on:
+                store = HistoryStore(sftp, client_dir)
+            try:
+                for rel, target in uploads:
+                    local = os.path.join(root, rel)
+                    old = renames.get(rel, "")
+                    for step_target, dest in (("server", server_root), ("client", client_dir)):
+                        if target != "both" and target != step_target:
+                            continue
+                        remote = TodoManifest.remote_source_path(sftp, dest, rel)
+                        if store is not None and sftp.exists(remote) and not sftp.is_dir(remote):
+                            if store.archive(remote, step_target, rel, "替换旧版"):
+                                archived += 1
+                            else:
+                                skipped.append(
+                                    f"{self._remote_disp(remote)}（旧文件备份失败，已跳过替换）")
+                                continue
+                        done += 1
+                        sftp.upload(local, remote)
+                        if progress_cb:
+                            if old:
+                                msg = (f"改名 {old} → {self._remote_disp(remote)}"
+                                       f"（{TARGET_LABELS.get(target, target)}）")
+                            else:
+                                msg = (f"上传 {self._remote_disp(remote)}"
+                                       f"（{TARGET_LABELS.get(target, target)}）")
+                            progress_cb(done, total, msg)
+                rename_olds = {o[len("client_files/"):] if o.startswith("client_files/") else o
+                               for o in renames.values()}
+                for rel, is_client in ([(r, False) for r in deletes]
+                                       + [(r, True) for r in deletes_client]):
+                    # 硬防护：服务端根目录下的顶层文件（start.sh 等）绝不删除
+                    if "/" not in rel:
+                        log.warning("拒绝删除服务端顶层文件: %s", rel)
                         continue
                     done += 1
+                    dest = client_dir if is_client else server_root
                     remote = TodoManifest.remote_source_path(sftp, dest, rel)
-                    sftp.upload(local, remote)
-                    if progress_cb:
-                        if old:
-                            msg = (f"改名 {old} → {self._remote_disp(remote)}"
-                                   f"（{TARGET_LABELS.get(target, target)}）")
+                    if sftp.is_dir(remote):
+                        sftp.delete_dir(remote)
+                    elif store is not None:
+                        reason = "改名旧文件" if rel in rename_olds else "删除旧文件"
+                        if store.archive(remote, "client" if is_client else "server",
+                                         rel, reason):
+                            archived += 1
                         else:
-                            msg = (f"上传 {self._remote_disp(remote)}"
-                                   f"（{TARGET_LABELS.get(target, target)}）")
-                        progress_cb(done, total, msg)
-            rename_olds = {o[len("client_files/"):] if o.startswith("client_files/") else o
-                           for o in renames.values()}
-            for rel, is_client in ([(r, False) for r in deletes]
-                                   + [(r, True) for r in deletes_client]):
-                # 硬防护：服务端根目录下的顶层文件（start.sh 等）绝不删除
-                if "/" not in rel:
-                    log.warning("拒绝删除服务端顶层文件: %s", rel)
-                    continue
-                done += 1
-                dest = client_dir if is_client else server_root
-                remote = TodoManifest.remote_source_path(sftp, dest, rel)
-                if sftp.is_dir(remote):
-                    sftp.delete_dir(remote)
-                else:
-                    sftp.delete(remote)
-                if progress_cb:
-                    head = "改名：删除旧文件" if rel in rename_olds else "删除"
-                    progress_cb(done, total, f"{head} {self._remote_disp(remote)}")
-        return f"已上传 {len(uploads)} 个、删除 {len(deletes) + len(deletes_client)} 个。"
+                            skipped.append(
+                                f"{self._remote_disp(remote)}（旧文件备份失败，已跳过删除）")
+                    else:
+                        sftp.delete(remote)
+                    if progress_cb:
+                        head = "改名：删除旧文件" if rel in rename_olds else "删除"
+                        progress_cb(done, total, f"{head} {self._remote_disp(remote)}")
+                if store is not None:
+                    pruned = store.prune(keep_n, max_mb)
+            finally:
+                if store is not None and store.dirty:
+                    try:
+                        store.save()
+                    except Exception as exc:
+                        log.warning("保存历史索引失败: %s", exc)
+        parts = [f"已上传 {len(uploads)} 个、删除 {len(deletes) + len(deletes_client)} 个。"]
+        if store is not None:
+            parts.append(
+                f"历史版本：备份 {archived} 个旧文件"
+                f"（每条路径保留最近 {keep_n} 个，"
+                f"上限 {max_mb if max_mb > 0 else '不限'} MB）。")
+            if pruned:
+                parts.append(f"按策略清理旧历史 {len(pruned)} 条。")
+        if skipped:
+            parts.append(
+                f"有 {len(skipped)} 个文件因备份失败已跳过（未做破坏性操作）：\n"
+                + "\n".join(skipped[:20]))
+        return "\n".join(parts)
 
     def _on_progress(self, current, total, message):
         self.lbl_status.setText(fmt_progress(current, total, message, "发送进度"))

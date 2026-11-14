@@ -6,9 +6,11 @@
 不能塞进服务端 mods，否则服务端会加载到客户端模组而炸，所以放这儿让客户端来下）。
 服务端 mods 是服务端自己加载模组的目录，与「发不发客户端」无关，本页不读它。
 
+- 每次打开本页都**实时读取服务器上的 client_files**（服主可能绕过本工具直接往服务器
+  加文件，只看本地快照会漏），再与「上次发布基线」对比，列出全部新增/替换/改名/删除。
 - 改动树即任务清单：全部默认启用（发布），右键可禁用（变灰）/重新启用/批注。
-- 每次打开本页自动检测一遍改动（带统一进度格式）。
 - 发布时只把「启用」的改动写入清单；禁用项保持原基线，下次仍会检测出来。
+- 发布前会核对源文件仍存在于服务器且大小一致，避免发布客户端下载不到的坏任务。
 """
 import fnmatch
 import json
@@ -46,7 +48,7 @@ from app_common.constants import config_dir
 from app_common.file_hash import hash_remote_parallel, hash_remote_smart
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
-from app_common.sftp import SFTPManager
+from app_common.sftp import SFTPError, SFTPManager
 from app_common.snapshot import load_snapshot, normalize_files, save_snapshot
 from app_common.snapshot_dialog import SnapshotHistoryDialog
 from app_common.tasks import CATEGORY_LABELS, TaskItem, TodoManifest, safe_target
@@ -73,10 +75,10 @@ _VERSION_SEG = re.compile(r"[-_.](v?\d[\d.]*)$")
 def client_files_from_repo_snapshot(server_id: str) -> dict[str, dict]:
     """从「服务端文件仓库」快照里取出客户端文件目录的内容 → {rel: {"size", "hash"}}。
 
-    「更新服务端」页每次扫描服务端目录时，都会把客户端文件目录以 client_files/
-    前缀并入快照并回填远程哈希，所以这份快照就是 client_files 的现成读数：
-    刚上传完切到「发布待办」就能直接拿来算改动，不必再远程全量扫一遍。
-    快照不存在 / 里面没有 client_files 条目时返回空字典（调用方回退为远程扫描）。
+    「更新服务端」页扫描服务端目录时，会把客户端文件目录以 client_files/ 前缀
+    并入快照并回填远程哈希。本页检测时以服务器上的**实时目录**为准，这里的哈希
+    只当作「内容相同的提示」复用（省一次远程哈希），不作为文件是否存在的依据。
+    快照不存在 / 里面没有 client_files 条目时返回空字典。
     """
     prefix = "client_files/"
     out: dict[str, dict] = {}
@@ -187,7 +189,7 @@ class TodoPage(QWidget):
         head.addWidget(QLabel("版本号："))
         self.ed_version = QLineEdit()
         self.ed_version.setPlaceholderText("自定义版本号，如 hotfix-1.0.2")
-        self.ed_version.setText(f"hotfix-{datetime.now().strftime('%m%d')}")
+        self.ed_version.setText(f"hotfix-{datetime.now().strftime('%m%d-%H%M')}")
         head.addWidget(self.ed_version, 1)
         self.lbl_time = QLabel("创建时间：—")
         self.lbl_time.setObjectName("muted")
@@ -325,9 +327,9 @@ class TodoPage(QWidget):
         if not force and now - self._last_auto_detect < 5:
             return
         self._last_auto_detect = now
-        # 自动检测优先复用「更新服务端」页留下的快照（秒出，不远程重扫）；
-        # 手动点「重新检测」才做权威的远程全量扫描。
-        self._detect_changes(auto=True, from_snapshot=True)
+        # 自动检测也读取服务器上的真实目录：服主可能通过别的途径（直接 SFTP）
+        # 往 client_files 里加了文件，本地快照看不到它们。
+        self._detect_changes(auto=True)
 
     # ---------- 服务端改动检测 ----------
     def _refresh_pub_snap(self):
@@ -347,7 +349,7 @@ class TodoPage(QWidget):
         else:
             self._refresh_pub_snap()
 
-    def _detect_changes(self, auto: bool = False, from_snapshot: bool = False):
+    def _detect_changes(self, auto: bool = False):
         if self._detecting:
             return
         if not self.config.host():
@@ -359,8 +361,8 @@ class TodoPage(QWidget):
         self._auto_mode = auto
         self._detecting = True
         self.btn_detect.setEnabled(False)
-        self.lbl_status.setText("正在检测客户端文件目录的改动…")
-        worker = Worker(self._detect_worker, from_snapshot)
+        self.lbl_status.setText("正在读取服务器客户端文件目录，并与上次发布基线对比…")
+        worker = Worker(self._detect_worker)
         worker.progress.connect(self._on_detect_progress)
         worker.done.connect(self._on_detect_done)
         self._worker = worker
@@ -369,104 +371,105 @@ class TodoPage(QWidget):
     def _on_detect_progress(self, current, total, message):
         self.lbl_status.setText(fmt_progress(current, total, message, "检测客户端改动"))
 
-    def _detect_worker(self, from_snapshot: bool = False, progress_cb=None) -> str:
-        """当前客户端文件夹（client_files） vs 上次发布基线，返回 JSON 行列表。
+    def _detect_worker(self, progress_cb=None) -> str:
+        """实时扫描服务器客户端文件目录（client_files） vs 上次发布基线，返回 JSON。
 
         每行：{"rel", "status": new|update|rename|deleted|obsolete, "size", "old_rel"?}
+
         判定条件组合（大小 + 哈希）：
         - 基线无 → 新增；
         - 大小不同，或大小相同但哈希不同 → 替换；
         - 当前新增与基线已移除的文件内容相同（大小 + 哈希一致）→ 改名；
         - 基线有、当前无且未配对 → 删除。
 
-        两处提速：
-        - from_snapshot=True：直接用「更新服务端」页扫描留下的本地快照（里面已含
-          client_files 的文件+大小+哈希），不远程重扫——刚上传完切过来就能秒出结果；
-          快照不可用时自动回退为远程扫描。
-        - 已标记「本次不发布」的文件不参与检测：不比对、不算远程哈希，也不会被当成删除。
+        **每次都以服务器上的实际目录为准**（不再复用本地快照）：服主完全可能绕过
+        本工具、直接用别的 SFTP/面板往 client_files 里添文件，只看本地快照会漏。
+        目录列表本身带修改时间，和哈希缓存里的 (大小, 修改时间) 对得上时直接复用
+        哈希；对不上才重新计算远程哈希，因此重复检测不会反复下载已确认的文件。
+
+        已标记「本次不发布」的文件不参与检测：不比对、不算远程哈希，也不会被当成删除。
         """
-
-        def on_scan(dirs: int, entries: int):
-            if progress_cb:
-                progress_cb(dirs, 0,
-                            f"正在读取客户端文件目录…（已读 {dirs} 个目录 / {entries} 个条目）")
-
-        # 「本次不发布」的路径：用户已决定这批不发，检测时彻底跳过（省掉远程哈希）。
+        server_id = self.config.current_id()
         disabled = set(self._state.get("disabled") or ())
-        base = normalize_files(
-            load_snapshot(self.config.current_id(), "publish").get("files", {}))
-        cache = _load_hash_cache(self.config.current_id())
+        pub = load_snapshot(server_id, "publish")
+        base = normalize_files(pub.get("files", {}))
+        snap_files = client_files_from_repo_snapshot(server_id)  # 「更新服务端」扫描时算过的哈希
+        cache = _load_hash_cache(server_id)
 
-        current: dict[str, int] = {}
-        cur_hash: dict[str, str] = {}
-        snap_used = False
-        if from_snapshot:
-            snap_files = client_files_from_repo_snapshot(self.config.current_id())
-            if snap_files:
-                # 快照里带的哈希是「更新服务端」页远程算好的，直接复用
-                current = {rel: m["size"] for rel, m in snap_files.items()}
-                cur_hash = {rel: m["hash"] for rel, m in snap_files.items() if m.get("hash")}
-                snap_used = True
-                log.info("发布待办检测：复用服务端扫描快照（client_files %d 个文件），"
-                         "本次不远程重扫", len(current))
+        with SFTPManager(self.config.host(), self.config.port(),
+                         self.config.username(), self.config.password()) as sftp:
+            # 1) 实时读取服务器上的 client_files（大小 + 修改时间）
+            if not sftp.exists(self.config.files_dir):
+                if base:
+                    # 目录突然不存在：若当成「空目录」会把已发布文件全判成删除，必须中止
+                    raise RuntimeError(
+                        f"服务器客户端文件目录不存在：{self.config.files_dir}\n"
+                        "为避免误把已发布文件全部当成「删除」下发，已中止检测。\n"
+                        "请检查「服务器设置」里的客户端文件目录是否填写正确。")
+                log.info("客户端文件目录尚不存在（首次发布前），按空目录处理: %s",
+                         self.config.files_dir)
+                current: dict[str, dict] = {}
+            else:
+                current = self._scan_client_files(sftp, progress_cb)
 
-        if not snap_used:
-            with SFTPManager(self.config.host(), self.config.port(),
-                             self.config.username(), self.config.password()) as sftp:
-                # client_files 目录树较小：串行扫描，复用当前连接，不额外开连接
-                current = dict(sftp.list_files_recursive_with_size(
-                    self.config.files_dir, max_workers=1,
-                    progress_cb=on_scan))
-                # 需要计算当前文件哈希（快速哈希：SFTP 远程计算，不下载内容）：
-                #  1) 当前新增（基线无）→ 与「服务端已移除」配对判断改名；
-                #  2) 基线存在、大小相同 → 总是远程计算当前哈希确认内容是否一致
-                #     （即使基线已存哈希也重新确认：服务端文件被替换但大小不变时同样能检出）。
-                #     （大小不同 → 直接判定替换，无需哈希，最快。）
-                need_hash = []
-                for rel, rsize in current.items():
-                    bmeta = base.get(rel)
-                    if bmeta is None or bmeta["size"] == rsize:
-                        need_hash.append(rel)
+            # 「本次不发布」的路径彻底跳过：不比对、不算远程哈希，也不会被当成「已删除」。
+            disabled_present = sorted(rel for rel in current if rel in disabled)
+            if disabled_present:
+                log.info("发布待办检测：跳过 %d 个「本次不发布」的文件", len(disabled_present))
+                current = {rel: meta for rel, meta in current.items()
+                           if rel not in disabled}
 
+            if progress_cb:
+                progress_cb(len(current), len(current),
+                            f"已读取服务器 {len(current)} 个客户端文件，正在确认内容…")
+
+            # 2) 决定哪些文件需要重新计算哈希
+            #    - 缓存里 (大小, 修改时间) 都对得上 → 内容没变，直接用缓存哈希；
+            #    - 基线里同名同大小 → 必须重新确认（防止「大小不变、内容被替换」漏检）；
+            #    - 基线里没有（新增）→ 只在可能配对成「改名」时才需要哈希。
+            cur_hash: dict[str, str] = {}
+            need_hash: list[str] = []
+            for rel, meta in current.items():
+                size = meta["size"]
+                bmeta = base.get(rel)
+                c = cache.get(rel)
+                if (c and int(c.get("size", -1)) == size
+                        and int(c.get("mtime", -1)) == meta["mtime"]
+                        and c.get("hash")):
+                    cur_hash[rel] = c["hash"]
+                    continue
+                if bmeta is not None and bmeta["size"] == size:
+                    need_hash.append(rel)
+                    continue
+                if bmeta is None:
+                    smeta = snap_files.get(rel)
+                    if smeta and smeta["size"] == size and smeta.get("hash"):
+                        cur_hash[rel] = smeta["hash"]
+            deleted_rels = [rel for rel in sorted(base)
+                            if rel not in current and rel not in disabled]
+            rename_sizes = {base[rel]["size"] for rel in deleted_rels
+                            if base[rel].get("hash")}
+            for rel, meta in current.items():
+                if rel in cur_hash or rel in need_hash:
+                    continue
+                if base.get(rel) is None and meta["size"] in rename_sizes:
+                    need_hash.append(rel)
+
+            if need_hash:
                 def on_hash_progress(done: int, count: int, key: str):
                     if progress_cb:
                         progress_cb(done, count, f"计算哈希 {key}")
 
                 tasks = [(rel, TodoManifest.remote_source_path(
                     sftp, self.config.files_dir, rel)) for rel in need_hash]
-                cur_hash = hash_remote_parallel(
+                cur_hash.update(hash_remote_parallel(
                     sftp, self.config.host(), self.config.port(),
                     self.config.username(), self.config.password(),
-                    tasks, on_hash_progress)
-
-        # 「本次不发布」的路径彻底跳过：不比对、不算远程哈希，也不会被当成「已删除」。
-        disabled_present = {rel for rel in current if rel in disabled}
-        if disabled_present:
-            log.info("发布待办检测：跳过 %d 个「本次不发布」的文件", len(disabled_present))
-            current = {rel: sz for rel, sz in current.items() if rel not in disabled}
-
-        if not snap_used:
-            # 更新哈希缓存：仅记录与基线一致（或无法确认但大小相同）的文件，
-            # 供下次检测跳过重复下载；大小变化 / 已移除的文件从缓存剔除。
-            new_cache = dict(cache)
-            for rel, rsize in current.items():
-                bmeta = base.get(rel)
-                if bmeta is None or bmeta["size"] != rsize:
-                    new_cache.pop(rel, None)
-                    continue
-                h = cur_hash.get(rel)
-                if h:
-                    new_cache[rel] = {"size": rsize, "hash": h}
-                elif rel not in new_cache:
-                    new_cache[rel] = {"size": rsize, "hash": bmeta.get("hash")}
-            for rel in list(new_cache):
-                if rel not in current:
-                    new_cache.pop(rel, None)
-            _save_hash_cache(self.config.current_id(), new_cache)
+                    tasks, on_hash_progress))
 
         rows = []
         for rel in sorted(current):
-            rsize = current[rel]
+            rsize = current[rel]["size"]
             bmeta = base.get(rel)
             if bmeta is None:
                 rows.append({"rel": rel, "status": "new", "size": rsize,
@@ -478,19 +481,32 @@ class TodoPage(QWidget):
                 bh = bmeta.get("hash")
                 if not bh:
                     cc = cache.get(rel)
-                    if cc and cc.get("size") == rsize and cc.get("hash"):
+                    if cc and int(cc.get("size", -1)) == rsize and cc.get("hash"):
                         bh = cc["hash"]
                 ch = cur_hash.get(rel)
                 if bh and ch and bh != ch:
                     # 大小相同但内容不同 → 替换
                     rows.append({"rel": rel, "status": "update", "size": rsize})
+                elif not ch:
+                    # 哈希没算出来（网络/服务器限制）：保守按「内容未变」处理，不制造假更新
+                    log.warning("发布待办检测：无法确认 %s 的内容哈希，按未变更处理", rel)
                 # 否则视为一致，不出行（当前哈希已写入缓存，下次可直接比对）
 
-        # 服务端已移除（基线里有、当前没有）→ 客户端应删除；
-        # 内容与当前新增文件相同（大小 + 哈希一致）→ 判定为改名。
-        # 「本次不发布」的文件已从 current 剔除，不能因此被当成「已删除」。
-        deleted_rels = [rel for rel in sorted(base)
-                        if rel not in current and rel not in disabled]
+        # 3) 更新哈希缓存：(rel → 大小/修改时间/哈希)，下次检测直接复用
+        new_cache: dict[str, dict] = {}
+        for rel, meta in current.items():
+            h = cur_hash.get(rel)
+            if not h:
+                c = cache.get(rel)
+                if (c and int(c.get("size", -1)) == meta["size"]
+                        and int(c.get("mtime", -1)) == meta["mtime"]):
+                    h = c.get("hash")
+            if h:
+                new_cache[rel] = {"size": meta["size"],
+                                  "mtime": meta["mtime"], "hash": h}
+        _save_hash_cache(server_id, new_cache)
+
+        # 4) 改名配对：内容与「基线里已移除」的文件相同 → 判定为改名
         matched = self._match_rename_pairs(rows, base, deleted_rels)
         final = []
         for r in rows:
@@ -508,7 +524,7 @@ class TodoPage(QWidget):
 
         # 旧版残留：client_files/mods 下同模组（去末尾版本段）存在多个版本时，
         # 保留版本号最大的一个，其余标记为「旧版残留」（删除任务）。
-        # 旧版残留优先于快照差异（即使同时是新增/更新，也视为待删除的旧版）。
+        # 旧版残留优先于基线差异（即使同时是新增/更新，也视为待删除的旧版）。
         groups: dict[str, list[str]] = {}
         for rel in sorted(current):
             if rel.split("/", 1)[0] == "mods" and rel.rsplit("/", 1)[-1].lower().endswith(".jar"):
@@ -523,12 +539,47 @@ class TodoPage(QWidget):
             obsolete_rels.update(rels[1:])
         rows = [r for r in rows if r["rel"] not in obsolete_rels]
         for rel in sorted(obsolete_rels):
-            rows.append({"rel": rel, "status": "obsolete", "size": current[rel]})
+            rows.append({"rel": rel, "status": "obsolete", "size": current[rel]["size"]})
+        log.info("发布待办检测完成：服务器 client_files %d 个文件，基线 %d 个，改动 %d 项",
+                 len(current), len(base), len(rows))
         return json.dumps(
-            {"rows": rows, "from_snapshot": snap_used,
+            {"rows": rows, "current_count": len(current),
+             "baseline_saved_at": pub.get("saved_at", ""),
              "disabled_present": sorted(disabled_present),
              "files_dir": self.config.files_dir, "server_root": self.config.server_root},
             ensure_ascii=False)
+
+    def _scan_client_files(self, sftp, progress_cb=None) -> dict[str, dict]:
+        """实时递归读取服务器 files_dir（client_files），返回 {相对路径: {size, mtime}}。
+
+        用 list_entries（listdir_attr）一次拿到名称/类型/大小/修改时间，不额外 stat。
+        隐藏项（以 . 开头）跳过，与更新服务端页的扫描口径一致。
+        """
+        root = self.config.files_dir
+        out: dict[str, dict] = {}
+        stack = [""]
+        dirs = 0
+        while stack:
+            rel_dir = stack.pop()
+            full = SFTPManager.join(root, rel_dir) if rel_dir else root
+            try:
+                entries = sftp.list_entries(full)
+            except SFTPError as exc:
+                # 列目录失败不能当作「空目录」继续：那会把该目录下已发布文件全判成删除
+                raise SFTPError(
+                    f"读取服务器客户端文件目录失败（{full}）：{exc}") from exc
+            for name, is_dir, size, mtime in entries:
+                child = f"{rel_dir}/{name}" if rel_dir else name
+                if is_dir:
+                    stack.append(child)
+                else:
+                    out[child] = {"size": int(size), "mtime": int(mtime or 0)}
+            dirs += 1
+            if progress_cb and dirs % 25 == 0:
+                progress_cb(dirs, 0,
+                            f"正在读取服务器客户端文件目录…"
+                            f"（已读 {dirs} 个目录 / {len(out)} 个文件）")
+        return out
 
     @staticmethod
     def _match_rename_pairs(new_rows: list[dict], base: dict,
@@ -589,17 +640,19 @@ class TodoPage(QWidget):
         skipped_n = len(self._state["disabled"])
         skip_note = (f"　已跳过 {skipped_n} 个「本次不发布」的文件（不参与检测）"
                      if skipped_n else "")
-        snap_note = ("　（基于上次服务端扫描的快照秒出；"
-                     "点「重新检测」可强制远程重扫）" if data.get("from_snapshot") else "")
+        cur_n = int(data.get("current_count") or 0)
+        base_at = data.get("baseline_saved_at") or "无基线（首次发布将下发全部文件）"
+        scan_note = f"　（已实时读取服务器 {self.config.files_dir} 共 {cur_n} 个文件）"
         if not rows:
             self.lbl_status.setText(
-                "未检测到需要下发给客户端的改动（client_files 与上次发布基线一致）。"
-                + skip_note + snap_note)
+                "未检测到需要下发给客户端的改动（服务器 client_files 与上次发布基线一致）。"
+                f"　基线时间：{base_at}" + skip_note + scan_note)
         else:
             self.lbl_status.setText(
                 f"将下发给客户端：新增 {new_n}、替换 {upd_n}"
                 f"{f'、改名 {rnm_n}' if rnm_n else ''}、删除 {del_n}，共 {len(rows)} 项 ✔"
-                "（全部默认发布，右键可禁用）" + skip_note + snap_note)
+                f"　基线时间：{base_at}"
+                "（全部默认发布，右键可禁用）" + skip_note + scan_note)
         log.info("服务端改动检测完成: new=%d update=%d rename=%d delete=%d",
                  new_n, upd_n, rnm_n, del_n)
 
@@ -759,12 +812,12 @@ class TodoPage(QWidget):
             self._apply_state_item(it)  # 先给出即时视觉反馈
         self.lbl_status.setText(f"已{'禁用' if disable else '启用'} {len(rels)} 项")
         # 「本次不发布」的文件不再参与检测，重新检测一次让列表与实际扫描范围一致
-        self._redetect_from_snapshot()
+        self._redetect()
 
-    def _redetect_from_snapshot(self):
-        """状态（禁用/启用）变化后按快照重算列表：秒出，不远程重扫。"""
+    def _redetect(self):
+        """状态（禁用/启用）变化后重新检测：重新读服务器目录（不动发布基线）。"""
         self._last_auto_detect = 0.0
-        self._detect_changes(auto=True, from_snapshot=True)
+        self._detect_changes(auto=True)
 
     def _ignore_all(self):
         """忽略本次快照更新：把当前检测到的全部改动标记为不发布（可随时恢复）。"""
@@ -781,7 +834,7 @@ class TodoPage(QWidget):
         self._state["disabled"].update(rels)
         _save_todo_state(self.config.current_id(), self._state)
         self.lbl_status.setText(f"已忽略本次快照更新：{len(rels)} 项本次不发布")
-        self._redetect_from_snapshot()
+        self._redetect()
 
     def _republish_all(self):
         """重新发布已忽略：把全部已忽略的改动恢复为可发布状态。"""
@@ -798,7 +851,7 @@ class TodoPage(QWidget):
         self._state["disabled"] = set()
         _save_todo_state(self.config.current_id(), self._state)
         self.lbl_status.setText(f"已恢复 {count} 项改动为可发布状态")
-        self._redetect_from_snapshot()
+        self._redetect()
 
     def _annotate_items(self, items):
         """批注选区：一次输入，应用到全部选中项（目录直接作用于目录行）。"""
@@ -1135,6 +1188,42 @@ class TodoPage(QWidget):
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
             client_dir = self.config.files_dir
+            # 发布前核对：检测结果里的源文件必须真的存在于服务器 files_dir 且大小一致。
+            # （防止「检测完 → 文件又被别的途径删掉/改掉」时发布出客户端下载不到的坏任务。）
+            missing, resized = [], []
+            for it in items:
+                if it["status"] not in ("new", "update", "rename"):
+                    continue
+                remote = TodoManifest.remote_source_path(sftp, client_dir, it["rel"])
+                rsize = sftp.file_size(remote)
+                if rsize < 0:
+                    missing.append(it["rel"])
+                elif it.get("size") and rsize != it["size"]:
+                    resized.append(it["rel"])
+            if missing or resized:
+                detail = []
+                if missing:
+                    detail.append("服务器上已不存在：" + "、".join(missing[:20])
+                                  + ("…" if len(missing) > 20 else ""))
+                if resized:
+                    detail.append("大小已变化（检测后又被改过）：" + "、".join(resized[:20])
+                                  + ("…" if len(resized) > 20 else ""))
+                raise RuntimeError(
+                    "发布已中止：检测结果与服务器当前内容不一致。\n"
+                    + "\n".join(detail)
+                    + "\n\n请回到列表点「重新检测」确认后再发布。")
+            # 版本号去重：服务器上已发布的清单版本号与本次相同时自动补时间后缀。
+            # 否则客户端（尤其旧版）只比版本号，会以为已经应用过、漏掉本次更新。
+            try:
+                previous = TodoManifest.load_from_sftp(sftp, self.config.todo_dir)
+            except SFTPError:
+                previous = None
+            if previous is not None and previous.version == manifest.version:
+                new_version = (f"{manifest.version}-"
+                               f"{datetime.now().strftime('%H%M%S')}")
+                log.warning("发布版本号与上次相同（%s），自动改为 %s",
+                            manifest.version, new_version)
+                manifest.version = new_version
             for i, task in enumerate(tasks):
                 if task.action == "install" and task.local_file:
                     remote = TodoManifest.remote_source_path(sftp, client_dir, task.source)

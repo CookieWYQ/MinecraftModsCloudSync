@@ -49,7 +49,12 @@ from app_common.profile import (
 )
 from app_common.settings_dialog import SettingsDialog
 from app_common.single_instance import _activate_msg_id
-from app_common.tasks import ACTION_LABELS, CATEGORY_LABELS, TodoManifest
+from app_common.tasks import (
+    ACTION_LABELS,
+    CATEGORY_LABELS,
+    TodoManifest,
+    manifest_signature,
+)
 from app_common.updater import (
     DownloadThread,
     TrayProgressDialog,
@@ -69,9 +74,13 @@ from app_common.worker import Worker
 from .shared_download import SharedDownloadDialog
 
 from ..engine import (
+    AUTO_SYNC_SKIP_LABELS,
     ApplyThread,
+    AutoSyncThread,
     CheckAllThread,
     default_minecraft_dir,
+    is_manifest_new,
+    is_silent_batch,
 )
 
 log = get_logger("client.main_window")
@@ -119,6 +128,10 @@ class ClientMainWindow(QWidget):
         self._download_thread = None
         self._download_progress = None
         self._update_manual = False
+        self._auto_applying = False  # 是否正在自动应用「静默」更新
+        self._auto_sync_thread = None  # 正在执行的自动同步线程
+        self._auto_sync_running = False
+        self._apply_busy = False  # 是否正在应用服务器待办（避免与自动同步同时写游戏目录）
         self._build()
         self._load_state()
 
@@ -251,6 +264,36 @@ class ClientMainWindow(QWidget):
         dir_row.addWidget(btn_browse)
         right.addWidget(dir_box)
 
+        # 自动同步（免待办直连拉取）：服务端规定范围，玩家只控制开关与间隔
+        auto_box = QGroupBox("自动同步（直接对比服务器文件并拉取，不需要服主发布待办）")
+        auto_lay = QVBoxLayout(auto_box)
+        auto_lay.setSpacing(6)
+        auto_row = QHBoxLayout()
+        self.cb_auto_sync = QCheckBox("启用自动同步")
+        self.cb_auto_sync.setToolTip(
+            "开启后按下面的间隔检测服务器文件仓库，与本地游戏目录对比并自动下载新增/变化的文件。\n"
+            "服务器必须在「自动同步（免待办）」页下发并启用策略；\n"
+            "客户端只下载、不删除本地文件，本地多出来的文件只提示。")
+        self.sp_auto_interval = QSpinBox()
+        self.sp_auto_interval.setRange(5, 1440)
+        self.sp_auto_interval.setSuffix(" 分钟")
+        self.sp_auto_interval.setToolTip("自动检测服务器文件差异的间隔（5–1440 分钟）")
+        self.btn_auto_now = QPushButton("立即检测并拉取")
+        self.btn_auto_now.setToolTip("立即对比服务器与本地文件，并下载差异")
+        auto_row.addWidget(self.cb_auto_sync)
+        auto_row.addSpacing(12)
+        auto_row.addWidget(QLabel("检测间隔"))
+        auto_row.addWidget(self.sp_auto_interval)
+        auto_row.addSpacing(12)
+        auto_row.addWidget(self.btn_auto_now)
+        auto_row.addStretch(1)
+        auto_lay.addLayout(auto_row)
+        self.lbl_auto_status = QLabel("")
+        self.lbl_auto_status.setObjectName("muted")
+        self.lbl_auto_status.setWordWrap(True)
+        auto_lay.addWidget(self.lbl_auto_status)
+        right.addWidget(auto_box)
+
         # 操作按钮
         op_row = QHBoxLayout()
         self.btn_check = QPushButton("立即检查更新")
@@ -309,6 +352,13 @@ class ClientMainWindow(QWidget):
         self.btn_check.clicked.connect(lambda: self._check(manual=True))
         self.btn_apply.clicked.connect(self._apply)
 
+        # 自动同步（免待办）：开关 / 间隔 / 立即检测
+        self.cb_auto_sync.toggled.connect(self._on_auto_toggle)
+        self.sp_auto_interval.valueChanged.connect(self._on_auto_interval_changed)
+        self.btn_auto_now.clicked.connect(lambda: self._auto_sync(manual=True))
+        self.timer_auto = QTimer(self)
+        self.timer_auto.timeout.connect(lambda: self._auto_sync(manual=False))
+
         # 定时检查
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: self._check(manual=False))
@@ -353,7 +403,16 @@ class ClientMainWindow(QWidget):
 
     def _load_state(self):
         self.ed_game_dir.setText(self.config.local_mc_dir or default_minecraft_dir())
+        self.cb_auto_sync.blockSignals(True)
+        self.cb_auto_sync.setChecked(self.config.auto_sync_enabled)
+        self.cb_auto_sync.blockSignals(False)
+        self.btn_auto_now.setEnabled(self.config.auto_sync_enabled)
+        self.sp_auto_interval.blockSignals(True)
+        self.sp_auto_interval.setValue(self.config.auto_sync_interval_min)
+        self.sp_auto_interval.blockSignals(False)
+        self._restart_auto_timer()
         self.refresh_list()
+        self._refresh_auto_status()
 
     def refresh_list(self):
         current = self._current_sid
@@ -441,6 +500,7 @@ class ClientMainWindow(QWidget):
             self.lbl_latest.setText(profile.get("last_seen_version") or "—")
             self.table.setRowCount(0)
         self.btn_apply.setEnabled(bool(self._has_new.get(sid)))
+        self._refresh_auto_status()
 
     def _fill_tasks(self, tasks: list):
         self.table.setRowCount(len(tasks))
@@ -601,13 +661,7 @@ class ClientMainWindow(QWidget):
                 self._manifests[sid] = manifest
                 self._c2c_manifests[sid] = c2c
                 profile = self.config.profile_by_id(sid) or {}
-                is_new = False
-                if manifest is not None and manifest.version != \
-                        profile.get("last_applied_version", ""):
-                    is_new = True
-                if c2c is not None and c2c.version != \
-                        profile.get("last_applied_c2c", ""):
-                    is_new = True
+                is_new = bool(is_manifest_new(profile, manifest, c2c))
                 self._has_new[sid] = is_new
                 self._status[sid] = CONN_OK
                 if is_new:
@@ -656,18 +710,217 @@ class ClientMainWindow(QWidget):
                 self.lbl_status.setText("所有服务器均为最新 ✔")
             else:
                 self.lbl_status.setText(f"发现 {new_count} 台服务器有新更新 ✔")
-        elif new_count and self.config.notify:
-            names = []
-            for sid in self._manifests:
-                if self._has_new.get(sid):
-                    p = self.config.profile_by_id(sid)
-                    if p:
-                        names.append(p.get("name", ""))
-            notify(f"{APP_DISPLAY_NAME} - 发现新更新",
-                   "、".join(names) + " 有待应用的更新，请打开客户端查看。", self.tray)
+        elif new_count:
+            # 服务端把整批待办标记为「静默」时，客户端在后台自动应用，不打扰玩家
+            if self._auto_apply_if_possible(results):
+                pass
+            elif self.config.notify:
+                names = []
+                for sid in self._manifests:
+                    if self._has_new.get(sid):
+                        p = self.config.profile_by_id(sid)
+                        if p:
+                            names.append(p.get("name", ""))
+                notify(f"{APP_DISPLAY_NAME} - 发现新更新",
+                       "、".join(names) + " 有待应用的更新，请打开客户端查看。", self.tray)
+
+    # ---------- 自动同步（免待办直连拉取） ----------
+    def _restart_auto_timer(self):
+        """按本地开关与间隔启动/停止自动同步定时器。"""
+        if not hasattr(self, "timer_auto"):
+            return
+        if self.config.auto_sync_enabled:
+            self.timer_auto.start(self.config.auto_sync_interval_min * 60_000)
+        else:
+            self.timer_auto.stop()
+
+    def _on_auto_toggle(self, checked: bool):
+        self.config.auto_sync_enabled = bool(checked)
+        self.btn_auto_now.setEnabled(bool(checked))
+        self._restart_auto_timer()
+        if not checked:
+            self._refresh_auto_status()
+            return
+        self.lbl_auto_status.setText(
+            f"自动同步已开启（每 {self.config.auto_sync_interval_min} 分钟检测）。"
+            f"正在检测服务器文件差异…")
+        # 打开开关后立刻检测一次，让玩家马上看到效果
+        QTimer.singleShot(
+            800, lambda: (self._auto_sync(manual=True)
+                          if self.config.auto_sync_enabled else None))
+
+    def _on_auto_interval_changed(self, value: int):
+        self.config.auto_sync_interval_min = int(value)
+        self._restart_auto_timer()
+        self._refresh_auto_status()
+
+    def _refresh_auto_status(self):
+        if self._auto_sync_running:
+            return
+        if not self.config.auto_sync_enabled:
+            self.lbl_auto_status.setText(
+                "自动同步已关闭。打开后按间隔检测服务器文件并自动下载差异"
+                "（服务器需先启用自动同步策略）。")
+            return
+        sid = self._current_sid
+        profile = self.config.profile_by_id(sid) if sid else None
+        interval = self.config.auto_sync_interval_min
+        if profile is None:
+            self.lbl_auto_status.setText(
+                f"自动同步已开启（每 {interval} 分钟检测），请先选择服务器。")
+            return
+        at = profile.get("auto_sync_at") or ""
+        files = int(profile.get("auto_sync_files") or 0)
+        if at:
+            self.lbl_auto_status.setText(
+                f"自动同步已开启（每 {interval} 分钟检测）。"
+                f"上次同步：{at}，{files} 个文件。")
+        else:
+            self.lbl_auto_status.setText(
+                f"自动同步已开启（每 {interval} 分钟检测）。尚未执行过自动同步。")
+
+    def _auto_sync(self, manual: bool = False):
+        if self._auto_sync_thread is not None:
+            return
+        if not manual and not self.config.auto_sync_enabled:
+            return
+        if not self.config.profiles():
+            if manual:
+                winutil.warn(self, "提示", "尚未导入任何服务器配置文件。")
+            return
+        if not self.config.local_mc_dir or not self.ed_game_dir.text():
+            if manual:
+                winutil.warn(self, "提示", "请先选择客户端根目录。")
+            return
+        if self._apply_busy:
+            if manual:
+                winutil.warn(self, "请稍候",
+                             "正在应用服务器待办更新，等更新完成后再检测自动同步。")
+            return
+        sid = self._current_sid or self.config.profiles()[0].get("server_id")
+        profile = self.config.profile_by_id(sid)
+        if profile is None:
+            return
+        self.config.local_mc_dir = self.ed_game_dir.text()
+        self._auto_sync_running = True
+        self.btn_auto_now.setEnabled(False)
+        if manual:
+            self.lbl_auto_status.setText("正在检测服务器与本地文件差异…")
+        thread = AutoSyncThread(self.config, profile, apply=True)
+        thread.progress.connect(self._on_auto_sync_progress)
+        thread.done.connect(
+            lambda ok, result, err: self._on_auto_sync_done(
+                ok, result, err, profile, manual))
+        thread.finished.connect(thread.deleteLater)
+        self._auto_sync_thread = thread
+        self._threads.append(thread)
+        thread.start()
+
+    def _on_auto_sync_progress(self, cur: int, total: int, msg: str):
+        if msg:
+            self.lbl_auto_status.setText(msg)
+
+    def _on_auto_sync_done(self, ok: bool, result, err: str,
+                           profile, manual: bool):
+        thread = self._auto_sync_thread
+        self._auto_sync_thread = None
+        if thread is not None:
+            try:
+                self._threads.remove(thread)
+            except ValueError:
+                pass
+        self._auto_sync_running = False
+        self.btn_auto_now.setEnabled(self.config.auto_sync_enabled)
+        name = profile.get("name", "")
+        sid = profile.get("server_id", "")
+        if not ok:
+            log.error("自动同步失败: %s（%s）", name, err)
+            self.lbl_auto_status.setText(f"自动同步失败 ✘：{err}")
+            if manual:
+                if str(err).startswith("授权:"):
+                    winutil.error(self, "授权未通过", str(err)[3:])
+                else:
+                    winutil.error(self, "自动同步失败",
+                                  f"无法完成自动同步：\n{err}")
+            elif self.config.notify:
+                notify(f"{APP_DISPLAY_NAME} - 自动同步失败",
+                       f"「{name}」自动同步失败，请打开客户端查看日志。",
+                       self.tray)
+            return
+        result = result or {}
+        skipped = result.get("skipped") or ""
+        if skipped:
+            label = AUTO_SYNC_SKIP_LABELS.get(skipped, skipped)
+            hint = {
+                "policy_missing":
+                    "请让服主在服务端工具打开「自动同步（免待办）」页并保存策略。",
+                "policy_disabled":
+                    "请让服主在服务端工具把自动同步总开关打开。",
+                "policy_empty":
+                    "服务端策略的白名单为空，未允许任何目录。",
+            }.get(skipped, "")
+            self.lbl_auto_status.setText(label + ("。" + hint if hint else ""))
+            if manual:
+                winutil.info(self, "暂未同步",
+                             label + (f"\n\n{hint}" if hint else ""))
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        installed = list(result.get("installed") or [])
+        downloads = list(result.get("downloads") or [])
+        errors = list(result.get("errors") or [])
+        extras = list(result.get("extras") or [])
+        remote_files = int(result.get("remote_files") or 0)
+        downloaded_bytes = int(result.get("bytes") or 0)
+        total_bytes = int(result.get("total_bytes") or 0)
+        self.config.mark_auto_sync(sid, now, len(installed),
+                                   "ok" if not errors else "partial")
+        if not downloads:
+            self.lbl_auto_status.setText(
+                f"自动同步：已是最新（对比 {remote_files} 个文件，{now}）。")
+        elif errors:
+            self.lbl_auto_status.setText(
+                f"自动同步：下载 {len(installed)}/{len(downloads)} 个文件，"
+                f"失败 {len(errors)} 个（{now}）。")
+        else:
+            self.lbl_auto_status.setText(
+                f"自动同步：已下载 {len(installed)} 个文件"
+                f"（{_fmt_size(downloaded_bytes)}，{now}）。")
+        if result.get("warnings"):
+            log.warning("自动同步提示: %s",
+                        "；".join(result["warnings"][:5]))
+        if manual:
+            lines = [
+                f"服务器：{name}",
+                f"检测时间：{now}",
+                f"服务器范围内文件：{remote_files} 个",
+                f"本次需下载：{len(downloads)} 个（{_fmt_size(total_bytes)}）",
+                f"已下载：{len(installed)} 个（{_fmt_size(downloaded_bytes)}）",
+                f"本地多余（不会删除）：{len(extras)} 个",
+            ]
+            if errors:
+                lines.append(f"失败：{len(errors)} 个")
+                lines += errors
+            if extras:
+                lines.append("")
+                lines.append("本地多余文件（服务器上没有，未自动删除）：")
+                lines += [f"  · {item['rel']}" for item in extras[:50]]
+                if len(extras) > 50:
+                    lines.append(f"  … 其余 {len(extras) - 50} 个")
+            title = "自动同步：已是最新" if not downloads else "自动同步完成"
+            winutil.info_list(self, title, lines)
+        elif installed and self.config.notify:
+            notify(f"{APP_DISPLAY_NAME} - 自动同步",
+                   f"「{name}」已自动下载 {len(installed)} 个文件。",
+                   self.tray)
+        log.info("自动同步完成: %s - 下载 %d/%d 个文件（%d 个失败）",
+                 name, len(installed), len(downloads), len(errors))
 
     # ---------- 应用更新 ----------
     def _apply(self):
+        if self._auto_sync_running:
+            winutil.warn(self, "请稍候",
+                         "正在自动同步服务器文件，完成后再应用待办更新。")
+            return
         sid = self._current_sid
         if not sid or not self._has_new.get(sid):
             return
@@ -733,35 +986,87 @@ class ClientMainWindow(QWidget):
                 return
             skip_ids = dlg.skipped_ids()
 
+        self._start_apply(profile, manifest, c2c, skip_ids, auto=False)
+
+    def _start_apply(self, profile, manifest, c2c, skip_ids: set[str],
+                     auto: bool = False):
+        """启动应用线程；auto=True 表示静默自动应用（不弹进度/结果对话框）。"""
+        self._apply_busy = True
         total = len(manifest.tasks) if manifest else 0
         total += len(c2c.tasks) if c2c else 0
-        progress = QProgressDialog("正在应用更新…", None, 0, max(total, 1), self)
-        progress.setWindowTitle("应用更新")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
-        progress.setAutoClose(False)
+        progress = None
+        if not auto:
+            progress = QProgressDialog("正在应用更新…", None, 0, max(total, 1), self)
+            progress.setWindowTitle("应用更新")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
 
         thread = ApplyThread(self.config, profile, manifest, c2c, skip_ids)
-        thread.progress.connect(lambda cur, total, msg: (
-            progress.setValue(cur),
-            progress.setLabelText(f"[{cur}/{total}] {msg}"),
-        ))
+        if progress is not None:
+            thread.progress.connect(lambda cur, total, msg: (
+                progress.setValue(cur),
+                progress.setLabelText(f"[{cur}/{total}] {msg}"),
+            ))
         thread.done.connect(lambda ok, summary, err: self._on_apply_done(
-            ok, summary, err, profile, manifest, c2c, progress))
+            ok, summary, err, profile, manifest, c2c, progress, auto))
         thread.finished.connect(thread.deleteLater)
         self._threads.append(thread)
         thread.start()
 
+    def _auto_apply_if_possible(self, results: dict) -> bool:
+        """整批待办都被服务端标记为「静默」且没有可选任务时，后台自动应用。
+
+        只在定时检查（非手动）时尝试，且一次只自动应用一台服务器，
+        避免多台服务器同时写同一个游戏目录。返回是否已开始自动应用。
+        """
+        if self._auto_applying:
+            return True
+        candidates = []
+        for sid, result in results.items():
+            if not result.get("ok"):
+                continue
+            manifest = result.get("manifest")
+            c2c = result.get("c2c_manifest")
+            profile = self.config.profile_by_id(sid)
+            if profile is None or not is_manifest_new(profile, manifest, c2c):
+                continue
+            # 有任一任务不是静默、或带可选（需要玩家选择）→ 不自动应用
+            if not is_silent_batch(manifest, c2c):
+                continue
+            candidates.append((sid, profile, manifest, c2c))
+        if len(candidates) != 1:
+            return False
+        sid, profile, manifest, c2c = candidates[0]
+        self._auto_applying = True
+        name = profile.get("name", sid)
+        self.lbl_status.setText(f"检测到「{name}」的静默更新，正在后台自动应用…")
+        log.info("静默更新自动应用开始: %s", name)
+        self._start_apply(profile, manifest, c2c, set(), auto=True)
+        return True
+
     def _on_apply_done(self, ok: bool, summary, err: str, profile, manifest,
-                       c2c, progress):
-        progress.close()
+                       c2c, progress, auto: bool = False):
+        self._auto_applying = False
+        self._apply_busy = False
+        if progress is not None:
+            progress.close()
         if not ok:
-            winutil.error(self, "应用失败", f"应用更新过程中发生错误：\n{err}")
+            self.lbl_status.setText("应用更新失败 ✘")
+            if auto:
+                log.error("静默更新自动应用失败: %s（%s）", profile.get("name"), err)
+                if self.config.notify:
+                    notify(f"{APP_DISPLAY_NAME} - 自动更新失败",
+                           f"「{profile.get('name')}」更新失败，请打开客户端查看日志。",
+                           self.tray)
+            else:
+                winutil.error(self, "应用失败", f"应用更新过程中发生错误：\n{err}")
             return
         sid = profile.get("server_id")
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if manifest is not None:
-            self.config.mark_applied(sid, manifest.version, now)
+            self.config.mark_applied(sid, manifest.version, now,
+                                     sig=manifest_signature(manifest))
         if c2c is not None:
             self.config.mark_applied_c2c(sid, c2c.version)
         self.config.reset_unapplied(sid)
@@ -795,8 +1100,10 @@ class ClientMainWindow(QWidget):
         if self.config.notify:
             notify(f"{APP_DISPLAY_NAME} - 更新完成",
                    f"已应用版本 {'、'.join(versions)}", self.tray)
-        winutil.info_list(self, "更新完成", lines)
-        log.info("应用更新完成: %s - %s", profile.get("name"), "、".join(versions))
+        if not auto:
+            winutil.info_list(self, "更新完成", lines)
+        log.info("应用更新完成: %s - %s%s", profile.get("name"),
+                 "、".join(versions), "（静默自动）" if auto else "")
 
     # ---------- 设置 ----------
     def _browse_dir(self):
@@ -1061,6 +1368,16 @@ class ClientMainWindow(QWidget):
             return
         self.tray.hide()
         QApplication.quit()
+
+
+def _fmt_size(num: int) -> str:
+    """字节数格式化（界面提示用）。"""
+    size = float(max(0, int(num or 0)))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
 
 
 def _task_tags(task) -> str:

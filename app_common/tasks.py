@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """待办任务模型与清单（manifest）读写。"""
+import hashlib
 import json
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -182,3 +183,23 @@ def safe_target(rel: str) -> str:
     if any(part in ("..", ".") for part in p.parts):
         raise ValueError("路径不合法（不允许 .. 或 .）")
     return p.as_posix()
+
+
+def manifest_signature(manifest: "TodoManifest") -> str:
+    """待办清单的内容指纹（版本号 + 任务 + 设置）。
+
+    客户端用它判断「服务器重新发布过、但版本号没变」的情况：
+    例如服主当天二次发布时忘了改版本号，只比版本号会漏掉这批更新。
+    不含 created_at / note / description：仅内容变化才算新版本。
+    """
+    payload = {
+        "version": manifest.version,
+        "tasks": sorted(
+            [t.action, t.category, t.target, t.source,
+             bool(t.optional), bool(t.silent)] for t in manifest.tasks),
+        "settings": sorted([str(k), str(v)]
+                           for k, v in (manifest.settings or {}).items()),
+    }
+    blob = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"))
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()
