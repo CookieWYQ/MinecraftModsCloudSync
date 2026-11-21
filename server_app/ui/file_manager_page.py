@@ -12,16 +12,26 @@
 
 另外提供「映射为本地磁盘（给 PCL 用）」帮助窗口：检测 SSHFS-Win / rclone 并给出
 可直接复制的映射命令，把服务器目录假装成本地盘符，PCL 就能直接把整合包下载进去。
+
+模组相关（v1.3.1）
+----------------
+- 右键模组 jar →「模组网页」：打开 MC 百科 / Modrinth / CurseForge 详情页；
+  本地数据库确认不了项目时自动回退到对应网站的搜索页（都能打开）；
+- 右键条目 →「标记 / 排除」（手动标记，与其它页共用同一份数据）：
+  * 发布待办：本次不发布（跳过检测，等同「发布待办」页的禁用标记）；
+  * 自动同步：写进服务器上的自动同步策略黑名单，客户端不再自动下发；
+  * 差异审核：标注为「跳过」（更新服务端页不扫描、不比对、不发送）。
 """
 import json
 import os
 import posixpath
 from datetime import datetime
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor
+from PySide6.QtCore import Qt, QUrl, Signal
+from PySide6.QtGui import QBrush, QColor, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -42,7 +52,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app_common import winutil
+from app_common import auto_sync, winutil
+from app_common.mod_links import add_mod_web_menu
 from app_common.file_manager import (
     CATEGORY_LABELS,
     CATEGORY_ORDER,
@@ -68,9 +79,24 @@ from app_common.sftp import SFTPManager
 from app_common.sftp_mount import mount_help
 from app_common.worker import Worker, fmt_progress
 
+# 与「发布待办（S2C）」页共用同一份「本次不发布」标记（存在配置目录 snapshots/todo_*.json），
+# 在本页标记后，发布待办检测会直接跳过对应文件，反之亦然。
+from .todo_page import _load_todo_state, _save_todo_state
+
 log = get_logger("server.file_manager_page")
 
 ROLE_DATA = Qt.UserRole
+
+MARK_TODO = "todo"
+MARK_SYNC = "sync"
+MARK_DIFF = "diff"
+_MARK_COLORS = "#d9822b"
+
+
+def _is_mod_jar(name: str) -> bool:
+    """是否是模组 jar（含被禁用的 .jar.disabled）。"""
+    low = (name or "").lower()
+    return low.endswith(".jar") or low.endswith(".jar.disabled")
 
 
 def _fmt_time(ts) -> str:
@@ -129,6 +155,9 @@ class FileManagerPage(QWidget):
         self._loaded_key = None
         self._busy = False
         self._pending_upload = None
+        # 手动标记（与其它页面共用）：todo=发布待办禁用集合，sync=自动同步黑名单，
+        # diff=差异审核「跳过」标注（target_overrides 中值为 skip 的键）。
+        self._marks = {MARK_TODO: set(), MARK_SYNC: set(), MARK_DIFF: set()}
         self._build()
 
     # ---------------- 界面 ----------------
@@ -183,11 +212,11 @@ class FileManagerPage(QWidget):
         lay.addLayout(bar)
 
         self.tree = _FileTree()
-        self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels(["名称", "状态", "大小", "修改时间"])
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["名称", "状态", "大小", "修改时间", "标记"])
         header = self.tree.header()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        for col in (1, 2, 3):
+        for col in (1, 2, 3, 4):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         self.tree.setRootIsDecorated(True)
         self.tree.setSortingEnabled(False)
@@ -266,6 +295,7 @@ class FileManagerPage(QWidget):
             "history_keep": self.config.history_keep,
             "history_max_mb": self.config.history_max_mb,
             "files_dir": self.config.files_dir,
+            "todo_dir": self.config.todo_dir,
         }
 
     def _refresh_root_options(self):
@@ -281,6 +311,9 @@ class FileManagerPage(QWidget):
     # ---------------- 读取 ----------------
     def showEvent(self, event):
         super().showEvent(event)
+        # 其它页面可能刚改过标记（发布待办禁用 / 差异审核跳过），切回本页时刷新显示。
+        self._load_local_marks()
+        self._refresh_mark_labels()
         key = (self.config.current_id(), self._root_kind())
         if key != self._loaded_key:
             self.reload()
@@ -288,6 +321,7 @@ class FileManagerPage(QWidget):
     def reload(self):
         """重新读取当前管理目录（切换服务器/目录、操作完成后调用）。"""
         self._refresh_root_options()
+        self._load_local_marks()
         if self._busy:
             return
         if not self.config.host():
@@ -306,6 +340,15 @@ class FileManagerPage(QWidget):
                          info["username"], info["password"]) as sftp:
             data = scan_overview(sftp, info["root"],
                                  show_hidden=info["show_hidden"])
+            # 顺带读取自动同步策略黑名单：用于在「标记」列显示、以及右键菜单回显
+            # 勾选状态。失败不影响目录浏览（标记列退化为只显示本地标记）。
+            try:
+                policy = (auto_sync.load_policy(sftp, info["todo_dir"])
+                          if info.get("todo_dir") else None)
+                data["sync_exclude"] = list((policy or {}).get("exclude") or [])
+            except Exception as exc:
+                log.warning("读取自动同步策略失败: %s", exc)
+                data["sync_exclude"] = None
         data["kind"] = info["kind"]
         data["server_id"] = info["server_id"]
         return json.dumps(data, ensure_ascii=False)
@@ -329,12 +372,16 @@ class FileManagerPage(QWidget):
             return
         self._overview = data
         self._loaded_key = (self.config.current_id(), self._root_kind())
+        if data.get("sync_exclude") is not None:
+            self._marks[MARK_SYNC] = {str(e) for e in data["sync_exclude"]}
+        self._load_local_marks()
         self._fill_tree(data)
         if self.status_cb:
             self.status_cb(True)
         self.lbl_status.setText(
             f"共 {self._count_entries(data)} 个文件；"
-            f"拖拽本地文件到分类上即可上传，右键可启用/禁用、重命名、删除。")
+            f"拖拽本地文件到分类上即可上传；右键可启用/禁用、重命名、删除、"
+            f"打开模组网页，或把它标记为「排除」（发布待办 / 自动同步 / 差异审核）。")
 
     @staticmethod
     def _count_entries(data) -> int:
@@ -360,6 +407,7 @@ class FileManagerPage(QWidget):
             item.setText(1, self._category_status(cat))
             item.setText(2, "")
             item.setText(3, "")
+            item.setText(4, "")
             item.setToolTip(0, cat.get("dir") or root)
             for entry in cat.get("entries") or []:
                 self._add_entry(item, entry)
@@ -415,6 +463,7 @@ class FileManagerPage(QWidget):
         if entry.get("disabled"):
             for col in range(4):
                 item.setForeground(col, QBrush(QColor("#9e9e9e")))
+        self._apply_mark_cell(item)
         return item
 
     # ---------------- 懒加载子目录 ----------------
@@ -1040,25 +1089,310 @@ class FileManagerPage(QWidget):
 
     @staticmethod
     def _copy_mount_commands(data):
-        from PySide6.QtWidgets import QApplication
         lines = [cmd["command"] for cmd in data.get("commands") or []]
         QApplication.clipboard().setText("\n".join(lines))
 
+    # ---------------- 手动标记（发布待办 / 自动同步 / 差异审核） ----------------
+    def _root_is_files(self) -> bool:
+        """当前管理目录是否就是「客户端文件仓库」（发布待办 / 自动同步读取的目录）。"""
+        return (self._root().strip("/")
+                == str(self.config.files_dir or "").strip("/"))
+
+    def _load_local_marks(self):
+        """读取本地标记：「本次不发布」与「差异审核跳过」（轻量，不联网）。"""
+        try:
+            state = _load_todo_state(self.config.current_id())
+            self._marks[MARK_TODO] = {str(rel) for rel in
+                                      (state.get("disabled") or ())}
+        except Exception as exc:
+            log.warning("读取发布待办标记失败: %s", exc)
+        try:
+            self._marks[MARK_DIFF] = {
+                str(key) for key, value in self.config.target_overrides.items()
+                if value == "skip"}
+        except Exception as exc:
+            log.warning("读取差异审核标记失败: %s", exc)
+
+    def _sync_excluded(self, rel: str) -> bool:
+        """自动同步策略黑名单是否覆盖该路径（支持目录前缀与 glob）。"""
+        if not rel:
+            return False
+        try:
+            return any(auto_sync.entry_matches(entry, rel)
+                       for entry in self._marks[MARK_SYNC])
+        except Exception:
+            return False
+
+    def _diff_excluded(self, rel: str) -> bool:
+        """差异审核是否跳过了该文件（含 client_files/ 前缀的客户端文件副本）。"""
+        if not rel:
+            return False
+        return (rel in self._marks[MARK_DIFF]
+                or f"client_files/{rel}" in self._marks[MARK_DIFF])
+
+    def _mark_labels(self, rel: str, is_dir: bool) -> list[str]:
+        labels = []
+        if not is_dir and rel and rel in self._marks[MARK_TODO]:
+            labels.append("发布排除")
+        if self._sync_excluded(rel):
+            labels.append("同步排除")
+        if self._diff_excluded(rel):
+            labels.append("审核跳过")
+        return labels
+
+    def _apply_mark_cell(self, item: QTreeWidgetItem):
+        """把标记写进「标记」列（没有标记时清空）。"""
+        data = item.data(0, ROLE_DATA) or {}
+        if data.get("kind") != "entry":
+            return
+        rel = data.get("rel") or ""
+        labels = self._mark_labels(rel, bool(data.get("is_dir")))
+        item.setText(4, "、".join(labels))
+        if not labels:
+            item.setToolTip(4, "")
+            item.setForeground(4, QBrush())
+            return
+        tips = []
+        if "发布排除" in labels:
+            tips.append("发布待办：本次不发布（改动检测时跳过）")
+        if "同步排除" in labels:
+            tips.append("自动同步：黑名单（客户端不自动下发）")
+        if "审核跳过" in labels:
+            tips.append("差异审核：跳过（不扫描、不比对、不发送）")
+        item.setToolTip(4, "\n".join(tips))
+        item.setForeground(4, QBrush(QColor(_MARK_COLORS)))
+
+    def _refresh_mark_labels(self):
+        stack = [self.tree.topLevelItem(i)
+                 for i in range(self.tree.topLevelItemCount())]
+        while stack:
+            node = stack.pop()
+            self._apply_mark_cell(node)
+            stack.extend(node.child(i) for i in range(node.childCount()))
+
+    def _toggle_marks(self, kind: str, items, turn_on: bool):
+        """按标记类型执行勾选 / 取消（items 为当前选中的条目）。"""
+        entries = [item for item in items
+                   if (item.data(0, ROLE_DATA) or {}).get("kind") == "entry"]
+        if kind == MARK_TODO:
+            self._toggle_publish_marks(entries, turn_on)
+        elif kind == MARK_SYNC:
+            self._toggle_sync_marks(entries, turn_on)
+        elif kind == MARK_DIFF:
+            self._toggle_diff_marks(entries, turn_on)
+
+    @staticmethod
+    def _unique_rels(items, *, files_only: bool = False) -> list[str]:
+        rels: list[str] = []
+        for item in items:
+            data = item.data(0, ROLE_DATA) or {}
+            if data.get("kind") != "entry":
+                continue
+            if files_only and data.get("is_dir"):
+                continue
+            rel = data.get("rel") or ""
+            if rel and rel not in rels:
+                rels.append(rel)
+        return rels
+
+    # ---- 发布待办：本次不发布（与「发布待办」页共用 todo_*.json） ----
+    def _toggle_publish_marks(self, items, turn_on: bool):
+        rels = self._unique_rels(items, files_only=True)
+        if not rels:
+            winutil.warn(self, "提示",
+                         "「本次不发布」只能标记文件（不能标记整个目录）。")
+            return
+        state = _load_todo_state(self.config.current_id())
+        disabled = set(state.get("disabled") or ())
+        if turn_on:
+            disabled.update(rels)
+        else:
+            disabled.difference_update(rels)
+        state["disabled"] = disabled
+        _save_todo_state(self.config.current_id(), state)
+        self._marks[MARK_TODO] = set(disabled)
+        self._refresh_mark_labels()
+        if turn_on:
+            text = (f"已把 {len(rels)} 个文件标记为「本次不发布」："
+                    "发布待办检测会跳过它们，发布时也不会下发。")
+        else:
+            text = f"已取消 {len(rels)} 个文件的「本次不发布」标记。"
+        if not self._root_is_files():
+            text += ("（发布待办读取的是「客户端文件仓库」，该标记按相对路径作用于"
+                     "其中的同路径文件。）")
+        self.lbl_status.setText(text)
+        log.info("文件管理标记发布待办：%s %s",
+                 "排除" if turn_on else "恢复", rels[:12])
+
+    # ---- 自动同步：写入服务器策略黑名单 ----
+    def _toggle_sync_marks(self, items, turn_on: bool):
+        rels = self._unique_rels(items)
+        if not rels:
+            winutil.warn(self, "提示", "请先选中要排除的文件或目录。")
+            return
+        if not self.config.host():
+            winutil.warn(self, "提示", "未配置 SFTP 服务器，无法写入自动同步策略。")
+            return
+        if not str(self.config.todo_dir or "").strip("/"):
+            winutil.warn(self, "提示",
+                         "「服务器设置」里未填写待办目录，无法写入自动同步策略。")
+            return
+        info = self._sftp_info()
+        self._set_busy(True)
+        self.lbl_status.setText("正在更新服务器上的自动同步策略…")
+        self._start_worker(self._mark_sync_worker, info, rels, turn_on,
+                           on_done=self._on_mark_sync_done)
+
+    def _mark_sync_worker(self, info, rels, exclude,
+                          progress_cb=None) -> str:
+        with SFTPManager(info["host"], info["port"],
+                         info["username"], info["password"]) as sftp:
+            policy = auto_sync.load_policy(sftp, info["todo_dir"])
+            new_policy, changed = auto_sync.update_exclude(
+                policy,
+                add=rels if exclude else [],
+                remove=[] if exclude else rels)
+            if changed:
+                auto_sync.save_policy(sftp, info["todo_dir"], new_policy)
+        return json.dumps({"exclude": new_policy["exclude"], "changed": changed,
+                           "created": policy is None, "rels": rels,
+                           "excluded": exclude}, ensure_ascii=False)
+
+    def _on_mark_sync_done(self, ok: bool, msg: str):
+        self._set_busy(False)
+        if not ok:
+            winutil.error(self, "标记自动同步排除失败", str(msg))
+            return
+        try:
+            data = json.loads(msg or "{}")
+        except Exception:
+            data = {}
+        self._marks[MARK_SYNC] = {str(e) for e in data.get("exclude") or []}
+        self._refresh_mark_labels()
+        rels = data.get("rels") or []
+        if data.get("excluded"):
+            text = (f"已把 {len(rels)} 项加入自动同步黑名单"
+                    "（客户端不会再自动下发这些文件）。")
+            if data.get("created"):
+                text += "服务器原先没有策略文件，已按「关闭」状态创建。"
+        else:
+            text = (f"已把 {len(rels)} 项移出自动同步黑名单。"
+                    if data.get("changed")
+                    else f"{len(rels)} 项原本就不在黑名单里。")
+        if not self._root_is_files():
+            text += "（黑名单路径相对「客户端文件仓库」，同路径文件生效。）"
+        self.lbl_status.setText(text)
+        log.info("文件管理标记自动同步：%s %s",
+                 "排除" if data.get("excluded") else "恢复", rels[:12])
+
+    # ---- 差异审核：标注为「跳过」（target_overrides，与「更新服务端」页共用） ----
+    def _toggle_diff_marks(self, items, turn_on: bool):
+        rels = self._unique_rels(items)
+        if not rels:
+            winutil.warn(self, "提示", "请先选中要标记的文件或目录。")
+            return
+        overrides = self.config.target_overrides
+        for rel in rels:
+            for key in (rel, f"client_files/{rel}"):
+                if turn_on:
+                    overrides[key] = "skip"
+                elif overrides.get(key) == "skip":
+                    overrides.pop(key, None)
+        self.config.target_overrides = overrides
+        self._marks[MARK_DIFF] = {str(key) for key, value in overrides.items()
+                                  if value == "skip"}
+        self._refresh_mark_labels()
+        if turn_on:
+            text = (f"已把 {len(rels)} 项标注为「跳过」：更新服务端差异审核"
+                    "将不再扫描、比对或发送它们（回到该页点「刷新」后生效）。")
+        else:
+            text = f"已取消 {len(rels)} 项的「跳过」标注。"
+        self.lbl_status.setText(text)
+        log.info("文件管理标记差异审核：%s %s",
+                 "跳过" if turn_on else "恢复", rels[:12])
+
     # ---------------- 右键菜单 ----------------
+    def _add_mod_web_menu(self, menu: QMenu, filename: str):
+        """向菜单加「模组网页」子菜单，并给每项打上 (link/copy, url, 站点) 标记。"""
+        try:
+            bundle = add_mod_web_menu(menu, filename)
+        except Exception as exc:  # 链接解析失败不能影响其它右键操作
+            log.warning("解析模组网页链接失败: %s", exc)
+            return
+        for action, url, site in bundle["open"]:
+            action.setData(("link", url, site))
+        for action, url, site in bundle["copy"]:
+            action.setData(("copy", url, site))
+
+    def _add_marks_menu(self, menu: QMenu, items):
+        """向菜单加「标记 / 排除」子菜单（勾选状态回显当前标记）。"""
+        entries = [item for item in items
+                   if (item.data(0, ROLE_DATA) or {}).get("kind") == "entry"]
+        if not entries:
+            return
+        n = len(entries)
+        sub = menu.addMenu(f"标记 / 排除（{n} 项）" if n > 1 else "标记 / 排除")
+        all_rels = self._unique_rels(entries)
+
+        # 发布待办（仅文件：发布待办页的禁用标记就是文件级）
+        file_rels = self._unique_rels(entries, files_only=True)
+        if file_rels:
+            action = sub.addAction("发布待办：本次不发布（跳过检测）")
+            action.setCheckable(True)
+            action.setChecked(all(rel in self._marks[MARK_TODO]
+                                  for rel in file_rels))
+            action.setData(("mark", MARK_TODO))
+            action.setToolTip(
+                "与「发布待办（S2C）」页的「禁用（本次不发布）」是同一份标记：\n"
+                "勾选后该文件不参与改动检测，也不会被发布给客户端。")
+        else:
+            action = sub.addAction("发布待办：本次不发布（仅文件可用）")
+            action.setEnabled(False)
+
+        # 自动同步：按「整条路径」是否已在黑名单里回显（不匹配上级目录）
+        lower = {str(entry).lower() for entry in self._marks[MARK_SYNC]}
+        action = sub.addAction("自动同步：排除（客户端不自动下发）")
+        action.setCheckable(True)
+        action.setChecked(all(rel.lower() in lower for rel in all_rels))
+        action.setData(("mark", MARK_SYNC))
+        action.setToolTip(
+            "写入服务器上的自动同步策略黑名单（{待办目录}/auto_sync.json），\n"
+            "客户端自动同步时不会下载这些文件；目录条目覆盖其下所有文件。\n"
+            "只改黑名单，不会打开自动同步总开关。")
+
+        # 差异审核：跳过（不扫描 / 不比对 / 不发送）
+        action = sub.addAction("差异审核：跳过（不扫描 / 不比对）")
+        action.setCheckable(True)
+        action.setChecked(all(self._diff_excluded(rel) for rel in all_rels))
+        action.setData(("mark", MARK_DIFF))
+        action.setToolTip(
+            "与「更新服务端（C2S）」页右键「标注为 → 跳过」是同一份标记：\n"
+            "标记后差异审核不读取、不哈希、不比对，也不会发送该文件/目录。")
+
     def _on_menu(self, pos):
         item = self.tree.itemAt(pos)
         menu = QMenu(self)
         if item is not None:
-            item.setSelected(True)
+            # 右键落在未选中的条目上时只作用于它（多选时对全部选中项统一标记）
+            selected = self.tree.selectedItems()
+            if item not in selected:
+                self.tree.clearSelection()
+                item.setSelected(True)
             self.tree.setCurrentItem(item)
+            self._load_local_marks()
             data = item.data(0, ROLE_DATA) or {}
             if data.get("kind") == "entry":
                 is_dir = bool(data.get("is_dir"))
                 rel = data.get("rel") or ""
+                name = item.text(0)
                 if not is_dir and is_toggleable(rel, False):
                     disabled = bool(data.get("disabled"))
                     menu.addAction("启用该文件" if disabled else "禁用该文件",
                                    lambda: self._toggle_selected())
+                if not is_dir and _is_mod_jar(name):
+                    self._add_mod_web_menu(menu, name)
+                self._add_marks_menu(menu, self._selected_items())
+                menu.addSeparator()
                 menu.addAction("重命名…", self._rename_selected)
                 menu.addAction("删除…", self._delete_selected)
                 if is_dir:
@@ -1076,7 +1410,29 @@ class FileManagerPage(QWidget):
         menu.addAction("刷新", self.reload)
         menu.addAction("展开全部", self.tree.expandAll)
         menu.addAction("折叠全部", self.tree.collapseAll)
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        action = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if action is not None:
+            self._handle_menu_action(action)
+
+    def _handle_menu_action(self, action) -> bool:
+        """处理右键菜单里带数据的动作（模组网页 / 复制链接 / 标记）。返回是否已处理。"""
+        payload = action.data()
+        if not (isinstance(payload, tuple) and payload):
+            return False
+        tag = payload[0]
+        if tag == "link":
+            QDesktopServices.openUrl(QUrl(payload[1]))
+            self.lbl_status.setText(f"已在浏览器打开 {payload[2]}：{payload[1]}")
+            return True
+        if tag == "copy":
+            QApplication.clipboard().setText(payload[1])
+            self.lbl_status.setText(f"已复制 {payload[2]} 链接")
+            return True
+        if tag == "mark":
+            self._toggle_marks(payload[1], self._selected_items(),
+                               action.isChecked())
+            return True
+        return False
 
     def _upload_here(self):
         item = self.tree.currentItem()

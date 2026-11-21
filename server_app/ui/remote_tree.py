@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
+from app_common.mod_links import add_store_pages_menu
 from app_common.sftp import SFTPManager
 from app_common.worker import Worker
 
@@ -371,8 +372,18 @@ class RemoteTreeWidget(QWidget):
             menu.addSeparator()
             act_mc_view, act_mc_search, act_mc_copy, view_url, search_url = \
                 add_mcmod_menu_actions(menu, search_name)
+            # 追加 Modrinth / CurseForge 网页（命中项目 → 详情页，否则搜索页兜底）
+            store = add_store_pages_menu(menu, item.text(0),
+                                         display_name=search_name)
+            for store_act, store_url, site in store["open"]:
+                store_act.setData(("store_link", store_url, site))
         act = menu.exec(self.tree.viewport().mapToGlobal(pos))
         if act is None:
+            return
+        payload = act.data()
+        if isinstance(payload, tuple) and payload and payload[0] == "store_link":
+            QDesktopServices.openUrl(QUrl(payload[1]))
+            self.lbl_status.setText(f"已打开 {payload[2]}：{payload[1]}")
             return
         if act is act_name:
             QApplication.clipboard().setText(

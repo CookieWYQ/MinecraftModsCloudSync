@@ -42,6 +42,7 @@ from app_common.file_hash import hash_file_cached, hash_remote_parallel
 from app_common.history import HistoryStore
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_display_name
+from app_common.mod_links import add_store_pages_menu
 from app_common.mod_env import (
     SIDE_UNKNOWN,
     enrich_online,
@@ -265,6 +266,25 @@ class RemoteFilePage(QWidget):
         self._online_busy = False
         self._build()
         self._load_config()
+
+    def showEvent(self, event):
+        """回到本页时同步其它页面（文件管理）刚改过的手动标注，并按新标注重新检测。
+
+        「文件管理（手动）」页的「差异审核：跳过」写入的就是本页的 target_overrides；
+        不重新检测的话旧行还会留在列表里，看起来像没生效。
+        """
+        super().showEvent(event)
+        try:
+            overrides = dict(self.config.target_overrides)
+            auto_targets = dict(self.config.auto_targets)
+        except Exception:
+            return
+        if overrides == self._overrides and auto_targets == self._auto_targets:
+            return
+        self._overrides = overrides
+        self._auto_targets = auto_targets
+        self.lbl_status.setText("手动标注已更新，正在按新标记重新检测差异…")
+        self._auto_detect()
 
     def _build(self):
         layout = QVBoxLayout(self)
@@ -1810,8 +1830,18 @@ class RemoteFilePage(QWidget):
             menu.addSeparator()
             act_mc_view, act_mc_search, act_mc_copy, view_url, search_url = \
                 add_mcmod_menu_actions(menu, mcmod_key)
+            # 追加 Modrinth / CurseForge 网页（命中项目 → 详情页，否则搜索页兜底）
+            store = add_store_pages_menu(menu, item.text(0),
+                                         display_name=mcmod_key)
+            for store_act, store_url, site in store["open"]:
+                store_act.setData(("store_link", store_url, site))
         act = menu.exec(self.review_tree.viewport().mapToGlobal(pos))
         if act is None:
+            return
+        payload = act.data()
+        if isinstance(payload, tuple) and payload and payload[0] == "store_link":
+            QDesktopServices.openUrl(QUrl(payload[1]))
+            self.lbl_status.setText(f"已打开 {payload[2]}：{payload[1]}")
             return
         if act is act_name:
             QApplication.clipboard().setText(item.text(0))

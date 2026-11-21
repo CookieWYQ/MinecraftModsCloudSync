@@ -48,6 +48,7 @@ from app_common.constants import config_dir
 from app_common.file_hash import hash_remote_parallel
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
+from app_common.mod_links import add_store_pages_menu
 from app_common.sftp import SFTPError, SFTPManager
 from app_common.snapshot import load_snapshot, normalize_files, save_snapshot
 from app_common.snapshot_dialog import SnapshotHistoryDialog
@@ -305,8 +306,13 @@ class TodoPage(QWidget):
         self._default_font = QFont(self.changes_tree.font())
 
     def showEvent(self, event):
-        """每次打开本页自动检测一遍服务端改动。"""
+        """每次打开本页自动检测一遍服务端改动。
+
+        「文件管理（手动）」页可能刚改过「本次不发布」标记（两处共用同一份状态文件），
+        因此检测前先重新读取一次标记，避免沿用旧状态。
+        """
         super().showEvent(event)
+        self._state = _load_todo_state(self.config.current_id())
         self._auto_detect()
 
     def reload(self):
@@ -1003,8 +1009,18 @@ class TodoPage(QWidget):
             menu.addSeparator()
             act_mc_view, act_mc_search, act_mc_copy, view_url, search_url = \
                 add_mcmod_menu_actions(menu, mcmod_key)
+            # 追加 Modrinth / CurseForge 网页（命中项目 → 详情页，否则搜索页兜底）
+            store = add_store_pages_menu(menu, selected[0].text(0),
+                                         display_name=mcmod_key)
+            for store_act, store_url, site in store["open"]:
+                store_act.setData(("store_link", store_url, site))
         act = menu.exec(self.changes_tree.viewport().mapToGlobal(pos))
         if act is None:
+            return
+        payload = act.data()
+        if isinstance(payload, tuple) and payload and payload[0] == "store_link":
+            QDesktopServices.openUrl(QUrl(payload[1]))
+            self.lbl_status.setText(f"已打开 {payload[2]}：{payload[1]}")
             return
         if all_disabled and act is act_enable:
             self._toggle_items(selected, False)

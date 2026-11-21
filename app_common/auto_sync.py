@@ -162,6 +162,39 @@ def save_policy(sftp: SFTPManager, todo_dir: str, policy) -> dict:
     return data
 
 
+def update_exclude(policy, *, add=(), remove=()) -> tuple[dict, bool]:
+    """在黑名单里加入 / 移除条目，返回 ``(新策略, 是否有变化)``。
+
+    供「文件管理（手动）」页右键「排除出自动同步」使用：
+
+    - 条目按**整条路径**精确比较（忽略大小写），不碰白名单与总开关；
+    - ``policy`` 为 None（服务器还没下发策略）时以默认策略为基础（关闭状态），
+      这样标记只会写黑名单，不会意外把自动同步打开；
+    - 没有实际变化时返回 ``changed=False``，调用方可以不写回服务器。
+    """
+    base = normalize_policy(policy if policy is not None else default_policy())
+    entries = list(base["exclude"])
+    existing = {str(item).lower() for item in entries}
+    changed = False
+    for item in _clean_entries(add):
+        if item.lower() in existing:
+            continue
+        entries.append(item)
+        existing.add(item.lower())
+        changed = True
+    drop = {str(item).lower() for item in _clean_entries(remove)}
+    if drop:
+        kept = [item for item in entries if str(item).lower() not in drop]
+        if len(kept) != len(entries):
+            entries = kept
+            changed = True
+    out = dict(base)
+    out["exclude"] = entries
+    if changed:
+        out["updated_at"] = _now_iso()
+    return out, changed
+
+
 # ---------------- 路径与黑白名单匹配 ----------------
 def _split(path) -> list[str]:
     return [p for p in str(path or "").replace("\\", "/").split("/")
