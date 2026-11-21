@@ -17,7 +17,7 @@ log = get_logger("profile")
 PROFILE_TYPE = "mc_cloud_sync_profile"
 PROFILE_SCHEMA = 1
 PROFILE_SUFFIX = ".mcscf"
-PROFILE_FILTER = f"服务器配置文件 (*{PROFILE_SUFFIX})"
+PROFILE_FILTER = f"服务器配置文件 (*{PROFILE_SUFFIX});;所有文件 (*)"
 
 
 def new_server_id() -> str:

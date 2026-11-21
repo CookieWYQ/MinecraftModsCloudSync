@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
@@ -207,8 +208,10 @@ class ClientMainWindow(QWidget):
         self.left_panel.setFixedWidth(self._left_w)
         body.addWidget(self.left_panel)
 
-        # ---- 右侧：详情 ----
-        right = QVBoxLayout()
+        # ---- 右侧：详情（仅在已导入服务器配置时显示） ----
+        self.detail_page = QWidget()
+        right = QVBoxLayout(self.detail_page)
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(12)
 
         # 标题：服务器名称 + 唯一编号
@@ -323,6 +326,15 @@ class ClientMainWindow(QWidget):
         header.setSectionResizeMode(3, QHeaderView.Stretch)
         right.addWidget(self.table, 1)
 
+        # ---- 右侧外层：上方为「未导入引导页 / 服务器详情」，下方全局工具条常驻 ----
+        self.right_stack = QStackedWidget()
+        self.empty_page = self._build_empty_page()
+        self.right_stack.addWidget(self.empty_page)
+        self.right_stack.addWidget(self.detail_page)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(12)
+        right_col.addWidget(self.right_stack, 1)
+
         # 软件设置与数据管理
         opt_box = QGroupBox("软件设置与数据管理")
         opt_row = QHBoxLayout(opt_box)
@@ -344,9 +356,9 @@ class ClientMainWindow(QWidget):
         opt_row.addStretch(1)
         opt_row.addWidget(btn_shared)
         opt_row.addWidget(self.btn_update)
-        right.addWidget(opt_box)
+        right_col.addWidget(opt_box)
 
-        body.addLayout(right, 3)
+        body.addLayout(right_col, 3)
         root.addLayout(body, 1)
 
         self.btn_check.clicked.connect(lambda: self._check(manual=True))
@@ -371,6 +383,41 @@ class ClientMainWindow(QWidget):
         self.timer_update.start(6 * 60 * 60 * 1000)
 
         self._setup_tray()
+
+    def _build_empty_page(self) -> QWidget:
+        """未导入任何服务器配置时的引导页：右侧不再显示无意义的空详情。"""
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(32, 32, 32, 32)
+        lay.addStretch(1)
+
+        title = QLabel("尚未导入服务器配置文件")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignCenter)
+        hint = QLabel(
+            "请先在左侧点击「导入配置文件…」选择服务器导出的 .mcscf 文件，\n"
+            "或直接把 .mcscf 配置文件拖入本窗口。\n\n"
+            "导入成功后会在这里显示服务器连接状态、更新版本与任务列表。")
+        hint.setObjectName("muted")
+        hint.setAlignment(Qt.AlignCenter)
+        hint.setWordWrap(True)
+
+        btn_import = QPushButton("导入配置文件…")
+        btn_import.setObjectName("primary")
+        btn_import.setFixedWidth(180)
+        btn_import.clicked.connect(self._import_profile)
+
+        lay.addWidget(title)
+        lay.addSpacing(10)
+        lay.addWidget(hint)
+        lay.addSpacing(18)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(btn_import)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+        lay.addStretch(1)
+        return page
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon(get_app_icon("client"), self)
@@ -413,6 +460,8 @@ class ClientMainWindow(QWidget):
         self._restart_auto_timer()
         self.refresh_list()
         self._refresh_auto_status()
+        if not self.config.profiles():
+            log.info("客户端未导入任何服务器配置文件，右侧显示导入引导")
 
     def refresh_list(self):
         current = self._current_sid
@@ -439,6 +488,7 @@ class ClientMainWindow(QWidget):
         else:
             self._current_sid = None
             self._show_placeholder()
+        self.right_stack.setCurrentWidget(self.detail_page if profiles else self.empty_page)
         self._filter_server_list()
 
     def _filter_server_list(self):
@@ -525,9 +575,10 @@ class ClientMainWindow(QWidget):
                 widget.set_status(status)
 
     # ---------- 服务器档案管理 ----------
-    def _apply_import(self, content: str, name: str, sid: str, created_at: str) -> None:
+    def _apply_import(self, content: str, name: str, sid: str, created_at: str,
+                      client_id: str = "") -> None:
         """写入服务器档案并选中该服务器（界面状态同步）。"""
-        self.config.add_profile(name, sid, content, created_at)
+        self.config.add_profile(name, sid, content, created_at, client_id)
         self._status.pop(sid, None)
         self._manifests.pop(sid, None)
         self._c2c_manifests.pop(sid, None)
@@ -538,19 +589,25 @@ class ClientMainWindow(QWidget):
             if self.list_servers.item(i).data(Qt.UserRole) == sid:
                 self.list_servers.setCurrentRow(i)
                 break
+        self._refresh_detail()
 
     def _import_profile(self):
         path, _ = QFileDialog.getOpenFileName(self, "导入服务器配置文件", "", PROFILE_FILTER)
         if not path:
+            log.info("导入服务器配置文件：用户取消了文件选择")
             return
+        log.info("开始导入服务器配置文件: %s", path)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             data = parse_profile_content(content)
         except Exception as exc:
-            winutil.error(self, "导入失败", f"无法导入该配置文件：\n{exc}")
+            log.error("导入服务器配置文件失败 %s: %s", path, exc, exc_info=True)
+            winutil.error(self, "导入失败",
+                          f"无法导入该配置文件：\n{path}\n\n原因：{exc}")
             return
         name, sid = data["name"], data["server_id"]
+        cid = data.get("client_id") or sid
         existing = self.config.profile_by_id(sid)
         if existing is not None:
             if not winutil.confirm(
@@ -559,22 +616,33 @@ class ClientMainWindow(QWidget):
                     f"导入的配置文件：\n{path}\n\n"
                     f"导入后将覆盖该服务器的现有配置，是否覆盖？",
                     default_yes=False):
+                log.info("导入服务器配置文件：用户取消覆盖「%s」(%s)", name, sid)
                 return
-        self._apply_import(content, name, sid, data.get("created_at", ""),
-                           data.get("client_id", ""))
+        try:
+            self._apply_import(content, name, sid, data.get("created_at", ""), cid)
+        except Exception as exc:
+            log.error("保存服务器档案失败 %s: %s", path, exc, exc_info=True)
+            winutil.error(self, "导入失败",
+                          f"配置文件解析成功，但保存服务器档案失败：\n{exc}")
+            return
+        log.info("导入服务器档案成功: %s（服务器编号 %s，客户端编号 %s）", name, sid, cid)
         winutil.info(self, "导入成功",
-                     f"已接入服务器：{name}\n客户端编号：{data.get('client_id') or sid}\n\n点击「立即检查更新」验证连接。")
-        log.info("导入服务器档案: %s", name)
+                     f"已接入服务器：{name}\n客户端编号：{cid}\n\n点击「立即检查更新」验证连接。")
 
     def _confirm_import_dropped(self, paths: list[str]):
         """拖入的 .mcscf 服务器配置文件：逐份确认后自动导入；已存在同编号服务器时提示覆盖。"""
+        if not paths:
+            return
+        log.info("拖入服务器配置文件 %d 份: %s", len(paths), "、".join(paths))
         for path in paths:
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     content = f.read()
                 data = parse_profile_content(content)
             except Exception as exc:
-                winutil.error(self, "导入失败", f"无法导入该配置文件：\n{exc}")
+                log.error("拖入的服务器配置文件解析失败 %s: %s", path, exc, exc_info=True)
+                winutil.error(self, "导入失败",
+                              f"无法导入该配置文件：\n{path}\n\n原因：{exc}")
                 continue
             name, sid = data["name"], data["server_id"]
             cid = data.get("client_id") or sid
@@ -586,16 +654,25 @@ class ClientMainWindow(QWidget):
                         f"拖入的配置文件：\n{path}\n\n"
                         f"导入后将覆盖该服务器的现有配置，是否覆盖？",
                         default_yes=False):
+                    log.info("拖入服务器配置文件：用户取消覆盖「%s」(%s)", name, sid)
                     continue
             elif not winutil.confirm(
                     self, "确认导入服务器",
                     f"检测到拖入的服务器配置文件：\n{path}\n\n"
                     f"服务器名称：{name}\n客户端编号：{cid}\n\n是否导入并接入该服务器？"):
+                log.info("拖入服务器配置文件：用户取消导入「%s」(%s)", name, sid)
                 continue
-            self._apply_import(content, name, sid, data.get("created_at", ""), cid)
+            try:
+                self._apply_import(content, name, sid, data.get("created_at", ""), cid)
+            except Exception as exc:
+                log.error("保存拖入的服务器档案失败 %s: %s", path, exc, exc_info=True)
+                winutil.error(self, "导入失败",
+                              f"配置文件解析成功，但保存服务器档案失败：\n{exc}")
+                continue
+            log.info("通过拖入导入服务器档案成功: %s（服务器编号 %s，客户端编号 %s）",
+                     name, sid, cid)
             winutil.info(self, "导入成功",
                          f"已接入服务器：{name}\n客户端编号：{cid}\n\n点击「立即检查更新」验证连接。")
-            log.info("通过拖入导入服务器档案: %s", name)
 
     def _remove_profile(self):
         sid = self._current_sid
@@ -1140,13 +1217,31 @@ class ClientMainWindow(QWidget):
                 out.append(url.toLocalFile())
         return out
 
+    @staticmethod
+    def _looks_like_profile_file(path: str) -> bool:
+        """内容嗅探：扩展名被改过的配置文件也能识别（只读文件头部 4KB）。"""
+        try:
+            if not os.path.isfile(path):
+                return False
+            with open(path, "rb") as f:
+                head = f.read(4096)
+        except OSError:
+            return False
+        return b"mc_cloud_sync_profile" in head
+
     def _handle_dropped(self, paths):
         """后台线程解析拖入内容（避免拖入 .minecraft / 启动器快捷方式时卡顿界面）。"""
         if isinstance(paths, str):
             paths = [paths]
+        if paths:
+            log.info("拖入 %d 个本地路径: %s", len(paths), "、".join(paths))
         # 拖入服务器配置文件（.mcscf）→ 确认后自动导入（无需后台解析）
         profile_paths = [p for p in paths
                          if os.path.splitext(p)[1].lower() == PROFILE_SUFFIX]
+        # 扩展名被改过的配置文件：按内容嗅探识别，避免拖入后毫无反应
+        profile_paths += [p for p in paths
+                          if p not in profile_paths
+                          and self._looks_like_profile_file(p)]
         if profile_paths:
             self._confirm_import_dropped([os.path.abspath(p) for p in profile_paths])
             return

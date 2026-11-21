@@ -627,13 +627,15 @@ class RemoteFilePage(QWidget):
                 overlap = _overlap_prefix(files_dir, server_root)
                 for rel, size in sftp.list_files_recursive_with_size(
                         server_root, excludes=excludes, skip_system=True,
-                        max_workers=4, progress_cb=on_scan_progress):
+                        max_workers=getattr(self.config, "scan_conns", 4),
+                        progress_cb=on_scan_progress):
                     if overlap and (rel == overlap or rel.startswith(overlap + "/")):
                         continue  # 属于客户端文件目录，避免重复计入
                     files[rel] = {"size": size, "hash": None}
                 for rel, size in sftp.list_files_recursive_with_size(
                         files_dir, excludes=excludes, skip_system=False,
-                        max_workers=4, progress_cb=on_scan_progress):
+                        max_workers=getattr(self.config, "scan_conns", 4),
+                        progress_cb=on_scan_progress):
                     files[f"client_files/{rel}"] = {"size": size, "hash": None}
             # 记录服务端文件仓库根目录下**实际存在**的顶层目录（含空目录，
             # 用一次目录列举拿到），供默认发送目标判定：服务端没在用这个目录时，
@@ -692,7 +694,8 @@ class RemoteFilePage(QWidget):
             remote = SFTPManager.join(base, entry)
             if sftp.is_dir(remote):
                 for rel, size in sftp.list_files_recursive_with_size(
-                        remote, excludes=excludes, skip_system=False, max_workers=4):
+                        remote, excludes=excludes, skip_system=False,
+                        max_workers=getattr(self.config, "scan_conns", 4)):
                     files[f"{prefix}{entry}/{rel}"] = {"size": size, "hash": None}
             elif sftp.exists(remote):
                 files[f"{prefix}{entry}"] = {"size": sftp.file_size(remote), "hash": None}
@@ -789,7 +792,8 @@ class RemoteFilePage(QWidget):
         hashes = hash_remote_parallel(
             sftp, self.config.host(), self.config.port(),
             self.config.username(), self.config.password(),
-            tasks, on_progress)
+            tasks, on_progress,
+            workers=getattr(self.config, "scan_conns", 4))
         for k, h in hashes.items():
             files[k] = {**files[k], "hash": h}
         return len(hashes)
@@ -2269,7 +2273,8 @@ class RemoteFilePage(QWidget):
                     hashes = hash_remote_parallel(
                         sftp, self.config.host(), self.config.port(),
                         self.config.username(), self.config.password(),
-                        [(rel, SFTPManager.join(mods_dir, rel)) for rel, _ in candidates])
+                        [(rel, SFTPManager.join(mods_dir, rel)) for rel, _ in candidates],
+                        workers=getattr(self.config, "scan_conns", 4))
                     for rel, lp in candidates:
                         try:
                             if hashes.get(rel) and hashes[rel] == hash_file_cached(lp):

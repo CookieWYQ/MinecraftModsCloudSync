@@ -21,9 +21,18 @@ from .logger import get_logger
 
 log = get_logger("sftp")
 
-# 全局并发连接上限：主会话 1 + 扫描工作线程若干，扫描总占用不超过该值
-_CONN_MAX = 5
+# 全局并发连接上限：主会话 1 + 扫描/哈希工作线程若干，扫描总占用不超过该值。
+# 多连接并行扫描是速度的主要来源（单个 SFTP 会话的目录往返很慢），但也不能无限开，
+# 避免被限制并发的小主机直接拒绝；真正的并发数由「软件设置 → 扫描并发连接数」决定，
+# 上限 MAX_SCAN_WORKERS，主会话另占 1 个名额。
+MAX_SCAN_WORKERS = 8
+DEFAULT_SCAN_WORKERS = 6
+_CONN_MAX = MAX_SCAN_WORKERS + 4
 _conn_sem = threading.BoundedSemaphore(_CONN_MAX)
+
+
+class _ScanIncomplete(Exception):
+    """并行扫描过程中有工作线程掉线/重连失败，结果可能不完整，需要退化为串行重扫。"""
 
 # 目录扫描缓存：key=(host,port,username,root,excludes,skip_system) → (时间, 结果列表)
 _scan_cache: dict[tuple, tuple] = {}
@@ -250,7 +259,7 @@ class SFTPManager:
             return None
 
     def remote_hash_many(self, paths: list[str], algo: str = "md5",
-                         batch: int = 32, progress_cb=None) -> dict[str, str]:
+                         batch: int = 64, progress_cb=None) -> dict[str, str]:
         """在同一连接上「流水线」批量计算远程哈希（SFTP check-file 扩展）。
 
         逐条请求时每个文件都要等一个网络往返，模组包动辄上千个文件，时间几乎全花在
@@ -359,46 +368,98 @@ class SFTPManager:
                     result.append(child_rel)
         return result
 
-    def list_files_recursive_with_size(self, path: str, excludes=None, skip_system: bool = False,
+    def list_files_recursive_with_meta(self, path: str, excludes=None,
+                                       skip_system: bool = False,
                                        max_workers: int = 3,
-                                       progress_cb=None) -> list[tuple[str, int]]:
-        """返回目录下所有文件 (相对路径, 大小) 列表，跳过隐藏项。
+                                       progress_cb=None,
+                                       dir_filter=None, file_filter=None,
+                                       use_cache: bool = True,
+                                       strict: bool = False,
+                                       ) -> list[tuple[str, int, int]]:
+        """返回目录下所有文件 (相对路径, 大小, 修改时间) 列表，跳过隐藏项。
 
-        - 内存缓存：按（服务器+根目录）缓存 60 秒内的完整扫描结果，重复打开页面 /
-          重复点击扫描时直接复用，不再重复读取同一棵目录树；上传/删除等写入操作会自动清空缓存
         - 并行：max_workers>1 时每个工作线程一个独立连接并行列目录（受全局并发名额限制）；
-          <=1 退化为串行、复用调用方连接
-        - 掉线自动重连：连接被服务器断开时重连后继续，反复掉线才中止报错
+          <=1 退化为串行、复用调用方连接。多连接并行是扫描速度的主要来源
+        - 缓存：没有自定义过滤时，按（服务器+根目录）缓存 60 秒内的完整扫描结果；
+          上传/删除等写入操作会自动清空缓存
+        - 掉线自动重连；并行时个别连接建不起来会自动降级，重连失败则改用主连接重扫，
+          保证不会返回「缺目录」的不完整结果
         - excludes: 跳过的目录名集合（忽略大小写，任意层级命中即跳过该目录）
         - skip_system: 为真且扫描的是根目录时，跳过与 MC 无关的系统目录（/usr、/etc 等）
+        - dir_filter(相对目录) / file_filter(相对文件): 可选自定义过滤；
+          目录过滤返回 False = 整棵子树不再进入，文件过滤返回 False = 不收集
+        - strict: 为真时任何目录读取失败都直接报错（差异检测/待办检测用：宁可失败，
+          也不能把读不到的目录当成空目录，否则会把现有文件误判为「已删除」）
         - progress_cb: 进度回调 (已处理目录数, 已发现文件数)
         """
         excludes = {str(e).lower() for e in (excludes or [])}
         root = self._posix(path)
+        use_cache = bool(use_cache and dir_filter is None and file_filter is None)
         cache_key = (self.host, self.port, self.username, root,
                      tuple(sorted(excludes)), bool(skip_system))
-        now = time.time()
-        hit = _scan_cache.get(cache_key)
-        if hit is not None and now - hit[0] < _SCAN_CACHE_TTL:
-            return list(hit[1])
+        if use_cache:
+            hit = _scan_cache.get(cache_key)
+            if hit is not None and time.time() - hit[0] < _SCAN_CACHE_TTL:
+                return list(hit[1])
 
-        def _should_skip_dir(rel: str, name: str) -> bool:
+        def skip_dir(rel: str) -> bool:
+            if not rel:
+                return False
+            name = rel.rsplit("/", 1)[-1]
             if name.startswith("."):
                 return True
             if name.lower() in excludes:
                 return True
-            if skip_system and not rel and name in SYSTEM_ROOT_DIRS:
+            if skip_system and "/" not in rel and name in SYSTEM_ROOT_DIRS:
                 return True
+            if dir_filter is not None:
+                try:
+                    return not dir_filter(rel)
+                except Exception:
+                    return False
             return False
 
-        if max_workers > 1:
-            result = self._scan_parallel(path, root, _should_skip_dir, max_workers, progress_cb)
+        def keep_file(rel: str) -> bool:
+            name = rel.rsplit("/", 1)[-1]
+            if name.startswith("."):
+                return False
+            if file_filter is not None:
+                try:
+                    return bool(file_filter(rel))
+                except Exception:
+                    return False
+            return True
+
+        workers = min(max(int(max_workers or 1), 1), MAX_SCAN_WORKERS)
+        if workers > 1:
+            try:
+                result = self._scan_parallel(path, root, skip_dir, keep_file,
+                                             workers, progress_cb, strict)
+            except _ScanIncomplete as exc:
+                if not self.is_alive():
+                    raise SFTPError(f"扫描中止：{exc}") from exc
+                log.warning("并行扫描不完整（%s），改用主连接串行重扫", exc)
+                result = self._scan_serial(path, root, skip_dir, keep_file,
+                                           progress_cb, strict)
         else:
-            result = self._scan_serial(path, root, _should_skip_dir, progress_cb)
-        _scan_cache[cache_key] = (time.time(), list(result))
+            result = self._scan_serial(path, root, skip_dir, keep_file,
+                                       progress_cb, strict)
+        if use_cache:
+            _scan_cache[cache_key] = (time.time(), list(result))
         return result
 
-    def _scan_serial(self, path: str, root: str, _should_skip_dir, progress_cb=None):
+    def list_files_recursive_with_size(self, path: str, excludes=None,
+                                       skip_system: bool = False,
+                                       max_workers: int = 3,
+                                       progress_cb=None) -> list[tuple[str, int]]:
+        """返回目录下所有文件 (相对路径, 大小) 列表（兼容旧调用，内部走 meta）。"""
+        return [(rel, size) for rel, size, _mtime
+                in self.list_files_recursive_with_meta(
+                    path, excludes=excludes, skip_system=skip_system,
+                    max_workers=max_workers, progress_cb=progress_cb)]
+
+    def _scan_serial(self, path: str, root: str, skip_dir, keep_file,
+                     progress_cb=None, strict: bool = False):
         """串行遍历（复用调用方连接），掉线自动重连。"""
         result = []
         stack = [""]
@@ -427,17 +488,20 @@ class SFTPManager:
                     if self._is_conn_error(exc):
                         # 反复掉线：宁可中止报错，也不要带残缺结果跑完
                         raise SFTPError(f"连接反复中断，扫描中止：{exc}") from exc
+                    if strict:
+                        # 严格模式（差异检测）：列目录失败 = 数据不可信，直接报错
+                        raise SFTPError(f"读取服务端目录失败：{full}（{exc}）") from exc
                     log.warning("无法列出 %s: %s", full, exc)
                     entries = []
                     break
             for e in entries:
                 child_rel = f"{rel}/{e.filename}".strip("/") if rel else e.filename
                 if stat.S_ISDIR(e.st_mode):
-                    if _should_skip_dir(rel, e.filename):
+                    if skip_dir(child_rel):
                         continue
                     stack.append(child_rel)
-                else:
-                    result.append((child_rel, e.st_size))
+                elif keep_file(child_rel):
+                    result.append((child_rel, e.st_size, int(e.st_mtime or 0)))
             dirs_done += 1
             files_found += len(entries)
             if dirs_done % 25 == 0 and progress_cb:
@@ -452,15 +516,23 @@ class SFTPManager:
                 pass
         return result
 
-    def _scan_parallel(self, path: str, root: str, _should_skip_dir, max_workers: int,
-                       progress_cb=None):
-        """并行遍历：共享任务队列 + 每线程独立连接（受全局并发名额限制），掉线自动重连。"""
+    def _scan_parallel(self, path: str, root: str, skip_dir, keep_file,
+                       max_workers: int, progress_cb=None,
+                       strict: bool = False):
+        """并行遍历：共享任务队列 + 每线程独立连接（受全局并发名额限制），掉线自动重连。
+
+        - 个别工作连接建不起来（服务器限制并发）时，其余连接会继续处理全部目录，
+          只记录告警，不算扫描失败
+        - 工作过程中重连失败会导致漏目录，结果不可信 → 抛 _ScanIncomplete，
+          由调用方改用主连接串行重扫
+        """
         q = _queue.Queue()
         results = []
         result_lock = threading.Lock()
         cond = threading.Condition()
         pending = 1            # 队列中 + 处理中的目录任务数
-        errors: list[str] = []
+        connect_errors: list[str] = []
+        hard_errors: list[str] = []
         dirs_done = 0
         files_found = 0
         q.put("")              # 根目录任务
@@ -472,18 +544,22 @@ class SFTPManager:
                 except Exception:
                     pass
 
-        def worker():
+        def worker(use_main: bool = False):
             nonlocal pending, dirs_done, files_found
-            conn = SFTPManager(self.host, self.port, self.username,
-                               self.password, self.timeout, self.sanitize_log)
-            try:
-                conn.connect()
-            except Exception as exc:
-                with cond:
-                    errors.append(str(exc))
-                    if pending == 0:
-                        cond.notify_all()
-                return
+            own_conn = True
+            if use_main and self.is_alive():
+                # 主连接直接充当一个工作线程的连接：省一次握手，也少占一个并发名额
+                conn = self
+                own_conn = False
+            else:
+                conn = SFTPManager(self.host, self.port, self.username,
+                                   self.password, self.timeout, self.sanitize_log)
+                try:
+                    conn.connect()
+                except Exception as exc:
+                    with cond:
+                        connect_errors.append(str(exc))
+                    return
             try:
                 while True:
                     try:
@@ -507,25 +583,28 @@ class SFTPManager:
                                     conn.reconnect()
                                 except Exception as exc2:
                                     with cond:
-                                        errors.append(f"重连失败：{exc2}")
-                                        if pending == 0:
-                                            cond.notify_all()
+                                        hard_errors.append(f"重连失败：{exc2}")
                                     return
                                 continue
                             log.warning("无法列出 %s: %s", full, exc)
+                            if strict:
+                                with cond:
+                                    hard_errors.append(f"读取目录失败：{full}（{exc}）")
+                                return
                             entries = []
                             break
                     for e in entries:
                         child_rel = f"{rel}/{e.filename}".strip("/") if rel else e.filename
                         if stat.S_ISDIR(e.st_mode):
-                            if _should_skip_dir(rel, e.filename):
+                            if skip_dir(child_rel):
                                 continue
                             with cond:
                                 q.put(child_rel)
                                 pending += 1
-                        else:
+                        elif keep_file(child_rel):
                             with result_lock:
-                                results.append((child_rel, e.st_size))
+                                results.append((child_rel, e.st_size,
+                                                int(e.st_mtime or 0)))
                     with cond:
                         dirs_done += 1
                         files_found += len(entries)
@@ -534,15 +613,23 @@ class SFTPManager:
                     if dirs_done % 25 == 0:
                         _emit()
             finally:
-                conn.close()
+                if own_conn:
+                    conn.close()
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(worker) for _ in range(max_workers)]
+            futures = [ex.submit(worker, i == 0) for i in range(max_workers)]
             for fut in futures:
                 fut.result()
         _emit()
-        if not results and errors:
-            raise SFTPError(f"读取服务端目录失败：{errors[0]}")
+        if hard_errors:
+            raise _ScanIncomplete(hard_errors[0])
+        if connect_errors and not results:
+            # 全部连接都建不起来：交给调用方用主连接串行重扫（很可能主连接是通的）
+            raise _ScanIncomplete(connect_errors[0])
+        if connect_errors:
+            log.warning("并行扫描有 %d 条连接未建立，已用其余 %d 条连接完成扫描：%s",
+                        len(connect_errors), max(1, max_workers - len(connect_errors)),
+                        connect_errors[0])
         return results
 
     def list_entries(self, path: str) -> list[tuple[str, bool, int, int]]:
@@ -568,6 +655,13 @@ class SFTPManager:
                 return f.read().decode("utf-8")
         except Exception as exc:
             raise SFTPError(f"读取远程文件失败: {path} ({exc})") from exc
+
+    def open(self, path: str, mode: str = "rb"):
+        """打开远程文件（返回 paramiko SFTPFile），供流式读取 / 计算哈希，免落临时文件。"""
+        try:
+            return self._sftp.open(self._posix(path), mode)
+        except Exception as exc:
+            raise SFTPError(f"打开远程文件失败: {path} ({exc})") from exc
 
     def write_text(self, path: str, text: str) -> None:
         _invalidate_scan_cache()

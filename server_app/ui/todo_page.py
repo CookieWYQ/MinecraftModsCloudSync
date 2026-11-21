@@ -45,7 +45,7 @@ from PySide6.QtWidgets import (
 from app_common import winutil
 from app_common.c2c import abs_c2c_dir
 from app_common.constants import config_dir
-from app_common.file_hash import hash_remote_parallel, hash_remote_smart
+from app_common.file_hash import hash_remote_parallel
 from app_common.logger import get_logger
 from app_common.mcmod_link import add_mcmod_menu_actions, mod_search_name
 from app_common.sftp import SFTPError, SFTPManager
@@ -465,7 +465,8 @@ class TodoPage(QWidget):
                 cur_hash.update(hash_remote_parallel(
                     sftp, self.config.host(), self.config.port(),
                     self.config.username(), self.config.password(),
-                    tasks, on_hash_progress))
+                    tasks, on_hash_progress,
+                    workers=getattr(self.config, "scan_conns", 4)))
 
         rows = []
         for rel in sorted(current):
@@ -552,34 +553,30 @@ class TodoPage(QWidget):
     def _scan_client_files(self, sftp, progress_cb=None) -> dict[str, dict]:
         """实时递归读取服务器 files_dir（client_files），返回 {相对路径: {size, mtime}}。
 
-        用 list_entries（listdir_attr）一次拿到名称/类型/大小/修改时间，不额外 stat。
-        隐藏项（以 . 开头）跳过，与更新服务端页的扫描口径一致。
+        多连接并行列目录（软件设置 → 扫描并发连接数）：单连接逐目录往返在文件多时
+        很慢，这是「发布待办」检测的主要耗时之一。隐藏项（以 . 开头）跳过，与
+        更新服务端页的扫描口径一致；strict=True 保证列目录失败时直接报错，
+        不会把读不到的目录当成空目录而把现有文件误判成「已删除」。
         """
         root = self.config.files_dir
-        out: dict[str, dict] = {}
-        stack = [""]
-        dirs = 0
-        while stack:
-            rel_dir = stack.pop()
-            full = SFTPManager.join(root, rel_dir) if rel_dir else root
-            try:
-                entries = sftp.list_entries(full)
-            except SFTPError as exc:
-                # 列目录失败不能当作「空目录」继续：那会把该目录下已发布文件全判成删除
-                raise SFTPError(
-                    f"读取服务器客户端文件目录失败（{full}）：{exc}") from exc
-            for name, is_dir, size, mtime in entries:
-                child = f"{rel_dir}/{name}" if rel_dir else name
-                if is_dir:
-                    stack.append(child)
-                else:
-                    out[child] = {"size": int(size), "mtime": int(mtime or 0)}
-            dirs += 1
-            if progress_cb and dirs % 25 == 0:
+        workers = getattr(self.config, "scan_conns", 4)
+
+        def on_scan(dirs: int, files: int):
+            if progress_cb and (dirs <= 1 or dirs % 25 == 0):
                 progress_cb(dirs, 0,
                             f"正在读取服务器客户端文件目录…"
-                            f"（已读 {dirs} 个目录 / {len(out)} 个文件）")
-        return out
+                            f"（已读 {dirs} 个目录 / {files} 个文件）")
+
+        try:
+            rows = sftp.list_files_recursive_with_meta(
+                root, max_workers=workers, progress_cb=on_scan,
+                use_cache=False, strict=True)
+        except SFTPError as exc:
+            # 不能当作「空目录」继续：那会把该目录下已发布文件全判成删除
+            raise SFTPError(
+                f"读取服务器客户端文件目录失败（{root}）：{exc}") from exc
+        return {rel: {"size": int(size), "mtime": int(mtime or 0)}
+                for rel, size, mtime in rows}
 
     @staticmethod
     def _match_rename_pairs(new_rows: list[dict], base: dict,
@@ -1238,14 +1235,25 @@ class TodoPage(QWidget):
             # 禁用项保持旧状态 → 下次仍会检测出来（可重新启用后再发布）。
             base = normalize_files(
                 load_snapshot(self.config.current_id(), "publish").get("files", {}))
+            # 先多连接并行算好本次发布文件的新哈希（发布后写基线用），
+            # 再逐项回填；否则每个改动项都串行算一次哈希，项多时很慢。
+            active = [it for it in items if it["status"] in ("new", "update", "rename")]
+            hashes: dict[str, str] = {}
+            if active:
+                hashes = hash_remote_parallel(
+                    sftp, self.config.host(), self.config.port(),
+                    self.config.username(), self.config.password(),
+                    [(it["rel"],
+                      TodoManifest.remote_source_path(sftp, client_dir, it["rel"]))
+                     for it in active],
+                    workers=getattr(self.config, "scan_conns", 4))
             for it in items:
                 rel = it["rel"]
                 if it["status"] in ("new", "update", "rename"):
                     if it["status"] == "rename" and it.get("old_rel"):
                         base.pop(it["old_rel"], None)
-                    remote = TodoManifest.remote_source_path(sftp, client_dir, rel)
                     base[rel] = {"size": it["size"],
-                                 "hash": hash_remote_smart(sftp, remote)}
+                                 "hash": hashes.get(rel)}
                 else:
                     base.pop(rel, None)
             saved_at = save_snapshot(self.config.current_id(), base, "publish")

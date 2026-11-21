@@ -28,9 +28,9 @@ from datetime import datetime
 from functools import lru_cache
 
 from .constants import DEFAULT_SYNC_EXCLUDE_PATTERNS
-from .file_hash import hash_file_cached
+from .file_hash import hash_file_cached, hash_remote_parallel
 from .logger import get_logger
-from .sftp import SFTPError, SFTPManager
+from .sftp import DEFAULT_SCAN_WORKERS, SFTPError, SFTPManager
 from .tasks import safe_target
 
 log = get_logger("auto_sync")
@@ -293,33 +293,33 @@ def dir_allowed(policy: dict, rel: str) -> bool:
 
 # ---------------- 扫描 ----------------
 def scan_remote(sftp: SFTPManager, files_dir: str, policy: dict,
-                progress_cb=None) -> dict[str, dict]:
-    """按策略扫描服务器 ``files_dir``，返回 ``{相对路径: {size, mtime}}``。"""
+                progress_cb=None, workers: int = DEFAULT_SCAN_WORKERS) -> dict[str, dict]:
+    """按策略扫描服务器 ``files_dir``，返回 ``{相对路径: {size, mtime}}``。
+
+    使用多条 SFTP 连接并行列目录（workers 条，受全局并发名额限制）：单个会话
+    逐目录往返在文件多时很慢，并行后扫描时间通常能降到原来的 1/3 ~ 1/5。
+    """
     policy = normalize_policy(policy)
     files_dir = str(files_dir or "")
     if not files_dir:
         raise ValueError("客户端文件目录未配置")
     if not sftp.exists(files_dir):
         raise ValueError(f"客户端文件目录不存在：{files_dir}")
-    result: dict[str, dict] = {}
-    stack = [""]
-    dirs = 0
-    while stack:
-        rel = stack.pop()
-        full = SFTPManager.join(files_dir, rel) if rel else files_dir
-        entries = sftp.list_entries(full)
-        dirs += 1
-        for name, is_dir, size, mtime in entries:
-            child = f"{rel}/{name}" if rel else name
-            if is_dir:
-                if dir_allowed(policy, child):
-                    stack.append(child)
-            elif path_allowed(policy, child):
-                result[child] = {"size": int(size or 0),
-                                 "mtime": int(mtime or 0)}
-        if progress_cb and dirs % 20 == 0:
-            progress_cb(0, 0, f"已扫描服务器 {dirs} 个目录、"
-                              f"{len(result)} 个文件…")
+
+    def on_scan(dirs: int, files: int):
+        if progress_cb:
+            progress_cb(0, 0, f"正在扫描服务器目录…（已读 {dirs} 个目录 / "
+                              f"{files} 个文件）")
+
+    rows = sftp.list_files_recursive_with_meta(
+        files_dir,
+        max_workers=workers,
+        progress_cb=on_scan,
+        dir_filter=lambda rel: dir_allowed(policy, rel),
+        file_filter=lambda rel: path_allowed(policy, rel),
+        use_cache=False)
+    result = {rel: {"size": int(size or 0), "mtime": int(mtime or 0)}
+              for rel, size, mtime in rows}
     if progress_cb:
         progress_cb(0, 0, f"服务器范围内共 {len(result)} 个文件")
     return result
@@ -361,7 +361,7 @@ def scan_local(local_dir: str, policy: dict, progress_cb=None) -> dict[str, dict
 
 # ---------------- 对比计划 ----------------
 def plan_sync(sftp: SFTPManager, files_dir: str, local_dir: str, policy: dict,
-              progress_cb=None) -> dict:
+              progress_cb=None, workers: int = 4) -> dict:
     """对比服务器与本地，生成「需要下载」的计划（不修改任何文件）。
 
     判定顺序：
@@ -384,7 +384,7 @@ def plan_sync(sftp: SFTPManager, files_dir: str, local_dir: str, policy: dict,
 
     if progress_cb:
         progress_cb(0, 0, "正在扫描服务器文件…")
-    remote = scan_remote(sftp, files_dir, policy, progress_cb)
+    remote = scan_remote(sftp, files_dir, policy, progress_cb, workers=workers)
     if progress_cb:
         progress_cb(0, 0, f"正在扫描本地文件（服务器范围内 {len(remote)} 个）…")
     local = scan_local(local_dir, policy, progress_cb)
@@ -424,16 +424,20 @@ def plan_sync(sftp: SFTPManager, files_dir: str, local_dir: str, policy: dict,
         remote_paths = {rel: SFTPManager.join(files_dir, rel)
                         for rel, _meta, _lrel, _lmeta in same_keys}
 
-        def hash_progress(done: int, total: int, rpath: str):
+        def hash_progress(done: int, total: int, rel: str):
             if progress_cb:
-                name = rpath.rsplit("/", 1)[-1]
+                name = str(rel).rsplit("/", 1)[-1]
                 progress_cb(done, total,
                             f"对比文件内容 {done}/{total}：{name}")
 
-        hashes = sftp.remote_hash_many(
-            list(remote_paths.values()), progress_cb=hash_progress) or {}
+        # 多连接并行哈希（check-file 流水线；服务器不支持时各自回退下载计算），
+        # 比单连接逐文件快得多
+        hashes = hash_remote_parallel(
+            sftp, sftp.host, sftp.port, sftp.username, sftp.password,
+            [(rel, remote_paths[rel]) for rel, _m, _lr, _lm in same_keys],
+            hash_progress, workers=workers)
         for idx, (rel, meta, local_rel, local_meta) in enumerate(same_keys, 1):
-            remote_hash = hashes.get(remote_paths[rel])
+            remote_hash = hashes.get(rel)
             if remote_hash:
                 try:
                     local_hash = hash_file_cached(

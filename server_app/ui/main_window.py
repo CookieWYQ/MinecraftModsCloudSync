@@ -51,6 +51,7 @@ from app_common.worker import Worker
 from .auto_sync_page import AutoSyncPage
 from .c2c_page import C2CPage
 from .export_page import ExportPage
+from .file_manager_page import FileManagerPage
 from .log_page import LogPage
 from .remote_page import RemoteFilePage
 from .server_settings_page import ServerSettingsPage
@@ -192,6 +193,8 @@ class ServerMainWindow(QMainWindow):
         self.todo_page = TodoPage(self.config, status_cb=self.set_sftp_status)
         self.auto_sync_page = AutoSyncPage(self.config,
                                            status_cb=self.set_sftp_status)
+        self.file_manager_page = FileManagerPage(self.config,
+                                                 status_cb=self.set_sftp_status)
         self.remote_page = RemoteFilePage(self.config, status_cb=self.set_sftp_status)
         self.export_page = ExportPage(self.config, status_cb=self.set_sftp_status)
         self.c2c_page = C2CPage(self.config, status_cb=self.set_sftp_status)
@@ -201,6 +204,7 @@ class ServerMainWindow(QMainWindow):
         self.tabs.addTab(self.remote_page, "更新服务端（C2S）")
         self.tabs.addTab(self.todo_page, "发布待办（S2C）")
         self.tabs.addTab(self.auto_sync_page, "自动同步（免待办）")
+        self.tabs.addTab(self.file_manager_page, "文件管理（手动）")
         self.tabs.addTab(self.export_page, "导出客户端配置")
         self.tabs.addTab(self.c2c_page, "C2C 文件发布（本地对本地）")
         self.tabs.addTab(self.settings_page, "服务器设置")
@@ -331,6 +335,10 @@ class ServerMainWindow(QMainWindow):
         except Exception as exc:
             log.warning("刷新自动同步策略页失败: %s", exc)
         try:
+            self.file_manager_page.reload()
+        except Exception as exc:
+            log.warning("刷新文件管理页失败: %s", exc)
+        try:
             self.remote_page.reload()
         except Exception as exc:
             log.warning("刷新更新服务端页失败: %s", exc)
@@ -370,6 +378,10 @@ class ServerMainWindow(QMainWindow):
             self.auto_sync_page.reload()
         except Exception as exc:
             log.warning("设置保存后刷新自动同步策略页失败: %s", exc)
+        try:
+            self.file_manager_page.reload()
+        except Exception as exc:
+            log.warning("设置保存后刷新文件管理页失败: %s", exc)
         try:
             self.c2c_page.reload()
         except Exception as exc:

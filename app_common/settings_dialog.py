@@ -85,6 +85,28 @@ class SettingsDialog(QDialog):
         gform.addRow(self.cb_update_check)
         layout.addWidget(general)
 
+        # 扫描性能（仅服务端工具使用：多连接并行扫描/哈希）
+        self.sp_scan_conns = None
+        if not self.is_client:
+            perf = QGroupBox("扫描性能（SFTP 多连接并行）")
+            pform = QFormLayout(perf)
+            pform.setSpacing(10)
+            self.sp_scan_conns = QSpinBox()
+            self.sp_scan_conns.setRange(1, 8)
+            self.sp_scan_conns.setSuffix(" 条连接")
+            if self.config is not None and hasattr(self.config, "scan_conns"):
+                self.sp_scan_conns.setValue(self.config.scan_conns)
+            pform.addRow("并行连接数", self.sp_scan_conns)
+            perf_tip = QLabel(
+                "扫描服务端目录、计算文件哈希时同时使用的 SFTP 连接数。\n"
+                "调大可以明显加快「更新服务端」「发布待办」的扫描速度；"
+                "免费 / 小主机若限制并发连接数，可调小或保持默认（6）。\n"
+                "被服务器拒绝时软件会自动降级为更少连接，不会卡死。")
+            perf_tip.setObjectName("muted")
+            perf_tip.setWordWrap(True)
+            pform.addRow(perf_tip)
+            layout.addWidget(perf)
+
         tip = QLabel("提示：本窗口管理软件本体设置；每个服务器对应的档案与数据请使用「配置管理」。")
         tip.setObjectName("muted")
         tip.setWordWrap(True)
@@ -127,6 +149,8 @@ class SettingsDialog(QDialog):
             self.config.notify = self.cb_notify.isChecked()
         if self.cb_update_check is not None:
             self.config.auto_update_check = self.cb_update_check.isChecked()
+        if self.sp_scan_conns is not None and hasattr(self.config, "scan_conns"):
+            self.config.scan_conns = self.sp_scan_conns.value()
         if self.on_changed is not None:
             try:
                 self.on_changed(interval_changed)

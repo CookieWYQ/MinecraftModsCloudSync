@@ -28,6 +28,14 @@ def _abs_remote_dir(value, default: str) -> str:
     return p
 
 
+# 扫描/哈希并发连接数：默认 6 条工作连接 + 1 条主连接。
+# 免费/小主机常见并发上限是 3~10，默认值在「明显加速」与「不被拒绝」之间取折中；
+# 被拒绝时并行扫描会自动降级（见 sftp.list_files_recursive_with_meta），不会卡死。
+SCAN_CONNS_DEFAULT = 6
+SCAN_CONNS_MIN = 1
+SCAN_CONNS_MAX = 8
+
+
 class ServerConfig:
     """服务端工具配置：可同时管理多台服务器（每台独立的 SFTP / 远程目录 / 本地客户端目录）。
 
@@ -205,6 +213,25 @@ class ServerConfig:
     @auto_update_check.setter
     def auto_update_check(self, value: bool) -> None:
         self.store.set("auto_update_check", bool(value))
+
+    # ---- 扫描性能（多连接并行扫描 / 哈希） ----
+    @property
+    def scan_conns(self) -> int:
+        """扫描/哈希时并行打开的 SFTP 工作连接数（1~8，默认 6）。"""
+        try:
+            value = int(self.store.get("scan_conns", SCAN_CONNS_DEFAULT))
+        except (TypeError, ValueError):
+            value = SCAN_CONNS_DEFAULT
+        return max(SCAN_CONNS_MIN, min(SCAN_CONNS_MAX, value))
+
+    @scan_conns.setter
+    def scan_conns(self, value) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = SCAN_CONNS_DEFAULT
+        self.store.set("scan_conns",
+                       max(SCAN_CONNS_MIN, min(SCAN_CONNS_MAX, value)))
 
     def host(self) -> str:
         return self.sftp.get("host", "")
@@ -627,6 +654,25 @@ class ClientConfig:
     @auto_update_check.setter
     def auto_update_check(self, value: bool) -> None:
         self.store.set("auto_update_check", bool(value))
+
+    # ---- 扫描性能（多连接并行扫描 / 哈希） ----
+    @property
+    def scan_conns(self) -> int:
+        """扫描/哈希时并行打开的 SFTP 工作连接数（1~8，默认 6）。"""
+        try:
+            value = int(self.store.get("scan_conns", SCAN_CONNS_DEFAULT))
+        except (TypeError, ValueError):
+            value = SCAN_CONNS_DEFAULT
+        return max(SCAN_CONNS_MIN, min(SCAN_CONNS_MAX, value))
+
+    @scan_conns.setter
+    def scan_conns(self, value) -> None:
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            value = SCAN_CONNS_DEFAULT
+        self.store.set("scan_conns",
+                       max(SCAN_CONNS_MIN, min(SCAN_CONNS_MAX, value)))
 
     # ---- 主题 ----
     @property

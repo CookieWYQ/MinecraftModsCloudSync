@@ -21,6 +21,16 @@ from .ui.main_window import ClientMainWindow
 log = get_logger("client.main")
 
 
+def _log_uncaught(exc_type, exc, tb) -> None:
+    """窗口程序没有控制台：未处理异常必须写入日志，否则排查时完全无记录。"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        return
+    log.error("未捕获异常: %s", exc, exc_info=(exc_type, exc, tb))
+
+
+sys.excepthook = _log_uncaught
+
+
 def main() -> int:
     # 普通权限运行：客户端写入的是用户目录（.minecraft）与 HKCU 自启注册表，
     # 均不需要管理员；提权反而会因 UIPI 隔离导致无法从资源管理器拖放文件/文件夹。

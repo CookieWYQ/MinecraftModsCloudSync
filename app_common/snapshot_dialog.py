@@ -211,7 +211,8 @@ class SnapshotHistoryDialog(QDialog):
         with SFTPManager(self.config.host(), self.config.port(),
                          self.config.username(), self.config.password()) as sftp:
             sizes = dict(sftp.list_files_recursive_with_size(
-                files_dir, max_workers=2, progress_cb=on_scan))
+                files_dir, max_workers=getattr(self.config, "scan_conns", 4),
+                progress_cb=on_scan))
 
             def on_hash(done: int, total: int, key: str):
                 if progress_cb:
@@ -221,7 +222,7 @@ class SnapshotHistoryDialog(QDialog):
                 sftp, self.config.host(), self.config.port(),
                 self.config.username(), self.config.password(),
                 [(rel, SFTPManager.join(files_dir, rel)) for rel in sizes],
-                on_hash)
+                on_hash, workers=getattr(self.config, "scan_conns", 4))
         data = {rel: {"size": size, "hash": hashes.get(rel)} for rel, size in sizes.items()}
         log.info("读取当前客户端内容：%s 下 %d 个文件（已算哈希 %d 个）",
                  files_dir, len(data), len(hashes))

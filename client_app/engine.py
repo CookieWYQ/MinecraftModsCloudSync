@@ -395,7 +395,8 @@ def auto_sync_run(config: ClientConfig, profile: dict, apply: bool = True,
             result["skipped"] = "policy_empty"
             return result
         plan = plan_sync(sftp, info["files_dir"], game_dir, policy,
-                         progress_cb)
+                         progress_cb,
+                         workers=getattr(config, "scan_conns", 4))
         for key in ("remote_files", "local_files", "downloads", "extras",
                     "total_bytes", "warnings", "scanned_at"):
             result[key] = plan.get(key, result.get(key))

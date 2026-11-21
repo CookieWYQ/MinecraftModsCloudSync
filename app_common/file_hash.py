@@ -8,15 +8,17 @@ S2C / C2S / C2C 三个模块统一用「大小 + 哈希」双条件判定：
 """
 import hashlib
 import os
-import tempfile
 import threading
 
 from .logger import get_logger
-from .sftp import SFTPManager
+from .sftp import MAX_SCAN_WORKERS, SFTPManager
 
 log = get_logger("file_hash")
 
 _CHUNK = 1 << 20  # 1 MB
+
+# 默认并行哈希连接数（软件设置里可调 1~8）；多连接是慢网络/大模组包场景的关键
+DEFAULT_HASH_WORKERS = 6
 
 # 本地哈希缓存：path → (大小, 修改时间, 哈希)。
 # 重复扫描（每次发送后都重建快照）时，绝大多数文件没变，直接复用上次结果，
@@ -61,15 +63,15 @@ def hash_file_cached(path: str, algo: str = "md5") -> str:
 
 
 def hash_remote(sftp: SFTPManager, remote_path: str, algo: str = "md5") -> str | None:
-    """下载远程文件到临时文件并计算哈希，计算后删除临时文件。
+    """流式读取远程文件并计算哈希（不落临时文件）。
 
-    失败（文件不存在 / 下载 / 读取错误）返回 None，由调用方按「无法确认」保守处理。
+    失败（文件不存在 / 网络 / 读取错误）返回 None，由调用方按「无法确认」保守处理。
+    服务器不支持 ``check-file`` 扩展时走这里：直接 ``open`` 后边读边算，
+    省掉「下载到临时文件 → 再从磁盘读一遍」的双重 IO；多连接时每个连接独立流式读取。
     """
     h = hashlib.new(algo)
-    tmp = tempfile.mktemp(prefix="mc_sync_hash_")
     try:
-        sftp.download(remote_path, tmp)
-        with open(tmp, "rb") as f:
+        with sftp.open(remote_path, "rb") as f:
             while True:
                 chunk = f.read(_CHUNK)
                 if not chunk:
@@ -79,12 +81,6 @@ def hash_remote(sftp: SFTPManager, remote_path: str, algo: str = "md5") -> str |
     except Exception as exc:
         log.warning("计算远程文件哈希失败: %s（%s）", remote_path, exc)
         return None
-    finally:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
 
 
 def hash_remote_smart(sftp: SFTPManager, remote_path: str,
@@ -139,25 +135,32 @@ def _hash_tasks_one_conn(conn: SFTPManager, tasks: list[tuple[str, str]],
 def hash_remote_parallel(sftp: SFTPManager | None,
                          host: str, port: int, username: str, password: str,
                          tasks: list[tuple[str, str]],
-                         progress_cb=None, workers: int = 4) -> dict[str, str]:
+                         progress_cb=None, workers: int | None = None) -> dict[str, str]:
     """并行计算多个远程文件哈希（快速哈希优先：SFTP check-file，不下载文件）。
 
     - tasks: [(key, remote_path), ...]，key 仅用于回填与进度显示
     - 返回 {key: md5}；计算失败的条目不包含在内
     - 每条连接内部再走「批量流水线」，往返次数由 文件数 降为 文件数/batch，
       多文件（模组包）场景比逐文件串行快一个数量级
-    - workers>1 时每个工作线程一个独立连接（受 sftp 模块全局并发名额限制）；
-      workers<=1 且传入 sftp 时复用该连接
+    - workers>1 时每个工作线程一个独立连接（受 sftp 模块全局并发名额限制），
+      默认 DEFAULT_HASH_WORKERS（软件设置里可调）；workers<=1 且传入 sftp 时复用该连接
+    - 传入的 sftp 主连接会直接承担一片任务，不额外再建一条连接；某片线程建连失败
+      （小主机限制并发）时，剩余任务会自动落到单连接重试，避免整批哈希缺失
     - progress_cb(done, total, key) 可选
     """
     total = len(tasks)
     if total == 0:
         return {}
-    n = min(max(workers, 1), 4, total)
-    if n <= 1 and sftp is not None:
-        return _hash_tasks_one_conn(sftp, tasks, progress_cb)
-
-    from .sftp import SFTPManager as _SFTPManager
+    try:
+        wanted = int(workers) if workers is not None else DEFAULT_HASH_WORKERS
+    except (TypeError, ValueError):
+        wanted = DEFAULT_HASH_WORKERS
+    n = min(max(wanted, 1), MAX_SCAN_WORKERS, total)
+    if n <= 1:
+        if sftp is not None:
+            return _hash_tasks_one_conn(sftp, tasks, progress_cb)
+        with SFTPManager(host, port, username, password) as conn:
+            return _hash_tasks_one_conn(conn, tasks, progress_cb)
 
     lock = threading.Lock()
     counter = {"done": 0}
@@ -167,28 +170,67 @@ def hash_remote_parallel(sftp: SFTPManager | None,
             return
         with lock:
             counter["done"] += 1
-            done = counter["done"]
+            done = min(counter["done"], total)
         try:
             progress_cb(done, total, key)
         except Exception:
             pass
 
     result: dict[str, str] = {}
+    failed: list[list[tuple[str, str]]] = []
 
-    def worker(slice_: list[tuple[str, str]]):
+    def hash_on_conn(conn, slice_):
         try:
-            with _SFTPManager(host, port, username, password) as conn:
-                part = _hash_tasks_one_conn(conn, slice_, on_progress)
+            part = _hash_tasks_one_conn(conn, slice_, on_progress)
         except Exception as exc:
             log.warning("哈希工作线程失败: %s", exc)
-            return
+            return None
         with lock:
             result.update(part)
+        return part
+
+    def worker(slice_):
+        try:
+            with SFTPManager(host, port, username, password) as conn:
+                part = hash_on_conn(conn, slice_)
+        except Exception as exc:
+            log.warning("哈希工作连接建立失败: %s", exc)
+            part = None
+        if part is None:
+            with lock:
+                failed.append(slice_)
 
     threads = [threading.Thread(target=worker, args=(tasks[i::n],), daemon=True)
-               for i in range(n)]
-    for t in threads:
-        t.start()
+               for i in range(1, n)]
+
+    # 主连接直接跑第 0 片（不额外占一个连接名额），其余并行
+    if sftp is not None:
+        for t in threads:
+            t.start()
+        part = hash_on_conn(sftp, tasks[0::n])
+        if part is None:
+            failed.append(tasks[0::n])
+    else:
+        threads.insert(0, threading.Thread(target=worker, args=(tasks[0::n],),
+                                           daemon=True))
+        for t in threads:
+            t.start()
     for t in threads:
         t.join()
+
+    # 有切片整片失败（通常是并发连接被服务器拒绝）→ 剩余任务落到单连接重试
+    if failed:
+        retry = [item for slice_ in failed for item in slice_
+                 if item[0] not in result]
+        if retry:
+            log.warning("并行哈希有 %d 个任务失败，改用单连接重试", len(retry))
+            try:
+                if sftp is not None and sftp.is_alive():
+                    part = _hash_tasks_one_conn(sftp, retry, on_progress)
+                else:
+                    with SFTPManager(host, port, username, password) as conn:
+                        part = _hash_tasks_one_conn(conn, retry, on_progress)
+                result.update(part)
+            except Exception as exc:
+                log.warning("哈希单连接重试失败: %s", exc)
     return result

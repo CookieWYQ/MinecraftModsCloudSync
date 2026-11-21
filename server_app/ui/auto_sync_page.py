@@ -257,6 +257,7 @@ class AutoSyncPage(QWidget):
             "password": self.config.password(),
             "todo_dir": self.config.todo_dir,
             "files_dir": self.config.files_dir,
+            "scan_conns": getattr(self.config, "scan_conns", 4),
         }
 
     # ---------- 读取 ----------
@@ -458,7 +459,8 @@ class AutoSyncPage(QWidget):
                 raise RuntimeError(
                     f"客户端文件目录不存在：{info['files_dir']}\n"
                     f"请先在「服务器设置」中检查「客户端文件目录」。")
-            files = scan_remote(sftp, info["files_dir"], policy, progress_cb)
+            files = scan_remote(sftp, info["files_dir"], policy, progress_cb,
+                                workers=info.get("scan_conns", 4))
         by_top: dict[str, list[int]] = {}
         for rel, meta in files.items():
             top = rel.split("/", 1)[0] if "/" in rel else "(根目录文件)"
