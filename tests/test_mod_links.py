@@ -94,7 +94,11 @@ def check_disabled_and_names() -> None:
     optifine = ml.mod_links("OptiFine_1.20.1_HD_U_I6.jar")
     assert optifine["wiki_id"] is None, optifine
     assert "OptiFine" in optifine["name"], optifine
-    print("禁用后缀与展示名处理正确")
+    # 整合包/启动器加的中文名方括号前缀要剥掉（命中率与展示名都更好）
+    prefixed = ml.mod_links("【汉化】jei-1.20.1-forge-15.2.0.27.jar")
+    assert prefixed["wiki_id"] == 459, prefixed
+    assert prefixed["name"] == "jei", prefixed
+    print("禁用后缀、方括号前缀与展示名处理正确")
 
 
 def check_menu() -> None:

@@ -38,6 +38,8 @@ _VERSION_TAIL = re.compile(r"[-_ .](?:v?\d[\d.]*)$")
 _MC_TAIL = re.compile(r"[-_ .+]mc\d[\d.]*$", re.IGNORECASE)
 _LOADER_TAIL = re.compile(
     r"[-_ .](?:fabric|forge|neoforge|quilt|fml|common|loader)$", re.IGNORECASE)
+# 整合包/启动器可能给 jar 加中文名前缀：`[机械动力：伪装方块+] copycats-3.0.11.jar`
+_NAME_PREFIX = re.compile(r"^\s*[\[【][^\]】]{1,80}[\]】]\s*")
 
 
 def _display_name(filename: str) -> str:
@@ -48,7 +50,8 @@ def _display_name(filename: str) -> str:
     ``Mekanism-1.20.1-10.4.1.15.jar`` → ``Mekanism``；
     ``OptiFine_1.20.1_HD_U_I6.jar`` → 原样保留（版本段不是纯数字，不能乱删）。
     """
-    text = strip_file_suffixes(filename or "").strip()
+    text = _NAME_PREFIX.sub(
+        "", strip_file_suffixes(filename or "").strip()).strip()
     for _ in range(8):
         new = _VERSION_TAIL.sub("", text)
         new = _MC_TAIL.sub("", new)
