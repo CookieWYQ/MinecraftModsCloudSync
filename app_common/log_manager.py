@@ -30,28 +30,43 @@ def collect_log_lines(start: datetime, end: datetime, keyword: str = "") -> list
 
     客户端 / 服务端日志已按子目录隔离（logs\\client、logs\\server），
     这里只读取当前应用自己的日志，不会混入对方（含 SFTP 连接细节）的记录。
+
+    日志按「记录」处理：以时间戳开头的行开始一条记录，紧随其后的无时间戳行
+    （异常 traceback、多行报错信息）算作同一条记录的续行，会一并输出/匹配关键词。
+    否则导出日志时 traceback 会被整段丢掉，只剩「未捕获异常导致程序退出」一行，
+    无法定位崩溃原因。
     """
     keyword = keyword.strip().lower()
     lines: list[str] = []
     for path in sorted(active_logs_dir().glob("*.log*")):
+        records: list[list[str]] = []
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
+                current: list[str] = []
                 for raw in f:
                     line = raw.rstrip("\n")
-                    m = _TS_RE.match(line)
-                    if not m:
-                        continue
-                    try:
-                        ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
-                    except ValueError:
-                        continue
-                    if not (start <= ts <= end):
-                        continue
-                    if keyword and keyword not in line.lower():
-                        continue
-                    lines.append(line)
+                    if _TS_RE.match(line):
+                        if current:
+                            records.append(current)
+                        current = [line]
+                    elif current:
+                        current.append(line)  # 续行（traceback 等）
+                if current:
+                    records.append(current)
         except OSError as exc:
             log.warning("读取日志文件失败 %s: %s", path, exc)
+            continue
+        for record in records:
+            m = _TS_RE.match(record[0])
+            try:
+                ts = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+            except (AttributeError, ValueError):
+                continue
+            if not (start <= ts <= end):
+                continue
+            if keyword and keyword not in "\n".join(record).lower():
+                continue
+            lines.extend(record)
     return lines
 
 

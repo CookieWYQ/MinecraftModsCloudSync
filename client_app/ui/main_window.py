@@ -1315,13 +1315,26 @@ class ClientMainWindow(QWidget):
         """检查软件本体更新。manual=False 为定时/启动静默检查（尊重设置开关）。"""
         if not manual and not self.config.auto_update_check:
             return
-        if self._update_thread is not None and self._update_thread.isRunning():
-            return
+        # 上一次检查线程可能已结束：QThread.deleteLater() 之后 Python 属性里残留的
+        # 包装对象访问 isRunning() 会抛 RuntimeError（C++ 对象已销毁），表现为
+        # 「再点一次检查更新就崩溃」。这里先判断是否仍在运行，不运行就清掉旧引用。
+        thread = self._update_thread
+        if thread is not None:
+            try:
+                running = thread.isRunning()
+            except RuntimeError:  # C++ 对象已被 deleteLater 销毁
+                running = False
+            if running:
+                return
+            self._update_thread = None
         self._update_manual = manual
-        self._update_thread = UpdateCheckThread(self)
-        self._update_thread.done.connect(self._on_update_checked)
-        self._update_thread.finished.connect(self._update_thread.deleteLater)
-        self._update_thread.start()
+        thread = UpdateCheckThread(self)
+        thread.done.connect(self._on_update_checked)
+        thread.finished.connect(thread.deleteLater)
+        # track_thread 在线程结束（finished）时把引用清空，且带身份校验，
+        # 保证之后重新检查时不会再碰到已销毁的 QThread 包装对象。
+        track_thread(self, "_update_thread", thread)
+        thread.start()
 
     def _on_update_checked(self, ok: bool, result, err: str):
         if not ok:
